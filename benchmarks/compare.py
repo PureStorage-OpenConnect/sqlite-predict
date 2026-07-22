@@ -75,7 +75,7 @@ def run_chronos(train, horizon):
     pipe = run_chronos._pipe
     ctx = torch.tensor([v for _, v in train])
     t0 = time.perf_counter()
-    q, _ = pipe.predict_quantiles(context=ctx, prediction_length=horizon,
+    q, _ = pipe.predict_quantiles(ctx, prediction_length=horizon,
                                   quantile_levels=[0.025, 0.5, 0.975])
     ms = (time.perf_counter() - t0) * 1000
     q = q[0].numpy()
