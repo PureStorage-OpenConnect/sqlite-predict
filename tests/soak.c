@@ -32,6 +32,12 @@ int main(void) {
   if (sqlite3_predict_init(db, NULL, NULL) != SQLITE_OK)
     return fail("init", db);
 
+  /* meta functions — predict_version() sets the JSON result subtype, so
+   * this exercises that path under -DSQLITE_STRICT_SUBTYPE (see Makefile) */
+  if (run_discard(db, "SELECT predict_version()", 1) ||
+      run_discard(db, "SELECT predict_debug()", 1))
+    goto done_fail;
+
   if (run_discard(
           db,
           "CREATE TABLE series(ts TEXT, value REAL, grp TEXT);", 1) ||

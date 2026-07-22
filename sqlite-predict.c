@@ -338,9 +338,18 @@ __declspec(dllexport)
 #endif
   int rc = SQLITE_OK;
   const int flags = SQLITE_UTF8 | SQLITE_INNOCUOUS | SQLITE_DETERMINISTIC;
+  /* predict_version tags its result with the JSON subtype. SQLite 3.45+
+   * refuses sqlite3_result_subtype() unless the function opted in with
+   * this flag (older SQLite ignores the unknown flag and never enforced
+   * the check). Scoped to the one function that sets a subtype. */
+#ifdef SQLITE_RESULT_SUBTYPE
+  const int subtype_flags = flags | SQLITE_RESULT_SUBTYPE;
+#else
+  const int subtype_flags = flags;
+#endif
 
-  rc = sqlite3_create_function_v2(db, "predict_version", 0, flags, NULL,
-                                  predict_version_fn, NULL, NULL, NULL);
+  rc = sqlite3_create_function_v2(db, "predict_version", 0, subtype_flags,
+                                  NULL, predict_version_fn, NULL, NULL, NULL);
   if (rc != SQLITE_OK)
     return rc;
   rc = sqlite3_create_function_v2(db, "predict_debug", 0, flags, NULL,

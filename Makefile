@@ -73,7 +73,8 @@ test-asan: vendor/sqlite3ext.h sqlite-predict.h
 	mkdir -p $(prefix)
 	clang -std=c99 -g -O1 -fsanitize=address,undefined \
 	  -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
-	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -Ivendor/ -I./ \
+	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -DSQLITE_STRICT_SUBTYPE=1 \
+	  -Ivendor/ -I./ \
 	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak-asan
 	UBSAN_OPTIONS=print_stacktrace=1 ./$(prefix)/soak-asan
 
@@ -81,7 +82,8 @@ test-asan: vendor/sqlite3ext.h sqlite-predict.h
 fuzz-build: vendor/sqlite3ext.h sqlite-predict.h
 	mkdir -p $(prefix)
 	clang -std=c99 -g -O1 -fsanitize=fuzzer,address,undefined \
-	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -Ivendor/ -I./ \
+	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -DSQLITE_STRICT_SUBTYPE=1 \
+	  -Ivendor/ -I./ \
 	  fuzz/fuzz_predict.c $(OBJS) vendor/sqlite3.c \
 	  -o $(prefix)/fuzz_predict
 
@@ -115,12 +117,14 @@ test-valgrind: vendor/sqlite3ext.h sqlite-predict.h
 # standalone soak binary (used by CI valgrind + Windows, runnable directly)
 soak: $(prefix) vendor/sqlite3ext.h sqlite-predict.h
 	$(CC) -std=c99 -g -O0 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
+	  -DSQLITE_STRICT_SUBTYPE=1 \
 	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak $(LDFLAGS)
 
 # WebAssembly soak (emscripten): compiles the static soak to wasm. CI runs
 # it under node to prove the code is wasm-portable and correct there.
 soak-wasm: $(prefix) vendor/sqlite3ext.h sqlite-predict.h
 	emcc -std=c99 -O1 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
+	  -DSQLITE_STRICT_SUBTYPE=1 \
 	  -sALLOW_MEMORY_GROWTH -sEXIT_RUNTIME=1 -sSTACK_SIZE=1048576 \
 	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak.js
 
