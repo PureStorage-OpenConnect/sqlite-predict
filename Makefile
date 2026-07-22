@@ -29,6 +29,7 @@ endif
 
 ifdef CONFIG_WINDOWS
 LOADABLE_EXTENSION=dll
+LDFLAGS+=-lm
 endif
 
 CC?=gcc
@@ -111,10 +112,17 @@ test-valgrind: vendor/sqlite3ext.h sqlite-predict.h
 	  valgrind --leak-check=full --error-exitcode=9 --errors-for-leak-kinds=definite \
 	    ./dist/soak-linux"
 
-# standalone soak binary (used by CI valgrind, and runnable directly)
+# standalone soak binary (used by CI valgrind + Windows, runnable directly)
 soak: $(prefix) vendor/sqlite3ext.h sqlite-predict.h
 	$(CC) -std=c99 -g -O0 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
 	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak $(LDFLAGS)
+
+# WebAssembly soak (emscripten): compiles the static soak to wasm. CI runs
+# it under node to prove the code is wasm-portable and correct there.
+soak-wasm: $(prefix) vendor/sqlite3ext.h sqlite-predict.h
+	emcc -std=c99 -O1 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
+	  -sALLOW_MEMORY_GROWTH -sEXIT_RUNTIME=1 -sSTACK_SIZE=1048576 \
+	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak.js
 
 clean:
 	rm -rf $(prefix) sqlite-predict.h
