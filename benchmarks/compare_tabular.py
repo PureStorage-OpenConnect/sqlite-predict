@@ -20,7 +20,12 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
 import synthetic_tabular as syt  # noqa: E402
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "models", "tabfm")
+# TabFM weights live outside the repo (13GB, non-commercial license).
+# Override with SQLITE_PREDICT_DATA; defaults to a per-user cache.
+_DATA = os.environ.get(
+    "SQLITE_PREDICT_DATA",
+    os.path.join(os.path.expanduser("~"), ".cache", "sqlite-predict"))
+MODEL_DIR = os.path.join(_DATA, "tabfm")
 HOLDOUT = 100
 
 CLS_SUITES = {"two_moons": syt.two_moons,

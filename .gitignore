@@ -1,17 +1,33 @@
+# Build output
 dist/
-vendor/sqlite3.h
-vendor/sqlite3ext.h
-vendor/sqlite3.c
-vendor/sqlite-amalgamation*
-sqlite-predict.h
-__pycache__/
-.venv/
+*.o
+*.a
 *.dylib
 *.so
 *.dll
-*.o
+*.wasm
+
+# Generated at build time
+sqlite-predict.h
+vendor/sqlite3.c
+vendor/sqlite3.h
+vendor/sqlite3ext.h
+vendor/sqlite-amalgamation*
+
+# libFuzzer failure artifacts (the curated fuzz/seeds/ stays tracked)
+crash-*
+leak-*
+timeout-*
+oom-*
+fuzz/corpus/
+
+# Python tooling (tests + benchmarks)
+__pycache__/
+.venv/
 .pytest_cache/
-tests/.python-version
-benchmarks/.python-version
-benchmarks/gestalt-dogfood.db
-benchmarks/models/
+.python-version
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo

@@ -100,15 +100,16 @@ fuzz-docker:
 	  ./dist/fuzz_predict_linux -max_total_time=$${FUZZ_SECONDS:-60} \
 	    -max_len=512 fuzz/corpus fuzz/seeds"
 
-# real valgrind, in a Linux container (also exercises gcc + glibc)
-test-valgrind:
+# real valgrind, in a Linux container (also exercises gcc + glibc).
+# Builds only the header + soak binary — no `make clean`/`make loadable`,
+# which would wipe the host's dist/ through the bind mount.
+test-valgrind: vendor/sqlite3ext.h sqlite-predict.h
 	docker run --rm -v $$(pwd):/src -w /src gcc:13 bash -c "\
-	  apt-get update -qq && apt-get install -y -qq valgrind unzip curl python3 > /dev/null && \
-	  make clean && make loadable CC=gcc && \
+	  apt-get update -qq && apt-get install -y -qq valgrind > /dev/null && \
 	  gcc -std=c99 -g -O0 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
-	    tests/soak.c $(OBJS) vendor/sqlite3.c -o dist/soak -lm -lpthread -ldl && \
+	    tests/soak.c $(OBJS) vendor/sqlite3.c -o dist/soak-linux -lm -lpthread -ldl && \
 	  valgrind --leak-check=full --error-exitcode=9 --errors-for-leak-kinds=definite \
-	    ./dist/soak"
+	    ./dist/soak-linux"
 
 clean:
 	rm -rf $(prefix) sqlite-predict.h
