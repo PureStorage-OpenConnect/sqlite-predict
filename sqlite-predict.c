@@ -190,6 +190,10 @@ int predict0_options_parse(sqlite3 *db, const char *json,
       sqlite3_finalize(stmt);
       return 1;
     }
+    /* a null value is equivalent to omitting the key (lets recorded
+     * receipt params round-trip as options) */
+    if (sqlite3_column_type(stmt, 1) == SQLITE_NULL)
+      continue;
     if (cb(ctx, key, sqlite3_column_value(stmt, 1), errmsg)) {
       sqlite3_finalize(stmt);
       return 1;

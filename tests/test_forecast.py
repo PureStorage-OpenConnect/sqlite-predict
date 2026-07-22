@@ -136,4 +136,6 @@ def test_forecast_is_deterministic(db):
     syn.load_into(db, rows)
     one = run_forecast(db, "SELECT ts, value FROM series", 6)
     two = run_forecast(db, "SELECT ts, value FROM series", 6)
-    assert one == two
+    # result columns are deterministic; receipt ids are fresh per call
+    assert [r[:7] for r in one] == [r[:7] for r in two]
+    assert one[0][7] != two[0][7]

@@ -76,4 +76,41 @@ void predict0_ulid_min(i64 ms, char *buf);
 /* Fresh ULID for the given epoch ms with sqlite3_randomness entropy. */
 void predict0_ulid_new(i64 ms, char *buf);
 
+/* ---- receipts (predict-receipts.c) ---- */
+
+#include "sha256.h"
+
+/* RFC §4.1.3 canonical row hashing: type-tagged fields, 0x1F between
+ * fields, 0x1E after each row. */
+typedef struct {
+  sha256_ctx sha;
+} predict0_hasher;
+
+void predict0_hash_init(predict0_hasher *h);
+void predict0_hash_null(predict0_hasher *h);
+void predict0_hash_int(predict0_hasher *h, i64 v);
+void predict0_hash_real(predict0_hasher *h, f64 v);
+void predict0_hash_text(predict0_hasher *h, const char *s);
+void predict0_hash_row_end(predict0_hasher *h);
+void predict0_hash_hex(predict0_hasher *h, char hex[65]);
+
+/* Idempotent DDL for _predict_models/_predict_receipts + bundled rows. */
+int predict0_receipts_ensure(sqlite3 *db, char **errmsg);
+
+/* content_hash of a registered model; sqlite3_malloc'd. NULL = absent. */
+char *predict0_registry_model_hash(sqlite3 *db, const char *model_id);
+
+/* Deterministic logical digest of all user tables (schema + rows,
+ * excluding _predict_% and sqlite_%), hex into out[65]. */
+int predict0_logical_digest(sqlite3 *db, char out[65], char **errmsg);
+
+/* Insert one receipt row. anchor/params/input_sql/result_hash owned by
+ * caller. receipt_id_out[27] receives the new ULID. */
+int predict0_receipt_insert(sqlite3 *db, const char *operation,
+                            const char *model_id, const char *model_hash,
+                            const char *anchor_kind, const char *anchor,
+                            const char *params, const char *input_sql,
+                            const char *result_hash, char receipt_id_out[27],
+                            char **errmsg);
+
 #endif /* PREDICT_INTERNAL_H */

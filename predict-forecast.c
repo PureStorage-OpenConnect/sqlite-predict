@@ -231,6 +231,16 @@ static predict0_ts_model resolve_ts_model(const char *name) {
   return NULL;
 }
 
+static const char *resolve_ts_model_id(const char *name) {
+  if (!name || strcmp(name, "default-ts") == 0)
+    return "theta-classic";
+  for (usize i = 0; i < countof(TS_MODELS); i++) {
+    if (strcmp(TS_MODELS[i].id, name) == 0)
+      return TS_MODELS[i].id;
+  }
+  return NULL;
+}
+
 #pragma endregion
 
 #pragma region options
@@ -363,7 +373,18 @@ typedef struct {
   f64 forecast, lower, upper;
   const char *status; /* static strings only */
   int has_values;     /* 0 for status-only rows */
+  char receipt_id[27];
 } ForecastRow;
+
+static int forecast_row_cmp(const void *a, const void *b) {
+  const ForecastRow *x = *(ForecastRow *const *)a;
+  const ForecastRow *y = *(ForecastRow *const *)b;
+  int c = strcmp(x->series_key ? x->series_key : "",
+                 y->series_key ? y->series_key : "");
+  if (c)
+    return c;
+  return x->step - y->step;
+}
 
 typedef struct forecast_vtab {
   sqlite3_vtab base;
@@ -766,8 +787,18 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     s->val[s->n] = sqlite3_column_double(stmt, value_idx);
     s->n++;
   }
+  /* capture resolved column names for the receipt before finalize */
+  char *resolved_time = NULL, *resolved_value = NULL;
+  if (time_idx >= 0)
+    resolved_time = sqlite3_mprintf("%s", sqlite3_column_name(stmt, time_idx));
+  if (value_idx >= 0)
+    resolved_value =
+        sqlite3_mprintf("%s", sqlite3_column_name(stmt, value_idx));
+
   sqlite3_finalize(stmt);
   if (rc != SQLITE_DONE && rc != SQLITE_ROW && rc != SQLITE_OK) {
+    sqlite3_free(resolved_time);
+    sqlite3_free(resolved_value);
     for (int i = 0; i < n_series; i++) {
       sqlite3_free(series[i].key);
       sqlite3_free(series[i].ts);
@@ -856,12 +887,139 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     sqlite3_free(series[i].val);
   }
   sqlite3_free(series);
-  forecast_opts_free(&opts);
 
-  if (rc == SQLITE_NOMEM)
+  if (rc == SQLITE_NOMEM) {
+    sqlite3_free(resolved_time);
+    sqlite3_free(resolved_value);
+    forecast_opts_free(&opts);
     return SQLITE_NOMEM;
+  }
+
+  /* receipt: RFC §4.1.2 — digest BEFORE insert; params canonical via
+   * json_object with alphabetical keys, resolved column names recorded */
+  if (opts.receipt) {
+    char *errmsg = NULL;
+    const char *model_id = resolve_ts_model_id(opts.model);
+    if (predict0_receipts_ensure(db, &errmsg)) {
+      sqlite3_free(vtab->base.zErrMsg);
+      vtab->base.zErrMsg = errmsg;
+      goto receipt_fail;
+    }
+    char *model_hash = predict0_registry_model_hash(db, model_id);
+    if (!model_hash) {
+      vtab->base.zErrMsg = sqlite3_mprintf(
+          "%s: %s not in _predict_models", PREDICT_ERR_MODEL_NOT_FOUND,
+          model_id);
+      goto receipt_fail;
+    }
+    char digest[65];
+    if (predict0_logical_digest(db, digest, &errmsg)) {
+      sqlite3_free(model_hash);
+      sqlite3_free(vtab->base.zErrMsg);
+      vtab->base.zErrMsg = errmsg;
+      goto receipt_fail;
+    }
+
+    /* result hash over rows sorted by (series_key, step) */
+    ForecastRow **order =
+        sqlite3_malloc(sizeof(ForecastRow *) * (cur->n_rows ? cur->n_rows : 1));
+    if (!order) {
+      sqlite3_free(model_hash);
+      goto receipt_fail;
+    }
+    for (int i = 0; i < cur->n_rows; i++)
+      order[i] = &cur->rows[i];
+    qsort(order, (usize)cur->n_rows, sizeof(ForecastRow *),
+          forecast_row_cmp);
+    predict0_hasher h;
+    predict0_hash_init(&h);
+    for (int i = 0; i < cur->n_rows; i++) {
+      ForecastRow *r = order[i];
+      predict0_hash_text(&h, r->series_key);
+      if (r->has_values) {
+        predict0_hash_int(&h, r->step);
+        predict0_hash_text(&h, r->ts);
+        predict0_hash_real(&h, r->forecast);
+        predict0_hash_real(&h, r->lower);
+        predict0_hash_real(&h, r->upper);
+      } else {
+        for (int k = 0; k < 5; k++)
+          predict0_hash_null(&h);
+      }
+      predict0_hash_row_end(&h);
+    }
+    sqlite3_free(order);
+    char result_hash[65];
+    predict0_hash_hex(&h, result_hash);
+
+    /* canonical params via json_object (keys alphabetical) */
+    char group_json[600] = "";
+    if (opts.n_group_cols) {
+      usize gl = 0;
+      gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl, "[");
+      for (int g = 0; g < opts.n_group_cols && gl < sizeof(group_json) - 4;
+           g++)
+        gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl,
+                              "%s\"%s\"", g ? "," : "", opts.group_cols[g]);
+      snprintf(group_json + gl, sizeof(group_json) - gl, "]");
+    }
+    sqlite3_stmt *pj = NULL;
+    char *params = NULL;
+    if (sqlite3_prepare_v2(
+            db,
+            "SELECT json_object('confidence_level', ?1, 'context_limit', ?2,"
+            " 'group_cols', CASE WHEN ?3 = '' THEN NULL ELSE json(?3) END,"
+            " 'horizon', ?4, 'model', ?5, 'receipt', 1,"
+            " 'time_col', ?6, 'value_col', ?7)",
+            -1, &pj, NULL) == SQLITE_OK) {
+      sqlite3_bind_double(pj, 1, opts.confidence);
+      sqlite3_bind_int(pj, 2, opts.context_limit);
+      sqlite3_bind_text(pj, 3, group_json, -1, SQLITE_STATIC);
+      sqlite3_bind_int(pj, 4, horizon);
+      sqlite3_bind_text(pj, 5, model_id, -1, SQLITE_STATIC);
+      if (resolved_time)
+        sqlite3_bind_text(pj, 6, resolved_time, -1, SQLITE_STATIC);
+      if (resolved_value)
+        sqlite3_bind_text(pj, 7, resolved_value, -1, SQLITE_STATIC);
+      if (sqlite3_step(pj) == SQLITE_ROW)
+        params = sqlite3_mprintf(
+            "%s", (const char *)sqlite3_column_text(pj, 0));
+      sqlite3_finalize(pj);
+    }
+    if (!params) {
+      sqlite3_free(model_hash);
+      vtab->base.zErrMsg = sqlite3_mprintf(
+          "%s: could not canonicalize params", PREDICT_ERR_RESOURCE);
+      goto receipt_fail;
+    }
+
+    char receipt_id[27];
+    int irc = predict0_receipt_insert(db, "forecast", model_id, model_hash,
+                                      "logical-digest", digest, params, query,
+                                      result_hash, receipt_id, &errmsg);
+    sqlite3_free(model_hash);
+    sqlite3_free(params);
+    if (irc != SQLITE_OK) {
+      sqlite3_free(vtab->base.zErrMsg);
+      vtab->base.zErrMsg = errmsg;
+      goto receipt_fail;
+    }
+    for (int i = 0; i < cur->n_rows; i++)
+      memcpy(cur->rows[i].receipt_id, receipt_id, sizeof(receipt_id));
+  }
+
+  sqlite3_free(resolved_time);
+  sqlite3_free(resolved_value);
+  forecast_opts_free(&opts);
   cur->i = 0;
   return SQLITE_OK;
+
+receipt_fail:
+  sqlite3_free(resolved_time);
+  sqlite3_free(resolved_value);
+  forecast_opts_free(&opts);
+  fc_rows_free(cur);
+  return SQLITE_ERROR;
 }
 
 static int fc_next(sqlite3_vtab_cursor *pCur) {
@@ -907,7 +1065,8 @@ static int fc_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
     sqlite3_result_text(ctx, r->status, -1, SQLITE_STATIC);
     break;
   case FC_COL_RECEIPT:
-    /* receipts land in M2 */
+    if (r->receipt_id[0])
+      sqlite3_result_text(ctx, r->receipt_id, -1, SQLITE_TRANSIENT);
     break;
   default:
     break;
