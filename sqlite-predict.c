@@ -75,8 +75,8 @@ int predict0_parse_timestamp(const char *s, i64 *out_ms) {
     n++;
   if (s[n] != '\0')
     return 1;
-  if (mo < 1 || mo > 12 || d < 1 || d > days_in_month(y, mo) || h > 23 ||
-      mi > 59 || sec > 60)
+  if (y < 1970 || y > 9999 || mo < 1 || mo > 12 || d < 1 ||
+      d > days_in_month(y, mo) || h > 23 || mi > 59 || sec > 60)
     return 1;
 
   /* days since 1970-01-01, civil-from-days style */

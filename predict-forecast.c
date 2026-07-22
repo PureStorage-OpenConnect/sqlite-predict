@@ -687,7 +687,6 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   int n_series = 0, series_cap = 0;
   i64 total_rows = 0;
   int inference_done = (time_idx >= 0 && value_idx >= 0);
-  char keybuf[512];
 
   while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     if (!inference_done) {
@@ -745,19 +744,20 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     }
 
     /* series key: group values joined with 0x1F */
-    keybuf[0] = '\0';
-    usize kl = 0;
-    for (int g = 0; g < opts.n_group_cols; g++) {
+    /* dynamic key: fixed buffers truncate long group values, silently
+     * merging distinct series */
+    char *key = sqlite3_mprintf("%s", "");
+    for (int g = 0; key && g < opts.n_group_cols; g++) {
       const char *gv = (const char *)sqlite3_column_text(stmt, group_idx[g]);
-      int wrote = snprintf(keybuf + kl, sizeof(keybuf) - kl, "%s%s",
-                           g ? "\x1f" : "", gv ? gv : "");
-      if (wrote > 0)
-        kl += (usize)wrote;
-      if (kl >= sizeof(keybuf) - 1)
-        break;
+      key = sqlite3_mprintf("%z%s%s", key, g ? "\x1f" : "", gv ? gv : "");
+    }
+    if (!key) {
+      rc = SQLITE_NOMEM;
+      break;
     }
 
-    SeriesBuf *s = series_find(&series, &n_series, &series_cap, keybuf);
+    SeriesBuf *s = series_find(&series, &n_series, &series_cap, key);
+    sqlite3_free(key);
     if (!s) {
       rc = SQLITE_NOMEM;
       break;
@@ -768,7 +768,9 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     i64 ms = 0;
     int tt = sqlite3_column_type(stmt, time_idx);
     if (tt == SQLITE_INTEGER) {
-      ms = sqlite3_column_int64(stmt, time_idx) * 1000;
+      /* 13-digit integers are already epoch ms; shorter are seconds */
+      i64 raw = sqlite3_column_int64(stmt, time_idx);
+      ms = raw > 99999999999LL ? raw : raw * 1000;
     } else if (predict0_parse_timestamp(
                    (const char *)sqlite3_column_text(stmt, time_idx), &ms)) {
       s->non_numeric = 1; /* unparseable time in this series */
@@ -1443,7 +1445,6 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   int n_series = 0, series_cap = 0;
   i64 total_rows = 0;
   int inference_done = (time_idx >= 0 && value_idx >= 0);
-  char keybuf[512];
 
   while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     if (!inference_done) {
@@ -1478,18 +1479,19 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     if (++total_rows > FORECAST_MAX_TOTAL_ROWS)
       break;
 
-    keybuf[0] = '\0';
-    usize kl = 0;
-    for (int g = 0; g < opts.n_group_cols; g++) {
+    /* dynamic key: fixed buffers truncate long group values, silently
+     * merging distinct series */
+    char *key = sqlite3_mprintf("%s", "");
+    for (int g = 0; key && g < opts.n_group_cols; g++) {
       const char *gv = (const char *)sqlite3_column_text(stmt, group_idx[g]);
-      int wrote = snprintf(keybuf + kl, sizeof(keybuf) - kl, "%s%s",
-                           g ? "\x1f" : "", gv ? gv : "");
-      if (wrote > 0)
-        kl += (usize)wrote;
-      if (kl >= sizeof(keybuf) - 1)
-        break;
+      key = sqlite3_mprintf("%z%s%s", key, g ? "\x1f" : "", gv ? gv : "");
     }
-    SeriesBuf *s = series_find(&series, &n_series, &series_cap, keybuf);
+    if (!key) {
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    SeriesBuf *s = series_find(&series, &n_series, &series_cap, key);
+    sqlite3_free(key);
     if (!s) {
       rc = SQLITE_NOMEM;
       break;
@@ -1499,7 +1501,9 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     i64 ms = 0;
     int tt = sqlite3_column_type(stmt, time_idx);
     if (tt == SQLITE_INTEGER) {
-      ms = sqlite3_column_int64(stmt, time_idx) * 1000;
+      /* 13-digit integers are already epoch ms; shorter are seconds */
+      i64 raw = sqlite3_column_int64(stmt, time_idx);
+      ms = raw > 99999999999LL ? raw : raw * 1000;
     } else if (predict0_parse_timestamp(
                    (const char *)sqlite3_column_text(stmt, time_idx), &ms)) {
       s->non_numeric = 1;

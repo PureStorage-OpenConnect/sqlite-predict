@@ -332,7 +332,16 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     const char *nm = sqlite3_column_name(ts, i);
     if (nm && strcmp(nm, opts.target) == 0) {
       target_idx = i;
-    } else if (nfeat < TAB_MAX_FEAT) {
+    } else {
+      if (nfeat == TAB_MAX_FEAT) {
+        sqlite3_finalize(ts);
+        for (int f = 0; f < nfeat; f++)
+          sqlite3_free(feat_names[f]);
+        rc = pr_error(cur, PREDICT_ERR_SCHEMA,
+                      "too many feature columns (max 64)", NULL);
+        pred_opts_free(&opts);
+        return rc;
+      }
       feat_names[nfeat] = sqlite3_mprintf("%s", nm ? nm : "");
       feat_idx[nfeat] = i;
       nfeat++;

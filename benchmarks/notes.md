@@ -86,3 +86,21 @@ as opt-in teachers (ONNX build), never default serving.
 7. Interval calibration: coverage tolerance needs a normative bound
    (both our over-coverage and chronos's under-coverage would fail a
    ±5% band).
+
+## Hardening (M6, 2026-07-22)
+
+- Audit found and fixed three real bugs: silent feature drop past 64
+  cols (now PREDICT_ERR_SCHEMA), 512-byte group-key truncation silently
+  merging distinct series (now dynamic keys), and epoch-ms integers
+  misread as seconds (13-digit heuristic; pre-1970 rejected). Plus one
+  earlier use-after-free in an error path caught by the adversarial
+  suite. All have regression tests.
+- Transaction semantics decided and pinned: receipts participate in the
+  enclosing transaction; rollback discards the receipt with the rows.
+- ASan+UBSan (non-recoverable): clean over the full C soak.
+- valgrind (Linux/gcc container): 83,736 allocs = 83,736 frees, zero
+  errors, "no leaks are possible". First Linux build, passing.
+- libFuzzer+ASan (Linux container): 194,114 runs / 121s over options
+  JSON, query SQL, and ulid/receipt inputs — zero crashes; corpus kept
+  in fuzz/corpus/.
+- pytest leak soak: bounded RSS over 1,200 mixed calls.

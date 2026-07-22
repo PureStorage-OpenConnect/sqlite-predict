@@ -65,6 +65,51 @@ test-loadable: loadable
 
 test: test-loadable
 
+# ASan+UBSan on the C soak driver (standalone executable: no DYLD
+# injection needed, macOS SIP strips it for system binaries anyway).
+# Covers every operation, receipts, replay, and the error paths.
+test-asan: vendor/sqlite3ext.h sqlite-predict.h
+	mkdir -p $(prefix)
+	clang -std=c99 -g -O1 -fsanitize=address,undefined \
+	  -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
+	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -Ivendor/ -I./ \
+	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak-asan
+	UBSAN_OPTIONS=print_stacktrace=1 ./$(prefix)/soak-asan
+
+# libFuzzer harness (statically links sqlite3.c; SQLITE_CORE build)
+fuzz-build: vendor/sqlite3ext.h sqlite-predict.h
+	mkdir -p $(prefix)
+	clang -std=c99 -g -O1 -fsanitize=fuzzer,address,undefined \
+	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -Ivendor/ -I./ \
+	  fuzz/fuzz_predict.c $(OBJS) vendor/sqlite3.c \
+	  -o $(prefix)/fuzz_predict
+
+fuzz: fuzz-build
+	mkdir -p fuzz/corpus
+	./$(prefix)/fuzz_predict -max_total_time=$${FUZZ_SECONDS:-60} \
+	  -max_len=512 fuzz/corpus fuzz/seeds
+
+# Apple clang ships no libFuzzer runtime; fuzz in a Linux container.
+fuzz-docker:
+	docker run --rm -v $$(pwd):/src -w /src silkeh/clang:17 bash -c "\
+	  mkdir -p dist fuzz/corpus && \
+	  clang -std=c99 -g -O1 -fsanitize=fuzzer,address \
+	    -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -Ivendor/ -I./ \
+	    fuzz/fuzz_predict.c $(OBJS) vendor/sqlite3.c \
+	    -o dist/fuzz_predict_linux -lm -lpthread -ldl && \
+	  ./dist/fuzz_predict_linux -max_total_time=$${FUZZ_SECONDS:-60} \
+	    -max_len=512 fuzz/corpus fuzz/seeds"
+
+# real valgrind, in a Linux container (also exercises gcc + glibc)
+test-valgrind:
+	docker run --rm -v $$(pwd):/src -w /src gcc:13 bash -c "\
+	  apt-get update -qq && apt-get install -y -qq valgrind unzip curl python3 > /dev/null && \
+	  make clean && make loadable CC=gcc && \
+	  gcc -std=c99 -g -O0 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
+	    tests/soak.c $(OBJS) vendor/sqlite3.c -o dist/soak -lm -lpthread -ldl && \
+	  valgrind --leak-check=full --error-exitcode=9 --errors-for-leak-kinds=definite \
+	    ./dist/soak"
+
 clean:
 	rm -rf $(prefix) sqlite-predict.h
 
