@@ -1,7 +1,7 @@
 # Contributing to sqlite-predict
 
-Thanks for your interest. This project is pre-alpha; the API and formats
-are unstable, so it's a good time to influence them.
+This project is pre-alpha. The API and the on-disk formats are still
+unstable, which makes now a good time to influence them.
 
 ## Ground rules
 

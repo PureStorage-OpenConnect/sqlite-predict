@@ -29,9 +29,9 @@ the same shape to the database that runs everywhere else: on the edge, in
 the browser, on a phone, and inside the local-first databases that AI
 agents increasingly sit on.
 
-It also adds the piece none of the cloud versions have. Every prediction
-carries a **receipt**, so an agent can cite a number as a fact and an
-auditor can reproduce it.
+The cloud versions stop at the prediction. This one keeps going: every
+result carries a **receipt** that pins down the model and the exact data it
+read, so an agent can cite the number and an auditor can reproduce it.
 
 ## Operations
 

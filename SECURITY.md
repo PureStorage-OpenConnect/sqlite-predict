@@ -6,7 +6,7 @@ Please report suspected vulnerabilities privately. **Do not open a public
 issue for security reports.**
 
 - Use GitHub's [private vulnerability reporting][ghsa] on this repository
-  ("Security" tab → "Report a vulnerability"), or
+  (the Security tab, then "Report a vulnerability"), or
 - Email the Pure Storage security team at **psirt@purestorage.com**.
 
 Please include a description, reproduction steps or a proof of concept, and
