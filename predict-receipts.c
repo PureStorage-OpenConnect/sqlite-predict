@@ -18,7 +18,7 @@ SQLITE_EXTENSION_INIT3
 void predict0_hash_init(predict0_hasher *h) { sha256_init(&h->sha); }
 
 static void hash_sep(predict0_hasher *h) {
-  static const u8 fs = 0x1f;
+  static const u8 fs = PREDICT_FS;
   sha256_update(&h->sha, &fs, 1);
 }
 
@@ -53,11 +53,11 @@ void predict0_hash_text(predict0_hasher *h, const char *s) {
 }
 
 void predict0_hash_row_end(predict0_hasher *h) {
-  static const u8 rs = 0x1e;
+  static const u8 rs = PREDICT_RS;
   sha256_update(&h->sha, &rs, 1);
 }
 
-void predict0_hash_hex(predict0_hasher *h, char hex[65]) {
+void predict0_hash_hex(predict0_hasher *h, char hex[PREDICT_HEX_BUFSIZE]) {
   u8 digest[32];
   sha256_final(&h->sha, digest);
   static const char *hexd = "0123456789abcdef";
@@ -65,7 +65,7 @@ void predict0_hash_hex(predict0_hasher *h, char hex[65]) {
     hex[i * 2] = hexd[digest[i] >> 4];
     hex[i * 2 + 1] = hexd[digest[i] & 0xf];
   }
-  hex[64] = '\0';
+  hex[PREDICT_HEX_BUFSIZE - 1] = 0;
 }
 
 static void hash_column_value(predict0_hasher *h, sqlite3_stmt *stmt,
@@ -133,7 +133,7 @@ static int bundled_model_row(sqlite3 *db, const char *id, const char *kind) {
     return SQLITE_NOMEM;
   sha256_update(&h.sha, (const u8 *)desc, strlen(desc));
   sqlite3_free(desc);
-  char hex[65];
+  char hex[PREDICT_HEX_BUFSIZE];
   predict0_hash_hex(&h, hex);
 
   char *sql = sqlite3_mprintf(
@@ -189,7 +189,7 @@ char *predict0_registry_model_hash(sqlite3 *db, const char *model_id) {
 
 #pragma region digest
 
-int predict0_logical_digest(sqlite3 *db, char out[65], char **errmsg) {
+int predict0_logical_digest(sqlite3 *db, char out[PREDICT_HEX_BUFSIZE], char **errmsg) {
   predict0_hasher h;
   predict0_hash_init(&h);
 
@@ -260,7 +260,7 @@ int predict0_receipt_insert(sqlite3 *db, const char *operation,
                             const char *model_id, const char *model_hash,
                             const char *anchor_kind, const char *anchor,
                             const char *params, const char *input_sql,
-                            const char *result_hash, char receipt_id_out[27],
+                            const char *result_hash, char receipt_id_out[PREDICT_ULID_BUFSIZE],
                             char **errmsg) {
   i64 now_ms = 0;
   sqlite3_stmt *now = NULL;
@@ -511,7 +511,7 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     RP_CLEANUP();
     return r;
   }
-  char digest[65];
+  char digest[PREDICT_HEX_BUFSIZE];
   char *errmsg = NULL;
   if (predict0_logical_digest(db, digest, &errmsg)) {
     sqlite3_free(vtab->base.zErrMsg);

@@ -379,11 +379,11 @@ static const char *const ANOMALY_OPTION_KEYS[] = {
 typedef struct {
   char *series_key;
   int step;
-  char ts[24];
+  char ts[PREDICT_TS_BUFSIZE];
   f64 forecast, lower, upper;
   const char *status; /* static strings only */
   int has_values;     /* 0 for status-only rows */
-  char receipt_id[27];
+  char receipt_id[PREDICT_ULID_BUFSIZE];
 } ForecastRow;
 
 static int forecast_row_cmp(const void *a, const void *b) {
@@ -770,7 +770,27 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     if (tt == SQLITE_INTEGER) {
       /* 13-digit integers are already epoch ms; shorter are seconds */
       i64 raw = sqlite3_column_int64(stmt, time_idx);
-      ms = raw > 99999999999LL ? raw : raw * 1000;
+      /* epoch column: reject negatives (bug source) and out-of-domain
+
+       * values as non_numeric rather than formatting garbage */
+
+      if (raw < 0) {
+
+        s->non_numeric = 1;
+
+        continue;
+
+      }
+
+      ms = raw >= PREDICT_EPOCH_MS_THRESHOLD ? raw : raw * 1000;
+
+      if (ms > PREDICT_MS_MAX) {
+
+        s->non_numeric = 1;
+
+        continue;
+
+      }
     } else if (predict0_parse_timestamp(
                    (const char *)sqlite3_column_text(stmt, time_idx), &ms)) {
       s->non_numeric = 1; /* unparseable time in this series */
@@ -869,10 +889,10 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     }
 
     /* median step from sorted timestamps */
-    i64 step_ms = 3600000;
+    i64 step_ms = PREDICT_MS_PER_HOUR;
     if (n > 1) {
       i64 span = ts[n - 1] - ts[0];
-      step_ms = span > 0 ? span / (n - 1) : 3600000;
+      step_ms = span > 0 ? span / (n - 1) : PREDICT_MS_PER_HOUR;
     }
 
     model(y, n, horizon, fc, sg);
@@ -924,7 +944,7 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
           model_id);
       goto receipt_fail;
     }
-    char digest[65];
+    char digest[PREDICT_HEX_BUFSIZE];
     if (predict0_logical_digest(db, digest, &errmsg)) {
       sqlite3_free(model_hash);
       sqlite3_free(vtab->base.zErrMsg);
@@ -961,7 +981,7 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       predict0_hash_row_end(&h);
     }
     sqlite3_free(order);
-    char result_hash[65];
+    char result_hash[PREDICT_HEX_BUFSIZE];
     predict0_hash_hex(&h, result_hash);
 
     /* canonical params via json_object (keys alphabetical) */
@@ -1005,7 +1025,7 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       goto receipt_fail;
     }
 
-    char receipt_id[27];
+    char receipt_id[PREDICT_ULID_BUFSIZE];
     int irc = predict0_receipt_insert(db, "forecast", model_id, model_hash,
                                       "logical-digest", digest, params, query,
                                       result_hash, receipt_id, &errmsg);
@@ -1142,13 +1162,13 @@ static sqlite3_module forecastModule = {
 
 typedef struct {
   char *series_key;
-  char ts[24];
+  char ts[PREDICT_TS_BUFSIZE];
   f64 value, fc, lo, hi, prob;
   int is_anom;
   int has_pred; /* 0 during warmup */
   int has_values;
   const char *status;
-  char receipt_id[27];
+  char receipt_id[PREDICT_ULID_BUFSIZE];
 } AnomRow;
 
 typedef struct {
@@ -1503,7 +1523,27 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     if (tt == SQLITE_INTEGER) {
       /* 13-digit integers are already epoch ms; shorter are seconds */
       i64 raw = sqlite3_column_int64(stmt, time_idx);
-      ms = raw > 99999999999LL ? raw : raw * 1000;
+      /* epoch column: reject negatives (bug source) and out-of-domain
+
+       * values as non_numeric rather than formatting garbage */
+
+      if (raw < 0) {
+
+        s->non_numeric = 1;
+
+        continue;
+
+      }
+
+      ms = raw >= PREDICT_EPOCH_MS_THRESHOLD ? raw : raw * 1000;
+
+      if (ms > PREDICT_MS_MAX) {
+
+        s->non_numeric = 1;
+
+        continue;
+
+      }
     } else if (predict0_parse_timestamp(
                    (const char *)sqlite3_column_text(stmt, time_idx), &ms)) {
       s->non_numeric = 1;
@@ -1655,7 +1695,7 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       return SQLITE_ERROR;
     }
     char *model_hash = predict0_registry_model_hash(db, model_id);
-    char digest[65];
+    char digest[PREDICT_HEX_BUFSIZE];
     if (!model_hash || predict0_logical_digest(db, digest, &rerr)) {
       sqlite3_free(model_hash);
       if (rerr) {
@@ -1711,7 +1751,7 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       predict0_hash_row_end(&h);
     }
     sqlite3_free(order);
-    char result_hash[65];
+    char result_hash[PREDICT_HEX_BUFSIZE];
     predict0_hash_hex(&h, result_hash);
 
     char group_json[600] = "";
@@ -1753,7 +1793,7 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       return an_error(cur, PREDICT_ERR_RESOURCE,
                       "could not canonicalize params", NULL);
     }
-    char receipt_id[27];
+    char receipt_id[PREDICT_ULID_BUFSIZE];
     int irc = predict0_receipt_insert(db, "detect_anomalies", model_id,
                                       model_hash, "logical-digest", digest,
                                       params, query, result_hash, receipt_id,

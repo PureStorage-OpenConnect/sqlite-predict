@@ -47,68 +47,113 @@ static int days_in_month(int y, int m) {
   return d[m - 1];
 }
 
+/* Days from 1970-01-01 to a proleptic-Gregorian date, and its inverse
+ * (Howard Hinnant's branch-free O(1) algorithms). Correct for the whole
+ * 0001..9999 range; replaces the old O(years) accumulation loops that
+ * turned a large epoch into a 294k-iteration DoS. */
+static i64 days_from_civil(i64 y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  i64 era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (i64)doe - 719468;
+}
+
+static void civil_from_days(i64 z, int *y, int *m, int *d) {
+  z += 719468;
+  i64 era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097);
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  i64 yy = (i64)yoe + era * 400;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+  *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+  *y = (int)(yy + (*m <= 2));
+}
+
+/* Read exactly `want` ASCII digits (no sign, no whitespace) at *pos,
+ * advancing *pos. Returns the value, or -1 if fewer than `want` digits
+ * are present. `want` is the minimum; single-digit fields are tolerated
+ * only when `flex` and the field is unambiguously terminated. */
+static int read_digits(const char *s, int *pos, int min_d, int max_d) {
+  int v = 0, got = 0;
+  while (got < max_d && s[*pos] >= '0' && s[*pos] <= '9') {
+    v = v * 10 + (s[*pos] - '0');
+    (*pos)++;
+    got++;
+  }
+  return got >= min_d ? v : -1;
+}
+
 int predict0_parse_timestamp(const char *s, i64 *out_ms) {
-  int y, mo, d, h = 0, mi = 0, sec = 0;
-  int n = 0;
   if (!s)
     return 1;
-  if (sscanf(s, "%4d-%2d-%2d%n", &y, &mo, &d, &n) != 3)
+  int p = 0;
+  int y = read_digits(s, &p, 1, 4);
+  if (y < 1 || s[p] != '-')
     return 1;
-  if (s[n] == 'T' || s[n] == ' ') {
-    int n2 = 0;
-    if (sscanf(s + n + 1, "%2d:%2d%n", &h, &mi, &n2) != 2)
+  p++;
+  int mo = read_digits(s, &p, 1, 2);
+  if (mo < 1 || s[p] != '-')
+    return 1;
+  p++;
+  int d = read_digits(s, &p, 1, 2);
+  if (d < 1)
+    return 1;
+
+  int h = 0, mi = 0, sec = 0;
+  if (s[p] == 'T' || s[p] == ' ') {
+    p++;
+    h = read_digits(s, &p, 1, 2);
+    if (h < 0 || s[p] != ':')
       return 1;
-    n += 1 + n2;
-    if (s[n] == ':') {
-      int n3 = 0;
-      if (sscanf(s + n + 1, "%2d%n", &sec, &n3) != 1)
+    p++;
+    mi = read_digits(s, &p, 1, 2);
+    if (mi < 0)
+      return 1;
+    if (s[p] == ':') {
+      p++;
+      sec = read_digits(s, &p, 1, 2);
+      if (sec < 0)
         return 1;
-      n += 1 + n3;
-      if (s[n] == '.') { /* skip fractional seconds */
-        n++;
-        while (s[n] >= '0' && s[n] <= '9')
-          n++;
+      if (s[p] == '.') { /* fractional seconds: parsed, not retained */
+        p++;
+        if (read_digits(s, &p, 1, 9) < 0)
+          return 1;
       }
     }
   }
-  if (s[n] == 'Z')
-    n++;
-  if (s[n] != '\0')
+  if (s[p] == 'Z')
+    p++;
+  if (s[p] != '\0')
     return 1;
-  if (y < 1970 || y > 9999 || mo < 1 || mo > 12 || d < 1 ||
-      d > days_in_month(y, mo) || h > 23 || mi > 59 || sec > 60)
+  if (y > 9999 || mo > 12 || d > days_in_month(y, mo) || h > 23 ||
+      mi > 59 || sec > 59)
     return 1;
 
-  /* days since 1970-01-01, civil-from-days style */
-  i64 days = 0;
-  for (int yy = 1970; yy < y; yy++)
-    days += ((yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0) ? 366 : 365;
-  for (int mm = 1; mm < mo; mm++)
-    days += days_in_month(y, mm);
-  days += d - 1;
-  *out_ms = ((days * 24 + h) * 60 + mi) * (i64)60 * 1000 + (i64)sec * 1000;
+  i64 days = days_from_civil(y, (unsigned)mo, (unsigned)d);
+  *out_ms = ((days * 24 + h) * 60 + mi) * 60 * 1000 + (i64)sec * 1000;
   return 0;
 }
 
 void predict0_format_timestamp(i64 ms, char *buf, usize bufsize) {
+  if (ms < PREDICT_MS_MIN)
+    ms = PREDICT_MS_MIN; /* clamp keeps the year in 0001..9999, so the */
+  if (ms > PREDICT_MS_MAX)
+    ms = PREDICT_MS_MAX; /* output is always 20 chars and never overflows */
   i64 secs = ms / 1000;
   i64 days = secs / 86400;
-  int rem = (int)(secs % 86400);
-  int y = 1970;
-  for (;;) {
-    int len = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 366 : 365;
-    if (days < len)
-      break;
-    days -= len;
-    y++;
+  int rem = (int)(secs - days * 86400); /* floored: rem always in [0,86400) */
+  if (rem < 0) {
+    rem += 86400;
+    days -= 1;
   }
-  int mo = 1;
-  while (days >= days_in_month(y, mo)) {
-    days -= days_in_month(y, mo);
-    mo++;
-  }
-  snprintf(buf, bufsize, "%04d-%02d-%02dT%02d:%02d:%02dZ", y, mo,
-           (int)days + 1, rem / 3600, (rem / 60) % 60, rem % 60);
+  int y, mo, d;
+  civil_from_days(days, &y, &mo, &d);
+  snprintf(buf, bufsize, "%04d-%02d-%02dT%02d:%02d:%02dZ", y, mo, d,
+           rem / 3600, (rem / 60) % 60, rem % 60);
 }
 
 f64 predict0_norm_quantile(f64 p) {
@@ -270,7 +315,7 @@ static void predict_ulid_fn(sqlite3_context *context, int argc,
     sqlite3_free(e);
     return;
   }
-  char buf[27];
+  char buf[PREDICT_ULID_BUFSIZE];
   predict0_ulid_min(ms, buf);
   sqlite3_result_text(context, buf, 26, SQLITE_TRANSIENT);
 }

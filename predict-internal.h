@@ -23,6 +23,29 @@ typedef size_t usize;
 #define UNUSED_PARAMETER(X) (void)(X)
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
+/* Wire-format contracts. These are duplicated across the key builder,
+ * the result hasher, and the RFC §4.1.3 spec; they MUST agree, so they
+ * live in exactly one place. */
+#define PREDICT_FS 0x1f /* field separator: series keys + result hash */
+#define PREDICT_RS 0x1e /* row separator: result hash */
+
+/* Buffer sizes encoding fixed-width invariants. */
+#define PREDICT_TS_BUFSIZE 24   /* "YYYY-MM-DDTHH:MM:SSZ" (20) + slack */
+#define PREDICT_ULID_BUFSIZE 27 /* 26 Crockford base32 chars + NUL */
+#define PREDICT_HEX_BUFSIZE 65  /* 64 lowercase SHA-256 hex chars + NUL */
+
+/* Representable timestamp domain: proleptic Gregorian years 0001..9999
+ * (the ISO 8601 range), in epoch milliseconds. Every value handed to
+ * predict0_format_timestamp is clamped here, so formatting is total and
+ * buffer-safe for any i64. */
+#define PREDICT_MS_MIN (-62135596800000LL) /* 0001-01-01T00:00:00Z */
+#define PREDICT_MS_MAX (253402300799999LL) /* 9999-12-31T23:59:59.999Z */
+
+#define PREDICT_MS_PER_HOUR 3600000LL
+/* Integers at or above this are already epoch ms; below, epoch seconds.
+ * 1e11 s is year 5138; 1e11 ms is year 1973 — no realistic overlap. */
+#define PREDICT_EPOCH_MS_THRESHOLD 100000000000LL
+
 /* Closed call-error set, RFC 0005 §4.3. Raised as "PREDICT_ERR_<NAME>: detail". */
 #define PREDICT_ERR_OPTIONS "PREDICT_ERR_OPTIONS"
 #define PREDICT_ERR_QUERY_NOT_READONLY "PREDICT_ERR_QUERY_NOT_READONLY"
@@ -93,7 +116,7 @@ void predict0_hash_int(predict0_hasher *h, i64 v);
 void predict0_hash_real(predict0_hasher *h, f64 v);
 void predict0_hash_text(predict0_hasher *h, const char *s);
 void predict0_hash_row_end(predict0_hasher *h);
-void predict0_hash_hex(predict0_hasher *h, char hex[65]);
+void predict0_hash_hex(predict0_hasher *h, char hex[PREDICT_HEX_BUFSIZE]);
 
 /* Idempotent DDL for _predict_models/_predict_receipts + bundled rows. */
 int predict0_receipts_ensure(sqlite3 *db, char **errmsg);
@@ -103,7 +126,7 @@ char *predict0_registry_model_hash(sqlite3 *db, const char *model_id);
 
 /* Deterministic logical digest of all user tables (schema + rows,
  * excluding _predict_% and sqlite_%), hex into out[65]. */
-int predict0_logical_digest(sqlite3 *db, char out[65], char **errmsg);
+int predict0_logical_digest(sqlite3 *db, char out[PREDICT_HEX_BUFSIZE], char **errmsg);
 
 /* Insert one receipt row. anchor/params/input_sql/result_hash owned by
  * caller. receipt_id_out[27] receives the new ULID. */
@@ -111,7 +134,7 @@ int predict0_receipt_insert(sqlite3 *db, const char *operation,
                             const char *model_id, const char *model_hash,
                             const char *anchor_kind, const char *anchor,
                             const char *params, const char *input_sql,
-                            const char *result_hash, char receipt_id_out[27],
+                            const char *result_hash, char receipt_id_out[PREDICT_ULID_BUFSIZE],
                             char **errmsg);
 
 #endif /* PREDICT_INTERNAL_H */

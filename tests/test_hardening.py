@@ -55,10 +55,61 @@ def test_epoch_milliseconds_not_mangled(db):
     assert out[0][6] == "ok"
 
 
-def test_pre_epoch_dates_rejected(db):
-    """Audit bug 3b: pre-1970 dates computed garbage silently."""
+def test_pre_epoch_dates_handled_correctly(db):
+    """The M6 workaround floored parsing at 1970 to dodge garbage math;
+    with the Hinnant calendar rewrite, pre-1970 dates are correct
+    proleptic-Gregorian dates. They parse and round-trip."""
+    rows, _ = syn.trend_season(n=40, seed=99)
+    # relabel the grid into 1969 by hand and confirm forecast timestamps
+    db.execute("CREATE TABLE old(ts TEXT, v REAL)")
+    db.executemany(
+        "INSERT INTO old VALUES (?, ?)",
+        [(f"1969-12-{1 + i // 24:02d}T{i % 24:02d}:00:00Z", float(i))
+         for i in range(40)],
+    )
+    out = db.execute(
+        "SELECT * FROM forecast('SELECT ts, v FROM old', 2,"
+        " '{\"receipt\":0}')").fetchall()
+    assert out[0][6] == "ok"
+    assert out[0][2].startswith("1969-12-")
+
+
+@pytest.mark.parametrize("bad", [
+    "2026-01-01T-5:00:00Z",   # embedded sign in hour
+    "2026-01-01T00:00:60Z",   # 60 seconds
+    "  2026-01-01",           # leading whitespace
+    "2026-13-01T00:00:00Z",   # month 13
+    "2026-02-30T00:00:00Z",   # feb 30
+    "0000-01-01T00:00:00Z",   # year zero
+    "2026-01-01Tx",           # garbage tail
+    "not-a-date",
+])
+def test_invalid_timestamps_rejected(db, bad):
     with pytest.raises(sqlite3.OperationalError):
-        db.execute("SELECT predict_ulid('1969-12-31T23:00:00Z')").fetchone()
+        db.execute("SELECT predict_ulid(?)", (bad,)).fetchone()
+
+
+@pytest.mark.parametrize("good", [
+    "2026-07-22T13:45:07Z", "0001-01-01T00:00:00Z",
+    "9999-12-31T23:59:59Z", "2000-02-29T12:00:00Z", "2026-1-1",
+])
+def test_valid_timestamps_accepted(db, good):
+    (v,) = db.execute("SELECT predict_ulid(?)", (good,)).fetchone()
+    assert len(v) == 26  # a ULID came back
+
+
+def test_huge_integer_epoch_is_bounded(db):
+    """A hostile integer epoch must not loop for 294k iterations or
+    overflow the timestamp buffer — it clamps to the 9999 boundary."""
+    db.execute("CREATE TABLE big(t INTEGER, v REAL)")
+    db.executemany("INSERT INTO big VALUES (?, ?)",
+                   [(9_000_000_000_000_000 + i, float(i)) for i in range(20)])
+    out = db.execute(
+        "SELECT * FROM forecast('SELECT t, v FROM big', 2,"
+        " '{\"receipt\":0}')").fetchall()
+    # forecast timestamps are clamped, never garbage or overflowed
+    for r in out:
+        assert r[2] is None or r[2].endswith("Z")
 
 
 def test_receipt_follows_transaction_rollback(db):

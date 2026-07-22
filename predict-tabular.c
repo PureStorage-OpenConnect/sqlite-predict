@@ -36,7 +36,7 @@ typedef struct {
   f64 confidence;
   int has_conf;
   const char *status;
-  char receipt_id[27];
+  char receipt_id[PREDICT_ULID_BUFSIZE];
 } PredRow;
 
 typedef struct {
@@ -618,7 +618,7 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       goto fail_train;
     }
     char *model_hash = predict0_registry_model_hash(db, model_id);
-    char digest[65];
+    char digest[PREDICT_HEX_BUFSIZE];
     if (!model_hash || predict0_logical_digest(db, digest, &rerr)) {
       sqlite3_free(model_hash);
       if (rerr) {
@@ -658,7 +658,7 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
         predict0_hash_null(&h);
       predict0_hash_row_end(&h);
     }
-    char result_hash[65];
+    char result_hash[PREDICT_HEX_BUFSIZE];
     predict0_hash_hex(&h, result_hash);
 
     sqlite3_stmt *pj = NULL;
@@ -690,7 +690,7 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                     "could not canonicalize params", NULL);
       goto fail_train;
     }
-    char receipt_id[27];
+    char receipt_id[PREDICT_ULID_BUFSIZE];
     int irc = predict0_receipt_insert(db, "predict", model_id, model_hash,
                                       "logical-digest", digest, params,
                                       input_json, result_hash, receipt_id,
