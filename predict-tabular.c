@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0
+ * Copyright (c) 2026 Pure Storage, Inc.
+ */
 /* predict(train_query, apply_query, options) — RFC 0005 §4.2.3.
  * v0 backing: knn5-incontext (kind 'tabular-stat'), the measured honest
  * baseline from the benchmark campaign: z-scored 5-NN with per-column

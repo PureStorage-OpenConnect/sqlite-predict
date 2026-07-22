@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0
+ * Copyright (c) 2026 Pure Storage, Inc.
+ */
 #ifndef PREDICT_INTERNAL_H
 #define PREDICT_INTERNAL_H
 

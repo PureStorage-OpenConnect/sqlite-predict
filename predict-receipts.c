@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0
+ * Copyright (c) 2026 Pure Storage, Inc.
+ */
 /* Model registry, receipts, canonical hashing, logical-digest anchors,
  * and the predict_replay() table-valued function. RFC 0005 §4.1, §4.2.6.
  *

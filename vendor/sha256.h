@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0
+ * Copyright (c) 2026 Pure Storage, Inc.
+ */
 /* SHA-256. Public-domain style single-file implementation (FIPS 180-4). */
 #ifndef PREDICT_SHA256_H
 #define PREDICT_SHA256_H

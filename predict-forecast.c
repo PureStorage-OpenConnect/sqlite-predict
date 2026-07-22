@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0
+ * Copyright (c) 2026 Pure Storage, Inc.
+ */
 /* forecast(query, horizon, options) — eponymous table-valued function.
  * RFC 0005 §4.2.1. Vtab shape follows SQLite's ext/misc/series.c. */
 #include "predict-internal.h"

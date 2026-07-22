@@ -111,6 +111,11 @@ test-valgrind: vendor/sqlite3ext.h sqlite-predict.h
 	  valgrind --leak-check=full --error-exitcode=9 --errors-for-leak-kinds=definite \
 	    ./dist/soak-linux"
 
+# standalone soak binary (used by CI valgrind, and runnable directly)
+soak: $(prefix) vendor/sqlite3ext.h sqlite-predict.h
+	$(CC) -std=c99 -g -O0 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
+	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak $(LDFLAGS)
+
 clean:
 	rm -rf $(prefix) sqlite-predict.h
 

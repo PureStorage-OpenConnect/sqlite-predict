@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0
+ * Copyright (c) 2026 Pure Storage, Inc.
+ */
 #include "sha256.h"
 
 #define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))

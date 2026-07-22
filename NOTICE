@@ -1,0 +1,11 @@
+sqlite-predict
+Copyright (c) 2026 Pure Storage, Inc.
+
+This product is dual-licensed under MIT OR Apache-2.0 (see LICENSE-MIT and
+LICENSE-APACHE).
+
+This product bundles the following third-party components:
+
+  - The SQLite amalgamation headers (sqlite3.h, sqlite3ext.h), fetched at
+    build time from https://sqlite.org and not redistributed in this
+    repository. SQLite is in the public domain.
