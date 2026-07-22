@@ -61,7 +61,11 @@ typedef size_t usize;
 #define PREDICT_ERR_PROBE "PREDICT_ERR_PROBE"
 #define PREDICT_ERR_LICENSE "PREDICT_ERR_LICENSE"
 #define PREDICT_ERR_MODEL_NOT_FOUND "PREDICT_ERR_MODEL_NOT_FOUND"
+#define PREDICT_ERR_MODEL_EXISTS "PREDICT_ERR_MODEL_EXISTS"
 #define PREDICT_ERR_MODEL_HASH "PREDICT_ERR_MODEL_HASH"
+#define PREDICT_ERR_RUNTIME_UNAVAILABLE "PREDICT_ERR_RUNTIME_UNAVAILABLE"
+#define PREDICT_ERR_IO_SPEC "PREDICT_ERR_IO_SPEC"
+#define PREDICT_ERR_INFERENCE "PREDICT_ERR_INFERENCE"
 #define PREDICT_ERR_STUDENT_EXISTS "PREDICT_ERR_STUDENT_EXISTS"
 #define PREDICT_ERR_RESOURCE "PREDICT_ERR_RESOURCE"
 #define PREDICT_ERR_RECEIPT_NOT_FOUND "PREDICT_ERR_RECEIPT_NOT_FOUND"
@@ -126,6 +130,73 @@ int predict0_receipts_ensure(sqlite3 *db, char **errmsg);
 
 /* content_hash of a registered model; sqlite3_malloc'd. NULL = absent. */
 char *predict0_registry_model_hash(sqlite3 *db, const char *model_id);
+
+/* A registry row, as the dispatcher and runtime backends see it. All
+ * strings are sqlite3_malloc'd; weights is a malloc'd copy of the inline
+ * BLOB (NULL when the model is URI-referenced or has no local weights). */
+typedef struct {
+  char *runtime;      /* 'onnx' | 'ggml' | 'tree' | 'remote' | 'bundled' */
+  char *kind;         /* 'tabular-fm' | 'student' | ... */
+  char *weights_uri;  /* external path to weights; NULL if inline/none */
+  char *io_spec;      /* JSON tensor mapping; NULL if not set */
+  char *license;      /* SPDX id */
+  char *content_hash; /* hex sha-256 pinning the exact weights */
+  void *weights;      /* inline weight bytes; NULL if URI/none */
+  int weights_len;
+} predict0_model_row;
+
+/* Look up a model. Returns 0 and fills *out on hit, 1 if absent, or an
+ * SQLITE_ error. Free *out with predict0_model_row_free on a hit. */
+int predict0_registry_lookup(sqlite3 *db, const char *model_id,
+                             predict0_model_row *out);
+void predict0_model_row_free(predict0_model_row *m);
+
+/* SHA-256 of a file's bytes, streamed. hex into out[65]. Returns 0 on
+ * success; on failure sets *errmsg (sqlite3_malloc'd, PREDICT_ERR_* lead). */
+int predict0_hash_file(const char *path, char out[PREDICT_HEX_BUFSIZE],
+                       char **errmsg);
+
+/* ---- runtime backends (predict-onnx.c, opt-in build) ---- */
+
+/* Backend-relevant options, parsed from the predict() JSON. Borrowed
+ * pointers into the caller's parsed options; valid for the call only. */
+typedef struct {
+  const char *device;         /* 'cpu'|'coreml'|'cuda'|'tensorrt'; NULL=cpu */
+  const char *precision;      /* 'fp32'|'fp16'|'int8'; NULL=fp32 */
+  const char *accept_license; /* SPDX the caller accepts; NULL=none */
+  int receipt;                /* emit a receipt? */
+} predict0_backend_opts;
+
+/* One prediction a runtime backend hands back, in apply-query order. */
+typedef struct {
+  int ref_type; /* SQLITE_INTEGER/FLOAT/TEXT/NULL of the row_ref */
+  i64 ref_i;
+  f64 ref_f;
+  char *ref_t;      /* sqlite3_malloc'd, for a TEXT ref */
+  char *prediction; /* sqlite3_malloc'd; NULL on status/error rows */
+  f64 confidence;
+  int has_conf;
+  const char *status; /* static string ('ok','non_numeric',...) */
+} predict0_result;
+
+void predict0_results_free(predict0_result *rows, int n);
+
+#ifdef SQLITE_PREDICT_ONNX
+/* Vector-layout ONNX inference: the model is self-contained (features ->
+ * prediction), so train_sql is not consulted. Reads row_ref + named
+ * features from apply_sql, maps them to the model's declared feature order,
+ * runs batched inference on the requested execution provider, and fills
+ * rows/n (apply order; free with predict0_results_free). When
+ * opts->receipt, emits a receipt and writes receipt_id_out. Returns
+ * SQLITE_OK, or an SQLITE_ code with *errmsg set (PREDICT_ERR_* lead). */
+int predict0_onnx_predict_vector(sqlite3 *db, const char *model_id,
+                                 const char *apply_sql,
+                                 const predict0_model_row *model,
+                                 const predict0_backend_opts *opts,
+                                 predict0_result **rows, int *n,
+                                 char receipt_id_out[PREDICT_ULID_BUFSIZE],
+                                 char **errmsg);
+#endif
 
 /* Deterministic logical digest of all user tables (schema + rows,
  * excluding _predict_% and sqlite_%), hex into out[65]. */

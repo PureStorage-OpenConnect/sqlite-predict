@@ -106,3 +106,24 @@ jobs:
           make soak-wasm
       - name: Run under node
         run: node dist/soak.js
+
+  onnx:
+    name: onnx (cpu)
+    runs-on: ubuntu-latest
+    env:
+      ORT_VERSION: "1.27.1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Fetch onnxruntime
+        run: |
+          curl -fsSL -o ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          tar xzf ort.tgz
+          echo "ONNXRUNTIME_PREFIX=$PWD/onnxruntime-linux-x64-${ORT_VERSION}" \
+            >> "$GITHUB_ENV"
+      - name: Build the onnx variant + run its tests
+        run: make test-onnx
+      - name: ASan + LSan soak of the onnx backend
+        run: make test-asan-onnx

@@ -38,6 +38,18 @@ prefix?=dist
 TARGET_LOADABLE=$(prefix)/predict0.$(LOADABLE_EXTENSION)
 
 OBJS=sqlite-predict.c predict-forecast.c predict-receipts.c predict-tabular.c vendor/sha256.c
+ONNX_OBJS=$(OBJS) predict-onnx.c
+
+# onnxruntime is a build+runtime dependency of the loadable-onnx variant
+# only. Point ONNXRUNTIME_PREFIX at an install (dir with include/ + lib/),
+# or install it (macOS: `brew install onnxruntime`; the prefix is auto-
+# detected there). The include lives at include/ for tarball installs and
+# include/onnxruntime/ for brew, so both are on the search path.
+ONNXRUNTIME_PREFIX ?= $(shell brew --prefix onnxruntime 2>/dev/null)
+ONNX_CFLAGS=-DSQLITE_PREDICT_ONNX -I$(ONNXRUNTIME_PREFIX)/include \
+  -I$(ONNXRUNTIME_PREFIX)/include/onnxruntime
+ONNX_LDFLAGS=-L$(ONNXRUNTIME_PREFIX)/lib -lonnxruntime \
+  -Wl,-rpath,$(ONNXRUNTIME_PREFIX)/lib
 
 $(prefix):
 	mkdir -p $(prefix)
@@ -58,6 +70,14 @@ sqlite-predict.h: sqlite-predict.h.tmpl VERSION
 loadable: $(prefix) vendor/sqlite3ext.h sqlite-predict.h $(OBJS)
 	$(CC) -fPIC -shared -std=c99 -Wall -Wextra -Ivendor/ -I./ -O3 $(CFLAGS) $(OBJS) -o $(TARGET_LOADABLE) $(LDFLAGS)
 
+# opt-in ONNX build: same loadable, plus predict-onnx.c linked against
+# onnxruntime. Serves onnx-runtime models (distilled students, exported
+# classifiers) through predict(). The core `loadable` stays zero-dependency.
+loadable-onnx: $(prefix) vendor/sqlite3ext.h sqlite-predict.h $(ONNX_OBJS)
+	$(CC) -fPIC -shared -std=c99 -Wall -Wextra -Ivendor/ -I./ -O3 \
+	  $(ONNX_CFLAGS) $(CFLAGS) $(ONNX_OBJS) -o $(TARGET_LOADABLE) \
+	  $(LDFLAGS) $(ONNX_LDFLAGS)
+
 debug: $(prefix) vendor/sqlite3ext.h sqlite-predict.h $(OBJS)
 	$(CC) -fPIC -shared -std=c99 -Wall -Wextra -Ivendor/ -I./ -g -O0 -DSQLITE_PREDICT_DEBUG $(CFLAGS) $(OBJS) -o $(TARGET_LOADABLE) $(LDFLAGS)
 
@@ -65,6 +85,12 @@ test-loadable: loadable
 	cd tests && uv run pytest -q
 
 test: test-loadable
+
+# ONNX build + its tests. The onnx-marked tests build a fixture model and
+# exercise the runtime path; they self-skip when the loaded extension has
+# no onnx runtime, so the core `make test` above ignores them.
+test-onnx: loadable-onnx
+	cd tests && uv run pytest -q
 
 # ASan+UBSan on the C soak driver (standalone executable: no DYLD
 # injection needed, macOS SIP strips it for system binaries anyway).
@@ -77,6 +103,21 @@ test-asan: vendor/sqlite3ext.h sqlite-predict.h
 	  -Ivendor/ -I./ \
 	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak-asan
 	UBSAN_OPTIONS=print_stacktrace=1 ./$(prefix)/soak-asan
+
+# ASan/UBSan soak for the onnx backend (leak-checked on Linux via LSan;
+# onnxruntime's own still-reachable allocations are filtered by onnx.supp).
+# Needs onnxruntime (ONNXRUNTIME_PREFIX) and the committed fixture model.
+test-asan-onnx: vendor/sqlite3ext.h sqlite-predict.h
+	mkdir -p $(prefix)
+	clang -std=c99 -g -O1 -fsanitize=address,undefined \
+	  -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
+	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -DSQLITE_STRICT_SUBTYPE=1 \
+	  $(ONNX_CFLAGS) -Ivendor/ -I./ \
+	  tests/soak_onnx.c $(ONNX_OBJS) vendor/sqlite3.c \
+	  -o $(prefix)/soak-onnx-asan $(ONNX_LDFLAGS)
+	LSAN_OPTIONS=suppressions=tests/onnx.supp \
+	  UBSAN_OPTIONS=print_stacktrace=1 \
+	  ./$(prefix)/soak-onnx-asan tests/fixtures/logreg.onnx
 
 # libFuzzer harness (statically links sqlite3.c; SQLITE_CORE build)
 fuzz-build: vendor/sqlite3ext.h sqlite-predict.h
@@ -134,4 +175,5 @@ clean:
 format:
 	clang-format -i sqlite-predict.c predict-*.c
 
-.PHONY: loadable debug test test-loadable clean format
+.PHONY: loadable loadable-onnx debug test test-loadable test-onnx \
+  test-asan-onnx clean format

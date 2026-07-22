@@ -1,0 +1,9 @@
+# LeakSanitizer suppressions for the onnx soak.
+#
+# onnxruntime allocates process-wide state and thread pools that live until
+# exit (still-reachable, not lost) and are built without instrumentation, so
+# LSan cannot always see they are reachable. These suppressions scope the
+# leak check to sqlite-predict's own allocations; a real leak in
+# predict-onnx.c has no libonnxruntime frame and is still reported.
+leak:libonnxruntime
+leak:onnxruntime::

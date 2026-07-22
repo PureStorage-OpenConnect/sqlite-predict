@@ -14,8 +14,11 @@ static void predict_version_fn(sqlite3_context *context, int argc,
   UNUSED_PARAMETER(argc);
   UNUSED_PARAMETER(argv);
   char *json = sqlite3_mprintf(
-      "{\"extension\":\"%s\",\"spec\":\"%s\",\"runtimes\":[\"stat\"],"
-      "\"models\":[]}",
+      "{\"extension\":\"%s\",\"spec\":\"%s\",\"runtimes\":[\"stat\""
+#ifdef SQLITE_PREDICT_ONNX
+      ",\"onnx\""
+#endif
+      "],\"models\":[]}",
       SQLITE_PREDICT_VERSION, SQLITE_PREDICT_SPEC);
   if (!json) {
     sqlite3_result_error_nomem(context);
@@ -323,6 +326,134 @@ static void predict_ulid_fn(sqlite3_context *context, int argc,
   sqlite3_result_text(context, buf, 26, SQLITE_TRANSIENT);
 }
 
+/* predict_register(model_id, config_json): record an external model in
+ * _predict_models so predict() can dispatch to it. config is a JSON object:
+ *   { "runtime":"onnx", "kind":"tabular-fm"|"student"|...,
+ *     "license":"<SPDX>", "weights_uri":"/path/model.onnx",
+ *     "io_spec": { ...tensor mapping... } }
+ * The content_hash is computed from the weights file, so the receipt pins
+ * the exact bytes and replay can detect a changed model. Returns the
+ * content_hash. Registration is metadata only: executing the model still
+ * requires the matching runtime to be compiled in. */
+static void predict_register_fn(sqlite3_context *context, int argc,
+                                sqlite3_value **argv) {
+  UNUSED_PARAMETER(argc);
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  const char *model_id = (const char *)sqlite3_value_text(argv[0]);
+  const char *config = (const char *)sqlite3_value_text(argv[1]);
+  if (!model_id || !model_id[0] || !config) {
+    char *e = sqlite3_mprintf(
+        "%s: predict_register(model_id, config_json) requires both",
+        PREDICT_ERR_OPTIONS);
+    sqlite3_result_error(context, e, -1);
+    sqlite3_free(e);
+    return;
+  }
+  char *emsg = NULL;
+  if (predict0_receipts_ensure(db, &emsg) != SQLITE_OK) {
+    sqlite3_result_error(context, emsg ? emsg : "registry unavailable", -1);
+    sqlite3_free(emsg);
+    return;
+  }
+
+  sqlite3_stmt *s = NULL;
+  if (sqlite3_prepare_v2(
+          db,
+          "SELECT json_extract(?1,'$.runtime'), json_extract(?1,'$.kind'),"
+          " json_extract(?1,'$.license'), json_extract(?1,'$.weights_uri'),"
+          " json_extract(?1,'$.io_spec')",
+          -1, &s, NULL) != SQLITE_OK) {
+    char *e = sqlite3_mprintf("%s: config is not valid JSON",
+                              PREDICT_ERR_OPTIONS);
+    sqlite3_result_error(context, e, -1);
+    sqlite3_free(e);
+    return;
+  }
+  sqlite3_bind_text(s, 1, config, -1, SQLITE_STATIC);
+  if (sqlite3_step(s) != SQLITE_ROW) {
+    sqlite3_finalize(s);
+    char *e = sqlite3_mprintf("%s: config is not valid JSON",
+                              PREDICT_ERR_OPTIONS);
+    sqlite3_result_error(context, e, -1);
+    sqlite3_free(e);
+    return;
+  }
+#define COL_OR_NULL(i)                                                        \
+  (sqlite3_column_type(s, i) == SQLITE_NULL                                   \
+       ? NULL                                                                 \
+       : sqlite3_mprintf("%s", (const char *)sqlite3_column_text(s, i)))
+  char *runtime = COL_OR_NULL(0);
+  char *kind = COL_OR_NULL(1);
+  char *license = COL_OR_NULL(2);
+  char *uri = COL_OR_NULL(3);
+  char *io_spec = COL_OR_NULL(4);
+#undef COL_OR_NULL
+  sqlite3_finalize(s);
+
+#define REG_FAIL(...)                                                          \
+  do {                                                                        \
+    char *e = sqlite3_mprintf(__VA_ARGS__);                                   \
+    sqlite3_result_error(context, e, -1);                                     \
+    sqlite3_free(e);                                                          \
+    goto reg_cleanup;                                                         \
+  } while (0)
+
+  if (!runtime || !kind || !license)
+    REG_FAIL("%s: config needs runtime, kind, and license",
+             PREDICT_ERR_OPTIONS);
+  /* This pass registers file-backed local runtimes; inline-weight students
+   * are registered by distill(). remote/bundled are engine-managed. */
+  if (strcmp(runtime, "onnx") != 0 && strcmp(runtime, "ggml") != 0 &&
+      strcmp(runtime, "tree") != 0)
+    REG_FAIL("%s: predict_register handles onnx|ggml|tree runtimes, got '%s'",
+             PREDICT_ERR_OPTIONS, runtime);
+  if (!uri)
+    REG_FAIL("%s: %s models need a weights_uri", PREDICT_ERR_OPTIONS, runtime);
+
+  char content_hash[PREDICT_HEX_BUFSIZE];
+  if (predict0_hash_file(uri, content_hash, &emsg)) {
+    sqlite3_result_error(context, emsg, -1);
+    sqlite3_free(emsg);
+    goto reg_cleanup;
+  }
+
+  sqlite3_stmt *ins = NULL;
+  if (sqlite3_prepare_v2(
+          db,
+          "INSERT INTO _predict_models"
+          " (model_id, kind, runtime, weights_uri, io_spec, content_hash,"
+          "  license) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+          -1, &ins, NULL) != SQLITE_OK)
+    REG_FAIL("%s: cannot prepare registry insert", PREDICT_ERR_RESOURCE);
+  sqlite3_bind_text(ins, 1, model_id, -1, SQLITE_STATIC);
+  sqlite3_bind_text(ins, 2, kind, -1, SQLITE_STATIC);
+  sqlite3_bind_text(ins, 3, runtime, -1, SQLITE_STATIC);
+  sqlite3_bind_text(ins, 4, uri, -1, SQLITE_STATIC);
+  if (io_spec)
+    sqlite3_bind_text(ins, 5, io_spec, -1, SQLITE_STATIC);
+  else
+    sqlite3_bind_null(ins, 5);
+  sqlite3_bind_text(ins, 6, content_hash, -1, SQLITE_STATIC);
+  sqlite3_bind_text(ins, 7, license, -1, SQLITE_STATIC);
+  int irc = sqlite3_step(ins);
+  sqlite3_finalize(ins);
+  if (irc == SQLITE_CONSTRAINT)
+    REG_FAIL("%s: model '%s' is already registered (or fails the weight-source"
+             " rule)", PREDICT_ERR_MODEL_EXISTS, model_id);
+  if (irc != SQLITE_DONE)
+    REG_FAIL("%s: registry insert failed: %s", PREDICT_ERR_RESOURCE,
+             sqlite3_errmsg(db));
+  sqlite3_result_text(context, content_hash, -1, SQLITE_TRANSIENT);
+
+#undef REG_FAIL
+reg_cleanup:
+  sqlite3_free(runtime);
+  sqlite3_free(kind);
+  sqlite3_free(license);
+  sqlite3_free(uri);
+  sqlite3_free(io_spec);
+}
+
 #pragma endregion
 
 #ifdef _WIN32
@@ -358,6 +489,12 @@ __declspec(dllexport)
     return rc;
   rc = sqlite3_create_function_v2(db, "predict_ulid", 1, flags, NULL,
                                   predict_ulid_fn, NULL, NULL, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  /* predict_register mutates the registry, so it is not INNOCUOUS and not
+   * DETERMINISTIC (its content_hash depends on a file read). */
+  rc = sqlite3_create_function_v2(db, "predict_register", 2, SQLITE_UTF8,
+                                  NULL, predict_register_fn, NULL, NULL, NULL);
   if (rc != SQLITE_OK)
     return rc;
 

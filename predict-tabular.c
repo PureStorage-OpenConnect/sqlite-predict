@@ -58,6 +58,9 @@ typedef struct {
   char *target;
   char *task; /* 'classify' | 'regress' */
   char *model;
+  char *device;         /* onnx: 'cpu'|'coreml'|'cuda'|'tensorrt' */
+  char *precision;      /* onnx: 'fp32'|'fp16'|'int8' */
+  char *accept_license; /* onnx: SPDX the caller accepts */
   int receipt;
 } PredOpts;
 
@@ -65,6 +68,9 @@ static void pred_opts_free(PredOpts *o) {
   sqlite3_free(o->target);
   sqlite3_free(o->task);
   sqlite3_free(o->model);
+  sqlite3_free(o->device);
+  sqlite3_free(o->precision);
+  sqlite3_free(o->accept_license);
 }
 
 static int pred_opt_cb(void *ctx, const char *key, sqlite3_value *value,
@@ -90,6 +96,18 @@ static int pred_opt_cb(void *ctx, const char *key, sqlite3_value *value,
     sqlite3_free(o->model);
     o->model = sqlite3_mprintf(
         "%s", (const char *)sqlite3_value_text(value));
+  } else if (strcmp(key, "device") == 0) {
+    sqlite3_free(o->device);
+    o->device = sqlite3_mprintf(
+        "%s", (const char *)sqlite3_value_text(value));
+  } else if (strcmp(key, "precision") == 0) {
+    sqlite3_free(o->precision);
+    o->precision = sqlite3_mprintf(
+        "%s", (const char *)sqlite3_value_text(value));
+  } else if (strcmp(key, "accept_license") == 0) {
+    sqlite3_free(o->accept_license);
+    o->accept_license = sqlite3_mprintf(
+        "%s", (const char *)sqlite3_value_text(value));
   } else if (strcmp(key, "receipt") == 0) {
     if (sqlite3_value_type(value) != SQLITE_INTEGER) {
       *errmsg = sqlite3_mprintf("%s: wrong type for option 'receipt'",
@@ -101,8 +119,9 @@ static int pred_opt_cb(void *ctx, const char *key, sqlite3_value *value,
   return 0;
 }
 
-static const char *const PRED_OPTION_KEYS[] = {"target", "task", "model",
-                                               "receipt", NULL};
+static const char *const PRED_OPTION_KEYS[] = {
+    "target",         "task",     "model",  "device",
+    "precision",      "accept_license", "receipt", NULL};
 
 /* per-feature categorical vocabulary (linear; fine at spike scale) */
 typedef struct {
@@ -257,6 +276,62 @@ static sqlite3_stmt *pr_prepare(pred_cursor *cur, sqlite3 *db,
   return stmt;
 }
 
+#ifdef SQLITE_PREDICT_ONNX
+/* Dispatch to the onnx vector backend and adopt its results into the
+ * cursor. Ownership of each result's strings is transferred (not copied)
+ * into the PredRow, so the neutral array is freed without double-free. */
+static int run_onnx_vector(pred_cursor *cur, sqlite3 *db, const char *model_id,
+                           const char *apply_sql, const predict0_model_row *m,
+                           PredOpts *opts) {
+  predict0_backend_opts bopts;
+  bopts.device = opts->device;
+  bopts.precision = opts->precision;
+  bopts.accept_license = opts->accept_license;
+  bopts.receipt = opts->receipt;
+
+  predict0_result *res = NULL;
+  int n = 0;
+  char receipt_id[PREDICT_ULID_BUFSIZE];
+  receipt_id[0] = '\0';
+  char *emsg = NULL;
+  int rc = predict0_onnx_predict_vector(db, model_id, apply_sql, m, &bopts,
+                                        &res, &n, receipt_id, &emsg);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(cur->base.pVtab->zErrMsg);
+    cur->base.pVtab->zErrMsg = emsg; /* already PREDICT_ERR_*-prefixed */
+    return SQLITE_ERROR;
+  }
+  if (n > 0) {
+    cur->rows = sqlite3_malloc(sizeof(PredRow) * n);
+    if (!cur->rows) {
+      predict0_results_free(res, n);
+      return SQLITE_NOMEM;
+    }
+    memset(cur->rows, 0, sizeof(PredRow) * n);
+  }
+  for (int i = 0; i < n; i++) {
+    PredRow *o = &cur->rows[i];
+    predict0_result *r = &res[i];
+    o->ref.type = r->ref_type;
+    o->ref.i = r->ref_i;
+    o->ref.f = r->ref_f;
+    o->ref.t = r->ref_t; /* transfer */
+    r->ref_t = NULL;
+    o->prediction = r->prediction; /* transfer */
+    r->prediction = NULL;
+    o->confidence = r->confidence;
+    o->has_conf = r->has_conf;
+    o->status = r->status;
+    if (opts->receipt && receipt_id[0])
+      memcpy(o->receipt_id, receipt_id, sizeof(receipt_id));
+    cur->n_rows++;
+  }
+  predict0_results_free(res, n);
+  cur->i = 0;
+  return SQLITE_OK;
+}
+#endif
+
 static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                      const char *idxStr, int argc, sqlite3_value **argv) {
   UNUSED_PARAMETER(idxNum);
@@ -293,10 +368,46 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   const char *model_id = opts.model && strcmp(opts.model, "default-tabular")
                              ? opts.model
                              : "knn5-incontext";
+
+  /* Non-default model: dispatch through the registry to a runtime backend.
+   * The default knn path below never consults the registry, so it still
+   * runs on read-only databases with receipt:0. */
   if (strcmp(model_id, "knn5-incontext") != 0) {
-    rc = pr_error(cur, PREDICT_ERR_MODEL_NOT_FOUND,
-                  "only knn5-incontext is available in this build: ",
-                  model_id);
+    predict0_model_row m;
+    int look = predict0_registry_lookup(db, model_id, &m);
+    if (look == 1) {
+      rc = pr_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, model_id, NULL);
+      pred_opts_free(&opts);
+      return rc;
+    }
+    if (look != 0) {
+      rc = pr_error(cur, PREDICT_ERR_RESOURCE,
+                    "model registry unavailable (needs a writable db)", NULL);
+      pred_opts_free(&opts);
+      return rc;
+    }
+    if (m.runtime && strcmp(m.runtime, "onnx") == 0) {
+#ifdef SQLITE_PREDICT_ONNX
+      rc = run_onnx_vector(cur, db, model_id, apply_sql, &m, &opts);
+#else
+      rc = pr_error(cur, PREDICT_ERR_RUNTIME_UNAVAILABLE,
+                    "onnx runtime is not in this build: ", model_id);
+#endif
+    } else {
+      rc = pr_error(cur, PREDICT_ERR_MODEL_NOT_FOUND,
+                    "unsupported model runtime for predict(): ",
+                    m.runtime ? m.runtime : model_id);
+    }
+    predict0_model_row_free(&m);
+    pred_opts_free(&opts);
+    return rc;
+  }
+
+  /* default knn5-incontext path: the onnx-only options make no sense here */
+  if (opts.device || opts.precision || opts.accept_license) {
+    rc = pr_error(cur, PREDICT_ERR_OPTIONS,
+                  "device/precision/accept_license require an onnx model",
+                  NULL);
     pred_opts_free(&opts);
     return rc;
   }
