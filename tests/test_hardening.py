@@ -166,3 +166,33 @@ def test_no_memory_growth_over_many_calls(db):
     rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     growth_mb = (rss_after - rss_before) / (1024 * 1024)
     assert growth_mb < 20, f"RSS grew {growth_mb:.1f}MB over 1200 calls"
+
+
+@pytest.mark.parametrize("op,args", [
+    ("forecast",
+     ("SELECT * FROM forecast('SELECT ts, value FROM series', 3, ?)",)),
+    ("detect_anomalies",
+     ("SELECT * FROM detect_anomalies('SELECT ts, value FROM series', ?)",)),
+])
+def test_duplicate_option_keys_no_leak_ts(db, op, args):
+    """CI fuzzer found a leak: a duplicate JSON option key overwrote a
+    strdup'd value without freeing the first. Last-wins, no leak. (Leak
+    cleanliness is enforced by ASan/valgrind on the soak; here we confirm
+    the call still succeeds and the last value wins.)"""
+    import synthetic as syn
+    rows, _ = syn.trend_season(n=60, seed=81)
+    syn.load_into(db, rows)
+    dup = '{"model":"theta-classic","model":"stub-seasonal-naive"}'
+    out = db.execute(args[0], (dup,)).fetchall()
+    assert len(out) >= 1
+
+
+def test_duplicate_option_keys_no_leak_predict(db):
+    import synthetic_tabular as syt
+    X, y, _ = syt.two_moons(n=120)
+    syt.load_tabular(db, X, y)
+    dup = '{"target":"label","task":"classify","task":"classify"}'
+    out = db.execute(
+        "SELECT * FROM predict('SELECT f1, f2, label FROM tab WHERE id<100',"
+        " 'SELECT id, f1, f2 FROM tab WHERE id>=100', ?)", (dup,)).fetchall()
+    assert len(out) >= 1

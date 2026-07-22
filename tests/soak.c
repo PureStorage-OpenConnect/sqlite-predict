@@ -103,6 +103,20 @@ int main(void) {
                 "SELECT * FROM detect_anomalies('SELECT ts, value FROM"
                 " series', '{\"value_col\":\"nope\"}')",
                 0);
+    /* duplicate option keys (the CI fuzzer's leak): last-wins, no leak */
+    run_discard(db,
+                "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
+                " 3, '{\"model\":\"theta-classic\",\"model\":"
+                "\"stub-seasonal-naive\",\"time_col\":\"ts\",\"time_col\":"
+                "\"ts\",\"group_cols\":[\"grp\"],\"group_cols\":[\"grp\"]}')",
+                1);
+    run_discard(db,
+                "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
+                " 'SELECT id, f1, f2 FROM tab',"
+                " '{\"target\":\"label\",\"task\":\"classify\",\"task\":"
+                "\"classify\",\"model\":\"knn5-incontext\",\"model\":"
+                "\"knn5-incontext\"}')",
+                1);
     run_discard(db,
                 "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
                 " 'SELECT id, f1 FROM tab', '{\"target\":\"label\"}')",

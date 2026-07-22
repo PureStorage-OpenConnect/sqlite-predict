@@ -76,16 +76,21 @@ static int pred_opt_cb(void *ctx, const char *key, sqlite3_value *value,
                               PREDICT_ERR_OPTIONS, key);
     return 1;
   }
-  if (strcmp(key, "target") == 0)
+  /* free-before-assign: a duplicate JSON key invokes this twice for the
+   * same option, and the second assignment must not leak the first */
+  if (strcmp(key, "target") == 0) {
+    sqlite3_free(o->target);
     o->target = sqlite3_mprintf(
         "%s", (const char *)sqlite3_value_text(value));
-  else if (strcmp(key, "task") == 0)
+  } else if (strcmp(key, "task") == 0) {
+    sqlite3_free(o->task);
     o->task = sqlite3_mprintf(
         "%s", (const char *)sqlite3_value_text(value));
-  else if (strcmp(key, "model") == 0)
+  } else if (strcmp(key, "model") == 0) {
+    sqlite3_free(o->model);
     o->model = sqlite3_mprintf(
         "%s", (const char *)sqlite3_value_text(value));
-  else if (strcmp(key, "receipt") == 0) {
+  } else if (strcmp(key, "receipt") == 0) {
     if (sqlite3_value_type(value) != SQLITE_INTEGER) {
       *errmsg = sqlite3_mprintf("%s: wrong type for option 'receipt'",
                                 PREDICT_ERR_OPTIONS);

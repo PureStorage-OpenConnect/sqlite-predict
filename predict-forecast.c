@@ -284,6 +284,7 @@ static int forecast_opt_cb(void *ctx, const char *key, sqlite3_value *value,
     char **dst = strcmp(key, "time_col") == 0  ? &o->time_col
                  : strcmp(key, "value_col") == 0 ? &o->value_col
                                                  : &o->model;
+    sqlite3_free(*dst); /* duplicate key: free before overwrite */
     *dst = dup_text(value);
     return 0;
   }
@@ -324,6 +325,10 @@ static int forecast_opt_cb(void *ctx, const char *key, sqlite3_value *value,
     const char *t = (const char *)sqlite3_value_text(value);
     if (!t)
       goto wrong_type;
+    /* duplicate key: free any previously-parsed group cols first */
+    for (int g = 0; g < o->n_group_cols; g++)
+      sqlite3_free(o->group_cols[g]);
+    o->n_group_cols = 0;
     if (t[0] != '[') {
       if (vtype != SQLITE_TEXT)
         goto wrong_type;
