@@ -22,8 +22,8 @@ static int run(sqlite3 *db, const char *sql, int expect_ok) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "usage: %s <fixture.onnx>\n", argv[0]);
+  if (argc < 3) {
+    fprintf(stderr, "usage: %s <vector.onnx> <incontext.onnx>\n", argv[0]);
     return 2;
   }
   sqlite3 *db = NULL;
@@ -39,27 +39,49 @@ int main(int argc, char **argv) {
       "'f2'),'output',json_object('name','probabilities','kind','probs',"
       "'labels',json_array('0','1')))))",
       argv[1]);
-  if (run(db, reg, 1)) {
+  char *regic = sqlite3_mprintf(
+      "SELECT predict_register('knn1', json_object('runtime','onnx','kind',"
+      "'tabular-fm','license','MIT','weights_uri',%Q,'io_spec',json_object("
+      "'layout','in_context','inputs',json_object('x_train','x_train',"
+      "'y_train','y_train','x_query','x_query'),'features',json_array('f1',"
+      "'f2'),'target','label','output',json_object('name','probabilities',"
+      "'kind','probs','labels',json_array('0','1')))))",
+      argv[2]);
+  if (run(db, reg, 1) || run(db, regic, 1)) {
     fprintf(stderr, "register failed\n");
     sqlite3_free(reg);
+    sqlite3_free(regic);
     sqlite3_close(db);
     return 1;
   }
   sqlite3_free(reg);
+  sqlite3_free(regic);
 
   run(db, "CREATE TABLE apply(id INTEGER, f1 REAL, f2 REAL)", 1);
   run(db,
       "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
       " i < 1500) INSERT INTO apply SELECT i, (i%7)-3.0, (i%5)-2.0 FROM n",
       1);
+  run(db, "CREATE TABLE tr(id INTEGER, f1 REAL, f2 REAL, label TEXT)", 1);
+  run(db,
+      "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
+      " i < 40) INSERT INTO tr SELECT i, (i%5)-2.0, (i%3)-1.0,"
+      " CAST(i%2 AS TEXT) FROM n",
+      1);
 
   for (int i = 0; i < 20; i++) {
-    /* success, with and without receipt (multi-batch: 1501 rows) */
+    /* vector: success (multi-batch: 1501 rows), with and without receipt */
     run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
             "json_object('model','clf'))", 1);
     run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
             "json_object('model','clf','receipt',0))", 1);
-    /* every error branch */
+    /* in_context: success (train context + 1501-row query, multi-batch) */
+    run(db, "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+            "'SELECT id, f1, f2 FROM apply',json_object('model','knn1'))", 1);
+    run(db, "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+            "'SELECT id, f1, f2 FROM apply',"
+            "json_object('model','knn1','receipt',0))", 1);
+    /* every error branch, both layouts */
     run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
             "json_object('model','clf','device','banana'))", 0);
     run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
@@ -70,6 +92,11 @@ int main(int argc, char **argv) {
             "json_object('model','clf'))", 0);
     run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
             "json_object('model','ghost'))", 0);
+    /* in_context error branches: no train, missing target, bad label */
+    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+            "json_object('model','knn1'))", 0);
+    run(db, "SELECT * FROM predict('SELECT f1, f2 FROM tr',"
+            "'SELECT id, f1, f2 FROM apply',json_object('model','knn1'))", 0);
   }
 
   sqlite3_close(db);

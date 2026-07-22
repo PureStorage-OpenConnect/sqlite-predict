@@ -182,20 +182,21 @@ typedef struct {
 void predict0_results_free(predict0_result *rows, int n);
 
 #ifdef SQLITE_PREDICT_ONNX
-/* Vector-layout ONNX inference: the model is self-contained (features ->
- * prediction), so train_sql is not consulted. Reads row_ref + named
- * features from apply_sql, maps them to the model's declared feature order,
- * runs batched inference on the requested execution provider, and fills
- * rows/n (apply order; free with predict0_results_free). When
+/* ONNX inference for predict(). Dispatches on the model's io_spec layout:
+ * 'vector' (a self-contained model mapping features -> prediction, train_sql
+ * unused) or 'in_context' (a teacher that ingests the train rows as context
+ * each call, so train_sql is required). Reads row_ref + named features from
+ * apply_sql, runs batched inference on the requested execution provider, and
+ * fills rows/n (apply order; free with predict0_results_free). When
  * opts->receipt, emits a receipt and writes receipt_id_out. Returns
  * SQLITE_OK, or an SQLITE_ code with *errmsg set (PREDICT_ERR_* lead). */
-int predict0_onnx_predict_vector(sqlite3 *db, const char *model_id,
-                                 const char *apply_sql,
-                                 const predict0_model_row *model,
-                                 const predict0_backend_opts *opts,
-                                 predict0_result **rows, int *n,
-                                 char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                                 char **errmsg);
+int predict0_onnx_predict(sqlite3 *db, const char *model_id,
+                          const char *train_sql, const char *apply_sql,
+                          const predict0_model_row *model,
+                          const predict0_backend_opts *opts,
+                          predict0_result **rows, int *n,
+                          char receipt_id_out[PREDICT_ULID_BUFSIZE],
+                          char **errmsg);
 #endif
 
 /* Deterministic logical digest of all user tables (schema + rows,

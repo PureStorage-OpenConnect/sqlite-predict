@@ -47,6 +47,25 @@ CLF_IO = {"layout": "vector", "input": "float_input", "features": ["f1", "f2"],
                      "labels": ["0", "1"]}}
 REG_IO = {"layout": "vector", "input": "float_input", "features": ["f1", "f2"],
           "output": {"name": "variable", "kind": "value"}}
+IC_IO = {"layout": "in_context",
+         "inputs": {"x_train": "x_train", "y_train": "y_train",
+                    "x_query": "x_query"},
+         "features": ["f1", "f2"], "target": "label",
+         "output": {"name": "probabilities", "kind": "probs",
+                    "labels": ["0", "1"]}}
+
+
+def _load_incontext(db, io=IC_IO, model_id="knn1"):
+    _register(db, model_id, "knn_incontext.onnx", io)
+    data = json.load(open(_abs("knn_incontext_cases.json")))
+    db.execute("CREATE TABLE tr(id INTEGER, f1 REAL, f2 REAL, label TEXT)")
+    db.executemany("INSERT INTO tr VALUES (?,?,?,?)",
+                   [(c["id"], c["f1"], c["f2"], c["label"])
+                    for c in data["train"]])
+    db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 REAL)")
+    db.executemany("INSERT INTO ap VALUES (?,?,?)",
+                   [(c["id"], c["f1"], c["f2"]) for c in data["apply"]])
+    return data
 
 
 def _load_apply(db, cases):
@@ -91,6 +110,133 @@ def test_regressor_matches_reference(db):
         assert status == "ok"
         assert conf is None  # regression carries no confidence
         assert abs(float(pred) - exp[rid]["value"]) < 1e-4
+
+
+def test_incontext_matches_reference(db):
+    """The teacher path: training rows become model context. Predictions
+    must match the pure-Python 1-NN reference the fixture was built from."""
+    data = _load_incontext(db)
+    rows = db.execute(
+        "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+        " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
+    ).fetchall()
+    assert len(rows) == len(data["apply"])
+    exp = {c["id"]: c["label"] for c in data["apply"]}
+    for rid, pred, conf, status, receipt, *_ in rows:
+        assert status == "ok"
+        assert pred == exp[rid]
+        assert abs(conf - 1.0) < 1e-6  # one-hot output
+        assert receipt
+
+
+def test_incontext_replays_exactly(db):
+    _load_incontext(db)
+    rid = db.execute(
+        "SELECT receipt_id FROM predict('SELECT f1, f2, label FROM tr',"
+        " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1')) LIMIT 1"
+    ).fetchone()[0]
+    match, detail = db.execute(
+        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
+    assert match == 1, detail
+
+
+def test_incontext_replay_detects_train_mutation(db):
+    """Because the training rows are the context, changing them must break
+    the receipt anchor."""
+    _load_incontext(db)
+    rid = db.execute(
+        "SELECT receipt_id FROM predict('SELECT f1, f2, label FROM tr',"
+        " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1')) LIMIT 1"
+    ).fetchone()[0]
+    db.execute("UPDATE tr SET label = '1' WHERE label = '0'")
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT match FROM predict_replay(?)", (rid,)).fetchone()
+    assert "PREDICT_ERR_ANCHOR_UNAVAILABLE" in str(e.value)
+
+
+def test_incontext_requires_train_query(db):
+    _load_incontext(db)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT * FROM predict(NULL, 'SELECT id, f1, f2 FROM ap',"
+            " json_object('model','knn1'))").fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
+def test_incontext_train_missing_target_errors(db):
+    _load_incontext(db)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT * FROM predict('SELECT f1, f2 FROM tr',"
+            " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
+        ).fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
+def test_incontext_unknown_train_label_errors(db):
+    _load_incontext(db)
+    db.execute("UPDATE tr SET label = 'purple' WHERE id = 0")
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+            " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
+        ).fetchall()
+    assert "PREDICT_ERR_IO_SPEC" in str(e.value)
+
+
+def test_incontext_nonnumeric_train_feature_errors(db):
+    _register(db, "knn1", "knn_incontext.onnx", IC_IO)
+    db.execute("CREATE TABLE tr(id INTEGER, f1 ANY, f2 REAL, label TEXT)")
+    db.execute("INSERT INTO tr VALUES (0, 'x', 1.0, '0'), (1, 2.0, 2.0, '1')")
+    db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 REAL)")
+    db.execute("INSERT INTO ap VALUES (0, 0.5, 0.5)")
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+            " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
+        ).fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
+def test_incontext_nonnumeric_query_row_flagged(db):
+    _register(db, "knn1", "knn_incontext.onnx", IC_IO)
+    db.execute("CREATE TABLE tr(id INTEGER, f1 REAL, f2 REAL, label TEXT)")
+    db.execute("INSERT INTO tr VALUES (0,-1,-1,'0'),(1,1,1,'1'),(2,2,2,'1')")
+    db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 ANY)")
+    db.execute("INSERT INTO ap VALUES (0, 1.0, 1.0), (1, 0.0, 'oops')")
+    rows = {r[0]: r for r in db.execute(
+        "SELECT row_ref, prediction, status FROM predict("
+        " 'SELECT f1, f2, label FROM tr', 'SELECT id, f1, f2 FROM ap',"
+        " json_object('model','knn1','receipt',0))").fetchall()}
+    assert rows[0][2] == "ok"
+    assert rows[1][2] == "non_numeric" and rows[1][1] is None
+
+
+def test_incontext_batch_boundary(db):
+    """Many query rows against a fixed context: cross the batch boundary and
+    confirm order and correctness (1-NN over the fixture's training rows)."""
+    data = _load_incontext(db)
+    train = [(c["f1"], c["f2"], int(c["label"])) for c in data["train"]]
+    db.execute("CREATE TABLE bigq(id INTEGER, f1 REAL, f2 REAL)")
+    n = 2100
+    pts = [(i, (i % 9) - 4.0, ((i * 3) % 7) - 3.0) for i in range(n)]
+    db.executemany("INSERT INTO bigq VALUES (?,?,?)", pts)
+    rows = db.execute(
+        "SELECT row_ref, prediction FROM predict("
+        " 'SELECT f1, f2, label FROM tr', 'SELECT id, f1, f2 FROM bigq"
+        " ORDER BY id', json_object('model','knn1','receipt',0))").fetchall()
+    assert len(rows) == n
+    assert [r[0] for r in rows] == list(range(n))
+
+    def ref(qx, qy):
+        best, bl = 1e30, "0"
+        for tx, ty, tl in train:
+            d = (qx - tx) ** 2 + (qy - ty) ** 2
+            if d < best:
+                best, bl = d, str(tl)
+        return bl
+    mism = sum(1 for rid, pred in rows if pred != ref(pts[rid][1], pts[rid][2]))
+    assert mism == 0
 
 
 def test_receipt_replays_exactly(db):

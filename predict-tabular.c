@@ -277,12 +277,12 @@ static sqlite3_stmt *pr_prepare(pred_cursor *cur, sqlite3 *db,
 }
 
 #ifdef SQLITE_PREDICT_ONNX
-/* Dispatch to the onnx vector backend and adopt its results into the
- * cursor. Ownership of each result's strings is transferred (not copied)
- * into the PredRow, so the neutral array is freed without double-free. */
-static int run_onnx_vector(pred_cursor *cur, sqlite3 *db, const char *model_id,
-                           const char *apply_sql, const predict0_model_row *m,
-                           PredOpts *opts) {
+/* Dispatch to the onnx backend and adopt its results into the cursor.
+ * Ownership of each result's strings is transferred (not copied) into the
+ * PredRow, so the neutral array is freed without double-free. */
+static int run_onnx(pred_cursor *cur, sqlite3 *db, const char *model_id,
+                    const char *train_sql, const char *apply_sql,
+                    const predict0_model_row *m, PredOpts *opts) {
   predict0_backend_opts bopts;
   bopts.device = opts->device;
   bopts.precision = opts->precision;
@@ -294,8 +294,8 @@ static int run_onnx_vector(pred_cursor *cur, sqlite3 *db, const char *model_id,
   char receipt_id[PREDICT_ULID_BUFSIZE];
   receipt_id[0] = '\0';
   char *emsg = NULL;
-  int rc = predict0_onnx_predict_vector(db, model_id, apply_sql, m, &bopts,
-                                        &res, &n, receipt_id, &emsg);
+  int rc = predict0_onnx_predict(db, model_id, train_sql, apply_sql, m, &bopts,
+                                 &res, &n, receipt_id, &emsg);
   if (rc != SQLITE_OK) {
     sqlite3_free(cur->base.pVtab->zErrMsg);
     cur->base.pVtab->zErrMsg = emsg; /* already PREDICT_ERR_*-prefixed */
@@ -388,7 +388,7 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     }
     if (m.runtime && strcmp(m.runtime, "onnx") == 0) {
 #ifdef SQLITE_PREDICT_ONNX
-      rc = run_onnx_vector(cur, db, model_id, apply_sql, &m, &opts);
+      rc = run_onnx(cur, db, model_id, train_sql, apply_sql, &m, &opts);
 #else
       rc = pr_error(cur, PREDICT_ERR_RUNTIME_UNAVAILABLE,
                     "onnx runtime is not in this build: ", model_id);

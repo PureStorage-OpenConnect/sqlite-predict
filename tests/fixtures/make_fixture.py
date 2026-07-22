@@ -1,9 +1,11 @@
 """Generate the tiny ONNX fixtures the onnx-runtime tests load.
 
-Run manually when the fixtures need regenerating (needs the `onnx`
-package, which the test env deliberately does not carry):
+Run manually when the fixtures need regenerating (needs onnx, plus
+onnxruntime + numpy to cross-validate the in-context fixture; the test
+env deliberately carries none of them):
 
-    uv run --with onnx python tests/fixtures/make_fixture.py
+    uv run --with onnx --with onnxruntime --with numpy \
+        python tests/fixtures/make_fixture.py
 
 It writes two self-contained fixtures next to this script:
 
@@ -123,6 +125,91 @@ def build_reg_cases():
     return pts
 
 
+def build_incontext(k_classes=2):
+    """A 1-nearest-neighbour in-context classifier: it reads the training
+    rows as context each call and labels each query by its nearest training
+    row. Exercises the three-input (x_train, y_train, x_query) marshalling.
+
+    probabilities = one_hot(argmin_j ||x_query_i - x_train_j||^2 -> y_train)
+    """
+    f = lambda name, shape: helper.make_tensor_value_info(  # noqa: E731
+        name, TensorProto.FLOAT, shape)
+    inputs = [
+        f("x_train", [None, 2]),
+        helper.make_tensor_value_info("y_train", TensorProto.INT64, [None]),
+        f("x_query", [None, 2]),
+    ]
+    init = [
+        helper.make_tensor("axes1", TensorProto.INT64, [1], [1]),
+        helper.make_tensor("two", TensorProto.FLOAT, [], [2.0]),
+        helper.make_tensor("depth", TensorProto.INT64, [], [k_classes]),
+        helper.make_tensor("oh_vals", TensorProto.FLOAT, [2], [0.0, 1.0]),
+    ]
+    n = helper.make_node
+    nodes = [
+        n("Mul", ["x_query", "x_query"], ["xq2"]),
+        n("ReduceSum", ["xq2", "axes1"], ["q2"], keepdims=1),          # [Nq,1]
+        n("Mul", ["x_train", "x_train"], ["xt2"]),
+        n("ReduceSum", ["xt2", "axes1"], ["t2"], keepdims=1),          # [Nt,1]
+        n("Transpose", ["t2"], ["t2t"], perm=[1, 0]),                  # [1,Nt]
+        n("Transpose", ["x_train"], ["xtT"], perm=[1, 0]),            # [F,Nt]
+        n("MatMul", ["x_query", "xtT"], ["qt"]),                       # [Nq,Nt]
+        n("Mul", ["qt", "two"], ["two_qt"]),
+        n("Add", ["q2", "t2t"], ["s"]),                                # [Nq,Nt]
+        n("Sub", ["s", "two_qt"], ["dist"]),                           # [Nq,Nt]
+        n("ArgMin", ["dist"], ["nn"], axis=1, keepdims=0),             # [Nq]
+        n("Gather", ["y_train", "nn"], ["pred"], axis=0),              # [Nq]
+        n("OneHot", ["pred", "depth", "oh_vals"], ["probabilities"], axis=-1),
+    ]
+    graph = helper.make_graph(
+        nodes, "knn1_incontext", inputs,
+        [f("probabilities", [None, k_classes])], initializer=init)
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 9
+    onnx.checker.check_model(model)
+    return model
+
+
+def build_incontext_cases():
+    import numpy as np
+    rng_pts = [(-2.0, -2.0, "0"), (-2.0, 2.0, "0"), (2.0, -2.0, "1"),
+               (2.0, 2.0, "1"), (-1.0, 0.0, "0"), (1.0, 0.0, "1"),
+               (0.0, -3.0, "0"), (0.0, 3.0, "1")]
+    x_train = [[p[0], p[1]] for p in rng_pts]
+    y_train = [int(p[2]) for p in rng_pts]
+    queries = [(-1.5, -1.0), (1.5, 1.0), (-0.2, 0.2), (0.3, -0.4),
+               (-2.1, 2.2), (2.2, -1.9), (0.0, 2.5), (-0.9, -2.8)]
+
+    # independent pure-python 1-NN reference
+    def ref(qx, qy):
+        best, bi = 1e30, 0
+        for j, (tx, ty) in enumerate(x_train):
+            d = (qx - tx) ** 2 + (qy - ty) ** 2
+            if d < best:
+                best, bi = d, j
+        return str(y_train[bi])
+
+    expected = [ref(qx, qy) for qx, qy in queries]
+
+    # cross-check against onnxruntime running the actual graph
+    import onnxruntime as ort
+    sess = ort.InferenceSession(os.path.join(HERE, "knn_incontext.onnx"))
+    probs = sess.run(["probabilities"], {
+        "x_train": np.array(x_train, dtype=np.float32),
+        "y_train": np.array(y_train, dtype=np.int64),
+        "x_query": np.array(queries, dtype=np.float32),
+    })[0]
+    ort_labels = [str(int(p.argmax())) for p in probs]
+    assert ort_labels == expected, f"graph != reference: {ort_labels} vs {expected}"
+
+    train = [{"id": j, "f1": x_train[j][0], "f2": x_train[j][1],
+              "label": str(y_train[j])} for j in range(len(x_train))]
+    apply = [{"id": i, "f1": queries[i][0], "f2": queries[i][1],
+              "label": expected[i]} for i in range(len(queries))]
+    return {"train": train, "apply": apply}
+
+
 def main():
     model = build_model()
     onnx.save(model, os.path.join(HERE, "logreg.onnx"))
@@ -136,8 +223,16 @@ def main():
     with open(os.path.join(HERE, "linreg_cases.json"), "w") as f:
         json.dump(rcases, f, indent=2)
 
-    print(f"wrote logreg.onnx ({model.ByteSize()} B, {len(cases)} cases)"
-          f" and linreg.onnx ({reg.ByteSize()} B, {len(rcases)} cases)")
+    ic = build_incontext()
+    onnx.save(ic, os.path.join(HERE, "knn_incontext.onnx"))
+    iccases = build_incontext_cases()  # validates the graph vs a py reference
+    with open(os.path.join(HERE, "knn_incontext_cases.json"), "w") as f:
+        json.dump(iccases, f, indent=2)
+
+    print(f"wrote logreg.onnx ({model.ByteSize()} B, {len(cases)} cases),"
+          f" linreg.onnx ({reg.ByteSize()} B, {len(rcases)} cases), and"
+          f" knn_incontext.onnx ({ic.ByteSize()} B,"
+          f" {len(iccases['apply'])} queries)")
 
 
 if __name__ == "__main__":

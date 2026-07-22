@@ -81,11 +81,17 @@ which compresses a teacher into a compact model that serves in
 microseconds.
 
 An opt-in ONNX build (`make loadable-onnx`) runs exported models through
-onnxruntime: register one with `predict_register()` and call it by name.
-Today it serves the "vector" case (a distilled student, or any exported
-tabular classifier/regressor) with a cached session and batched inference.
-Running a teacher such as TabFM directly, in-context, on a GPU is the next
-step. The default build never links onnxruntime.
+onnxruntime: register one with `predict_register()` and call it by name. It
+serves two shapes, with a cached session and batched inference:
+
+- **vector** — a self-contained model (a distilled student, or any exported
+  tabular classifier/regressor) mapping a feature vector to a prediction.
+- **in_context** — a teacher that ingests the `train_query` rows as context
+  on each call and labels the `apply_query` rows against them, the way
+  TabFM works.
+
+Both run on CPU today. Running a teacher on a GPU (CUDA/TensorRT, fp16) is
+the remaining step. The default build never links onnxruntime.
 
 ## Installing
 

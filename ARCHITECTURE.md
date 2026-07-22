@@ -44,15 +44,19 @@ the registry (so it still works read-only), while a named `onnx` model
 routes through the backend in `predict-onnx.c`.
 
 That backend (compiled only into `make loadable-onnx`, `-DSQLITE_PREDICT_ONNX`)
-serves the "vector" `io_spec` layout: a self-contained model mapping a
-feature vector to a prediction. It caches one onnxruntime session per
-(weights, device, precision), runs query rows in batches, and selects the
-execution provider explicitly, erasing no failure into a silent CPU
-fallback. Weights are pinned by content hash, so a receipt records exactly
-which bytes ran. Foundation-model *teachers* run in-context (the training
-rows become model context) and are the next backend layer, validated on the
-gated GPU CI job; the `benchmarks/` numbers are why the default answer for
-their accuracy is still distillation to a small vector student.
+serves two `io_spec` layouts. The **vector** layout is a self-contained model
+mapping a feature vector to a prediction. The **in_context** layout is a
+teacher (TabFM-shaped): it ingests the `train_query` rows as three tensors
+(`x_train`, `y_train`, `x_query`) each call and labels the query rows against
+that context. Both cache one onnxruntime session per (weights, device,
+precision), run query rows in batches, and select the execution provider
+explicitly, erasing no failure into a silent CPU fallback. Weights are pinned
+by content hash, so a receipt records exactly which bytes ran, and the
+in-context receipt anchors the training rows too, so mutating the context
+breaks replay. Both run on CPU today; the GPU execution providers are the
+next layer, validated on the gated GPU CI job. Even so, the `benchmarks/`
+numbers are why the default answer for a teacher's accuracy is usually
+distillation to a small vector student.
 
 ## Receipts, anchoring, and replay
 

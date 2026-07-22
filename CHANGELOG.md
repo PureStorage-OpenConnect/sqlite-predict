@@ -16,10 +16,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (time series) and `knn5-incontext` (tabular).
 - `predict_ulid()` and `predict_version()` utility functions.
 - Opt-in ONNX runtime serving path for `predict()` (`make loadable-onnx`):
-  runs an exported tabular model (a distilled student or classifier/
-  regressor) through onnxruntime, with a process-global session cache,
-  batched inference, and explicit fail-loud execution-provider selection.
-  The default build stays zero-dependency.
+  runs exported models through onnxruntime in two `io_spec` layouts, with a
+  process-global session cache, batched inference, and explicit fail-loud
+  execution-provider selection. The `vector` layout serves a self-contained
+  model (a distilled student or classifier/regressor); the `in_context`
+  layout serves a teacher that ingests the `train_query` rows as context
+  each call (TabFM-shaped), anchoring those rows in the receipt. The default
+  build stays zero-dependency.
 - `predict_register(model_id, config_json)` to register an external model,
   pinning its weights by content hash. `_predict_models` gains `weights_uri`
   and `io_spec`; receipts record the execution provider and precision.
