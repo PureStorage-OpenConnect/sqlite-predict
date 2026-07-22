@@ -119,6 +119,13 @@ make fuzz                # libFuzzer (needs an LLVM with the fuzzer runtime)
 make fuzz-docker         # libFuzzer + ASan in a Linux container
 ```
 
+CI builds and tests on Linux and macOS (the full pytest suite, plus
+AddressSanitizer, UBSan, valgrind, and a libFuzzer smoke run), builds the
+loadable DLL on Windows through MinGW, and compiles to WebAssembly with
+emscripten and runs it under node. The Windows and wasm checks drive a
+standalone C soak driver that exercises every operation, so "runs
+anywhere" is a thing CI proves rather than a thing the README claims.
+
 Contributions are welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
