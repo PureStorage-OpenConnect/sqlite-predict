@@ -4,6 +4,7 @@
 #include "sqlite-predict.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,5 +44,36 @@ typedef size_t usize;
 
 int predict0_forecast_init(sqlite3 *db);
 int predict0_receipts_init(sqlite3 *db);
+
+/* ---- shared helpers (sqlite-predict.c) ---- */
+
+/* Parse an ISO-8601 UTC timestamp ("YYYY-MM-DD[ T]HH:MM[:SS][Z]") or a
+ * bare date to epoch milliseconds. Returns 0 on success. */
+int predict0_parse_timestamp(const char *s, i64 *out_ms);
+
+/* Format epoch ms back to "YYYY-MM-DDTHH:MM:SSZ" into buf[21+]. */
+void predict0_format_timestamp(i64 ms, char *buf, usize bufsize);
+
+/* Inverse standard-normal CDF (Acklam's rational approximation).
+ * p in (0,1). Used for prediction-interval z values. */
+f64 predict0_norm_quantile(f64 p);
+
+/* Options parsing: the trailing JSON options argument. keys is a
+ * NULL-terminated array of allowed key names; each parsed key/value is
+ * delivered to the callback (value as sqlite3_value*). Returns 0 on
+ * success; on failure sets *errmsg (sqlite3_malloc'd, starts with a
+ * PREDICT_ERR_* code). NULL/absent json means no options: success. */
+typedef int (*predict0_option_cb)(void *ctx, const char *key,
+                                  sqlite3_value *value, char **errmsg);
+int predict0_options_parse(sqlite3 *db, const char *json,
+                           const char *const *keys, predict0_option_cb cb,
+                           void *ctx, char **errmsg);
+
+/* Smallest ULID for the given epoch ms (random component zeroed),
+ * Crockford base32, 26 chars + NUL into buf[27]. */
+void predict0_ulid_min(i64 ms, char *buf);
+
+/* Fresh ULID for the given epoch ms with sqlite3_randomness entropy. */
+void predict0_ulid_new(i64 ms, char *buf);
 
 #endif /* PREDICT_INTERNAL_H */
