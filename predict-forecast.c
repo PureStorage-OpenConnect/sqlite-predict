@@ -932,33 +932,12 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   if (opts.receipt) {
     char *errmsg = NULL;
     const char *model_id = resolve_ts_model_id(opts.model);
-    if (predict0_receipts_ensure(db, &errmsg)) {
-      sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = errmsg;
-      goto receipt_fail;
-    }
-    char *model_hash = predict0_registry_model_hash(db, model_id);
-    if (!model_hash) {
-      vtab->base.zErrMsg = sqlite3_mprintf(
-          "%s: %s not in _predict_models", PREDICT_ERR_MODEL_NOT_FOUND,
-          model_id);
-      goto receipt_fail;
-    }
-    char digest[PREDICT_HEX_BUFSIZE];
-    if (predict0_logical_digest(db, digest, &errmsg)) {
-      sqlite3_free(model_hash);
-      sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = errmsg;
-      goto receipt_fail;
-    }
 
     /* result hash over rows sorted by (series_key, step) */
     ForecastRow **order =
         sqlite3_malloc(sizeof(ForecastRow *) * (cur->n_rows ? cur->n_rows : 1));
-    if (!order) {
-      sqlite3_free(model_hash);
+    if (!order)
       goto receipt_fail;
-    }
     for (int i = 0; i < cur->n_rows; i++)
       order[i] = &cur->rows[i];
     qsort(order, (usize)cur->n_rows, sizeof(ForecastRow *),
@@ -1019,17 +998,14 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       sqlite3_finalize(pj);
     }
     if (!params) {
-      sqlite3_free(model_hash);
       vtab->base.zErrMsg = sqlite3_mprintf(
           "%s: could not canonicalize params", PREDICT_ERR_RESOURCE);
       goto receipt_fail;
     }
 
     char receipt_id[PREDICT_ULID_BUFSIZE];
-    int irc = predict0_receipt_insert(db, "forecast", model_id, model_hash,
-                                      "logical-digest", digest, params, query,
-                                      result_hash, receipt_id, &errmsg);
-    sqlite3_free(model_hash);
+    int irc = predict0_emit_receipt(db, "forecast", model_id, params, query,
+                                    result_hash, receipt_id, &errmsg);
     sqlite3_free(params);
     if (irc != SQLITE_OK) {
       sqlite3_free(vtab->base.zErrMsg);
@@ -1687,32 +1663,9 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   /* receipt */
   if (opts.receipt) {
     char *rerr = NULL;
-    if (predict0_receipts_ensure(db, &rerr)) {
-      sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = rerr;
-      AN_FREE_SERIES();
-      an_rows_free(cur);
-      return SQLITE_ERROR;
-    }
-    char *model_hash = predict0_registry_model_hash(db, model_id);
-    char digest[PREDICT_HEX_BUFSIZE];
-    if (!model_hash || predict0_logical_digest(db, digest, &rerr)) {
-      sqlite3_free(model_hash);
-      if (rerr) {
-        sqlite3_free(vtab->base.zErrMsg);
-        vtab->base.zErrMsg = rerr;
-      } else {
-        an_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, model_id, NULL);
-      }
-      AN_FREE_SERIES();
-      an_rows_free(cur);
-      return SQLITE_ERROR;
-    }
-
     AnomRow **order =
         sqlite3_malloc(sizeof(AnomRow *) * (cur->n_rows ? cur->n_rows : 1));
     if (!order) {
-      sqlite3_free(model_hash);
       AN_FREE_SERIES();
       an_rows_free(cur);
       return SQLITE_NOMEM;
@@ -1787,18 +1740,14 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       sqlite3_finalize(pj);
     }
     if (!params) {
-      sqlite3_free(model_hash);
       AN_FREE_SERIES();
       an_rows_free(cur);
       return an_error(cur, PREDICT_ERR_RESOURCE,
                       "could not canonicalize params", NULL);
     }
     char receipt_id[PREDICT_ULID_BUFSIZE];
-    int irc = predict0_receipt_insert(db, "detect_anomalies", model_id,
-                                      model_hash, "logical-digest", digest,
-                                      params, query, result_hash, receipt_id,
-                                      &rerr);
-    sqlite3_free(model_hash);
+    int irc = predict0_emit_receipt(db, "detect_anomalies", model_id, params,
+                                    query, result_hash, receipt_id, &rerr);
     sqlite3_free(params);
     if (irc != SQLITE_OK) {
       sqlite3_free(vtab->base.zErrMsg);

@@ -137,4 +137,12 @@ int predict0_receipt_insert(sqlite3 *db, const char *operation,
                             const char *result_hash, char receipt_id_out[PREDICT_ULID_BUFSIZE],
                             char **errmsg);
 
+/* Shared receipt tail: ensure tables + model hash + digest + insert.
+ * Caller supplies the op-specific params and result_hash. */
+int predict0_emit_receipt(sqlite3 *db, const char *op, const char *model_id,
+                          const char *params, const char *input_sql,
+                          const char *result_hash,
+                          char receipt_id_out[PREDICT_ULID_BUFSIZE],
+                          char **errmsg);
+
 #endif /* PREDICT_INTERNAL_H */

@@ -611,25 +611,6 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   /* ---- receipt ---- */
   if (opts.receipt) {
     char *rerr = NULL;
-    if (predict0_receipts_ensure(db, &rerr)) {
-      sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = rerr;
-      rc = SQLITE_ERROR;
-      goto fail_train;
-    }
-    char *model_hash = predict0_registry_model_hash(db, model_id);
-    char digest[PREDICT_HEX_BUFSIZE];
-    if (!model_hash || predict0_logical_digest(db, digest, &rerr)) {
-      sqlite3_free(model_hash);
-      if (rerr) {
-        sqlite3_free(vtab->base.zErrMsg);
-        vtab->base.zErrMsg = rerr;
-      } else {
-        pr_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, model_id, NULL);
-      }
-      rc = SQLITE_ERROR;
-      goto fail_train;
-    }
     predict0_hasher h;
     predict0_hash_init(&h);
     for (int i = 0; i < cur->n_rows; i++) {
@@ -683,7 +664,6 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       sqlite3_finalize(pj);
     }
     if (!params || !input_json) {
-      sqlite3_free(model_hash);
       sqlite3_free(params);
       sqlite3_free(input_json);
       rc = pr_error(cur, PREDICT_ERR_RESOURCE,
@@ -691,11 +671,9 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       goto fail_train;
     }
     char receipt_id[PREDICT_ULID_BUFSIZE];
-    int irc = predict0_receipt_insert(db, "predict", model_id, model_hash,
-                                      "logical-digest", digest, params,
-                                      input_json, result_hash, receipt_id,
-                                      &rerr);
-    sqlite3_free(model_hash);
+    int irc = predict0_emit_receipt(db, "predict", model_id, params,
+                                    input_json, result_hash, receipt_id,
+                                    &rerr);
     sqlite3_free(params);
     sqlite3_free(input_json);
     if (irc != SQLITE_OK) {

@@ -306,6 +306,38 @@ int predict0_receipt_insert(sqlite3 *db, const char *operation,
   return SQLITE_OK;
 }
 
+/* The receipt tail every operation shares: ensure the registry tables,
+ * resolve the model's content hash, digest the db, and insert. The
+ * caller builds the op-specific result_hash and params; this owns the
+ * ordering (digest must be taken before the insert mutates the db) and
+ * the uniform error text. logical-digest is the only anchor kind this
+ * build emits. Returns 0 on success with receipt_id_out filled. */
+int predict0_emit_receipt(sqlite3 *db, const char *op, const char *model_id,
+                          const char *params, const char *input_sql,
+                          const char *result_hash,
+                          char receipt_id_out[PREDICT_ULID_BUFSIZE],
+                          char **errmsg) {
+  if (predict0_receipts_ensure(db, errmsg))
+    return SQLITE_ERROR;
+  char *model_hash = predict0_registry_model_hash(db, model_id);
+  if (!model_hash) {
+    *errmsg = sqlite3_mprintf("%s: %s not in _predict_models",
+                              PREDICT_ERR_MODEL_NOT_FOUND, model_id);
+    return SQLITE_ERROR;
+  }
+  char digest[PREDICT_HEX_BUFSIZE];
+  if (predict0_logical_digest(db, digest, errmsg)) {
+    sqlite3_free(model_hash);
+    return SQLITE_ERROR;
+  }
+  int rc = predict0_receipt_insert(db, op, model_id, model_hash,
+                                   "logical-digest", digest, params,
+                                   input_sql, result_hash, receipt_id_out,
+                                   errmsg);
+  sqlite3_free(model_hash);
+  return rc;
+}
+
 #pragma endregion
 
 #pragma region replay
