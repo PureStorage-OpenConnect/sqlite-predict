@@ -104,3 +104,33 @@ as opt-in teachers (ONNX build), never default serving.
   JSON, query SQL, and ulid/receipt inputs — zero crashes; corpus kept
   in fuzz/corpus/.
 - pytest leak soak: bounded RSS over 1,200 mixed calls.
+
+## Code-quality pass (Fowler review, 2026-07-22)
+
+Reviewed for smells after the user flagged hardcoding. Done:
+- **Date handling rewritten** (was genuinely broken): strict digit parser
+  (rejects embedded signs, :60, leading whitespace); Hinnant O(1)
+  civil<->days replacing an O(years) loop that was a 294k-iteration DoS
+  + buffer overflow past year 9999; format clamps to [0001,9999] so it's
+  total for any i64; integer-epoch columns reject negatives/out-of-domain
+  as non_numeric instead of silent garbage. 14 new date tests.
+- **Contract constants lifted** to predict-internal.h: the 0x1f/0x1e
+  separators (shared by key builder + hasher + spec — the one magic
+  number that could silently corrupt output), buffer-size invariants,
+  epoch domain bounds.
+- **predict0_emit_receipt extracted**: the ensure->hash->digest->insert
+  tail was 3x-duplicated; now one helper owning the ordering contract.
+
+Deferred (recommended next, own focused session): extract
+collect_series() — the ~140-line series-collection loop is duplicated
+between forecast and detect_anomalies (it already forced the epoch-ms
+fix to be applied twice). Not rushed at session end because the two
+call sites have divergent error-path cleanup and a botched extraction
+would hide a memory bug in an error path. The replay-hash oracle +
+sanitizers make it safe to do carefully.
+
+Not changed (deliberate, not smells): the 4 vtab module structs
+(idiomatic C, sqlite-vec does the same); vendored SHA-256 / Acklam
+quantile / base32 (no C stdlib equivalent); hand-rolled calendar math
+(libc timegm is non-portable to Windows/wasm — the reason sqlite itself
+hand-rolls its date code; now commented as such).
