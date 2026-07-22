@@ -482,9 +482,11 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     sqlite3_free(orig_hash);                                                  \
   } while (0)
 
-  if (strcmp(operation, "forecast") != 0) {
+  int is_forecast = strcmp(operation, "forecast") == 0;
+  int is_anomalies = strcmp(operation, "detect_anomalies") == 0;
+  if (!is_forecast && !is_anomalies) {
     int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
-                     "replay implemented for forecast only in this build");
+                     "replay not implemented for this operation yet");
     RP_CLEANUP();
     return r;
   }
@@ -518,6 +520,54 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                      "database state no longer matches the receipt anchor");
     RP_CLEANUP();
     return r;
+  }
+
+  /* anomalies replay: re-run ordered by (series_key, ts) and hash the
+   * result columns directly (BINARY text collation == the write path's
+   * strcmp ordering) */
+  if (is_anomalies) {
+    sqlite3_stmt *run2 = NULL;
+    rc = sqlite3_prepare_v2(
+        db,
+        "SELECT series_key, ts, value, forecast, lower_bound, upper_bound,"
+        " is_anomaly, anomaly_probability"
+        " FROM detect_anomalies(?1, json_set(?2, '$.receipt', 0))"
+        " ORDER BY series_key, ts",
+        -1, &run2, NULL);
+    if (rc != SQLITE_OK) {
+      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH,
+                       "could not re-prepare detect_anomalies");
+      RP_CLEANUP();
+      return r;
+    }
+    sqlite3_bind_text(run2, 1, input_sql, -1, SQLITE_STATIC);
+    sqlite3_bind_text(run2, 2, params, -1, SQLITE_STATIC);
+    predict0_hasher h2;
+    predict0_hash_init(&h2);
+    int n2 = 0;
+    while ((rc = sqlite3_step(run2)) == SQLITE_ROW) {
+      for (int i = 0; i < 8; i++)
+        hash_column_value(&h2, run2, i);
+      predict0_hash_row_end(&h2);
+      n2++;
+    }
+    int done = rc == SQLITE_DONE;
+    sqlite3_finalize(run2);
+    if (!done) {
+      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH, sqlite3_errmsg(db));
+      RP_CLEANUP();
+      return r;
+    }
+    predict0_hash_hex(&h2, cur->hash);
+    cur->match = strcmp(cur->hash, orig_hash) == 0;
+    sqlite3_free(cur->orig);
+    cur->orig = sqlite3_mprintf("%s", orig_hash);
+    sqlite3_free(cur->detail);
+    cur->detail =
+        cur->match ? sqlite3_mprintf("reproduced (%d rows)", n2)
+                   : sqlite3_mprintf("result hash diverged over %d rows", n2);
+    RP_CLEANUP();
+    return SQLITE_OK;
   }
 
   /* re-run through the public surface with receipts off */
