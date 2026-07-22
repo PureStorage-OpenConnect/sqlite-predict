@@ -13,3 +13,5 @@ __pycache__/
 .pytest_cache/
 tests/.python-version
 benchmarks/.python-version
+benchmarks/gestalt-dogfood.db
+benchmarks/models/
