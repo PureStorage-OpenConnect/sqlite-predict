@@ -555,6 +555,253 @@ static void series_sort(SeriesBuf *s) {
   }
 }
 
+static void series_array_free(SeriesBuf *series, int n) {
+  for (int i = 0; i < n; i++) {
+    sqlite3_free(series[i].key);
+    sqlite3_free(series[i].ts);
+    sqlite3_free(series[i].val);
+  }
+  sqlite3_free(series);
+}
+
+/* Prepare `query`, resolve or infer the time/value/group columns per
+ * `opts`, and collect its rows into a series array. Shared verbatim by
+ * forecast() and detect_anomalies(); previously copy-pasted, which is
+ * why an earlier epoch-ms fix had to be applied twice.
+ *
+ * On SQLITE_OK: out_series/out_n hold the collected series (free with
+ * series_array_free), and out_time/out_value hold the resolved column
+ * names (sqlite3_malloc'd, for the receipt). On failure: returns an
+ * error code, frees everything internally, and sets errmsg to a
+ * "CODE: detail" string (sqlite3_malloc'd) for the caller's zErrMsg. */
+static int collect_series(sqlite3 *db, const char *query,
+                          const ForecastOpts *opts, SeriesBuf **out_series,
+                          int *out_n, char **out_time, char **out_value,
+                          char **errmsg) {
+  *out_series = NULL;
+  *out_n = 0;
+  *out_time = NULL;
+  *out_value = NULL;
+
+#define COLLECT_FAIL(code, msg, detail)                                       \
+  do {                                                                        \
+    *errmsg = sqlite3_mprintf("%s: %s%s", (code), (msg),                      \
+                              (detail) ? (detail) : "");                      \
+    return SQLITE_ERROR;                                                      \
+  } while (0)
+
+  sqlite3_stmt *stmt = NULL;
+  const char *tail = NULL;
+  if (sqlite3_prepare_v2(db, query, -1, &stmt, &tail) != SQLITE_OK || !stmt) {
+    char *e = sqlite3_mprintf("%s: query does not parse: %s",
+                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
+    if (stmt)
+      sqlite3_finalize(stmt);
+    *errmsg = e;
+    return SQLITE_ERROR;
+  }
+  while (tail && (*tail == ' ' || *tail == '\n' || *tail == ';' ||
+                  *tail == '\t'))
+    tail++;
+  if (tail && *tail != '\0') {
+    sqlite3_finalize(stmt);
+    COLLECT_FAIL(PREDICT_ERR_SCHEMA, "query must be a single statement", NULL);
+  }
+  if (!sqlite3_stmt_readonly(stmt)) {
+    sqlite3_finalize(stmt);
+    COLLECT_FAIL(PREDICT_ERR_QUERY_NOT_READONLY,
+                 "query must be a read-only SELECT", NULL);
+  }
+  int ncol = sqlite3_column_count(stmt);
+  if (ncol < 2) {
+    sqlite3_finalize(stmt);
+    COLLECT_FAIL(PREDICT_ERR_SCHEMA,
+                 "query must yield at least a time and a value column", NULL);
+  }
+
+  /* resolve named columns */
+  int time_idx = -1, value_idx = -1;
+  int group_idx[FORECAST_MAX_GROUP_COLS];
+  for (int g = 0; g < opts->n_group_cols; g++)
+    group_idx[g] = -1;
+  for (int i = 0; i < ncol; i++) {
+    const char *name = sqlite3_column_name(stmt, i);
+    if (opts->time_col && name && strcmp(name, opts->time_col) == 0)
+      time_idx = i;
+    if (opts->value_col && name && strcmp(name, opts->value_col) == 0)
+      value_idx = i;
+    for (int g = 0; g < opts->n_group_cols; g++)
+      if (name && strcmp(name, opts->group_cols[g]) == 0)
+        group_idx[g] = i;
+  }
+  if (opts->time_col && time_idx < 0) {
+    char *d = sqlite3_mprintf("%s", opts->time_col);
+    sqlite3_finalize(stmt);
+    *errmsg = sqlite3_mprintf("%s: no such time_col: %s", PREDICT_ERR_SCHEMA,
+                              d ? d : "");
+    sqlite3_free(d);
+    return SQLITE_ERROR;
+  }
+  if (opts->value_col && value_idx < 0) {
+    char *d = sqlite3_mprintf("%s", opts->value_col);
+    sqlite3_finalize(stmt);
+    *errmsg = sqlite3_mprintf("%s: no such value_col: %s", PREDICT_ERR_SCHEMA,
+                              d ? d : "");
+    sqlite3_free(d);
+    return SQLITE_ERROR;
+  }
+  for (int g = 0; g < opts->n_group_cols; g++) {
+    if (group_idx[g] < 0) {
+      char *d = sqlite3_mprintf("%s", opts->group_cols[g]);
+      sqlite3_finalize(stmt);
+      *errmsg = sqlite3_mprintf("%s: no such group col: %s",
+                                PREDICT_ERR_SCHEMA, d ? d : "");
+      sqlite3_free(d);
+      return SQLITE_ERROR;
+    }
+  }
+
+  SeriesBuf *series = NULL;
+  int n_series = 0, series_cap = 0;
+  i64 total_rows = 0;
+  int inference_done = (time_idx >= 0 && value_idx >= 0);
+  int rc;
+
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    if (!inference_done) {
+      for (int i = 0; time_idx < 0 && i < ncol; i++) {
+        int t = sqlite3_column_type(stmt, i);
+        if (t == SQLITE_INTEGER) {
+          time_idx = i;
+        } else if (t == SQLITE_TEXT) {
+          i64 ms;
+          if (predict0_parse_timestamp(
+                  (const char *)sqlite3_column_text(stmt, i), &ms) == 0)
+            time_idx = i;
+        }
+      }
+      for (int i = 0; value_idx < 0 && i < ncol; i++) {
+        if (i == time_idx)
+          continue;
+        int in_groups = 0;
+        for (int g = 0; g < opts->n_group_cols; g++)
+          if (group_idx[g] == i)
+            in_groups = 1;
+        if (in_groups)
+          continue;
+        int t = sqlite3_column_type(stmt, i);
+        if (t == SQLITE_INTEGER || t == SQLITE_FLOAT)
+          value_idx = i;
+      }
+      if (time_idx < 0 || value_idx < 0) {
+        sqlite3_finalize(stmt);
+        series_array_free(series, n_series);
+        COLLECT_FAIL(PREDICT_ERR_SCHEMA,
+                     "could not infer time/value columns", NULL);
+      }
+      inference_done = 1;
+    }
+
+    if (++total_rows > FORECAST_MAX_TOTAL_ROWS) {
+      sqlite3_finalize(stmt);
+      series_array_free(series, n_series);
+      COLLECT_FAIL(PREDICT_ERR_RESOURCE, "too many input rows", NULL);
+    }
+
+    /* dynamic key: fixed buffers would truncate long group values and
+     * silently merge distinct series */
+    char *key = sqlite3_mprintf("%s", "");
+    for (int g = 0; key && g < opts->n_group_cols; g++) {
+      const char *gv = (const char *)sqlite3_column_text(stmt, group_idx[g]);
+      char sep[2] = {PREDICT_FS, 0};
+      key = sqlite3_mprintf("%z%s%s", key, g ? sep : "", gv ? gv : "");
+    }
+    if (!key) {
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    SeriesBuf *s = series_find(&series, &n_series, &series_cap, key);
+    sqlite3_free(key);
+    if (!s) {
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    if (s->non_numeric)
+      continue;
+
+    i64 ms = 0;
+    int tt = sqlite3_column_type(stmt, time_idx);
+    if (tt == SQLITE_INTEGER) {
+      /* epoch column: reject negatives and out-of-domain values as
+       * non_numeric rather than formatting garbage (the original bug) */
+      i64 raw = sqlite3_column_int64(stmt, time_idx);
+      if (raw < 0) {
+        s->non_numeric = 1;
+        continue;
+      }
+      ms = raw >= PREDICT_EPOCH_MS_THRESHOLD ? raw : raw * 1000;
+      if (ms > PREDICT_MS_MAX) {
+        s->non_numeric = 1;
+        continue;
+      }
+    } else if (predict0_parse_timestamp(
+                   (const char *)sqlite3_column_text(stmt, time_idx), &ms)) {
+      s->non_numeric = 1;
+      continue;
+    }
+    int vt = sqlite3_column_type(stmt, value_idx);
+    if (vt != SQLITE_INTEGER && vt != SQLITE_FLOAT) {
+      s->non_numeric = 1;
+      continue;
+    }
+
+    if (s->n == s->cap) {
+      int nc = s->cap ? s->cap * 2 : 64;
+      i64 *nts = sqlite3_realloc(s->ts, sizeof(i64) * nc);
+      f64 *nval = sqlite3_realloc(s->val, sizeof(f64) * nc);
+      if (!nts || !nval) {
+        sqlite3_free(nts);
+        sqlite3_free(nval);
+        rc = SQLITE_NOMEM;
+        break;
+      }
+      s->ts = nts;
+      s->val = nval;
+      s->cap = nc;
+    }
+    s->ts[s->n] = ms;
+    s->val[s->n] = sqlite3_column_double(stmt, value_idx);
+    s->n++;
+  }
+
+  char *rtime = NULL, *rvalue = NULL;
+  if (time_idx >= 0)
+    rtime = sqlite3_mprintf("%s", sqlite3_column_name(stmt, time_idx));
+  if (value_idx >= 0)
+    rvalue = sqlite3_mprintf("%s", sqlite3_column_name(stmt, value_idx));
+  sqlite3_finalize(stmt);
+
+  if (rc == SQLITE_NOMEM) {
+    sqlite3_free(rtime);
+    sqlite3_free(rvalue);
+    series_array_free(series, n_series);
+    return SQLITE_NOMEM;
+  }
+  if (rc != SQLITE_DONE) {
+    sqlite3_free(rtime);
+    sqlite3_free(rvalue);
+    series_array_free(series, n_series);
+    COLLECT_FAIL(PREDICT_ERR_RESOURCE, "query execution failed", NULL);
+  }
+
+  *out_series = series;
+  *out_n = n_series;
+  *out_time = rtime;
+  *out_value = rvalue;
+  return SQLITE_OK;
+#undef COLLECT_FAIL
+}
+
 static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                      const char *idxStr, int argc, sqlite3_value **argv) {
   UNUSED_PARAMETER(idxNum);
@@ -605,241 +852,18 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     return rc;
   }
 
-  /* prepare the inner query */
-  sqlite3_stmt *stmt = NULL;
-  const char *tail = NULL;
-  int rc = sqlite3_prepare_v2(db, query, -1, &stmt, &tail);
-  if (rc != SQLITE_OK || !stmt) {
-    if (stmt)
-      sqlite3_finalize(stmt);
-    rc = fc_error(cur, PREDICT_ERR_SCHEMA, "query does not parse: ",
-                  sqlite3_errmsg(db));
+  /* prepare + collect the series (shared with detect_anomalies) */
+  SeriesBuf *series = NULL;
+  int n_series = 0;
+  char *resolved_time = NULL, *resolved_value = NULL;
+  char *cerr = NULL;
+  int rc = collect_series(db, query, &opts, &series, &n_series,
+                          &resolved_time, &resolved_value, &cerr);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = cerr;
     forecast_opts_free(&opts);
     return rc;
-  }
-  while (tail && (*tail == ' ' || *tail == '\n' || *tail == ';' ||
-                  *tail == '\t'))
-    tail++;
-  if (tail && *tail != '\0') {
-    sqlite3_finalize(stmt);
-    forecast_opts_free(&opts);
-    return fc_error(cur, PREDICT_ERR_SCHEMA,
-                    "query must be a single statement", NULL);
-  }
-  if (!sqlite3_stmt_readonly(stmt)) {
-    sqlite3_finalize(stmt);
-    forecast_opts_free(&opts);
-    return fc_error(cur, PREDICT_ERR_QUERY_NOT_READONLY,
-                    "query must be a read-only SELECT", NULL);
-  }
-
-  int ncol = sqlite3_column_count(stmt);
-  if (ncol < 2) {
-    sqlite3_finalize(stmt);
-    forecast_opts_free(&opts);
-    return fc_error(cur, PREDICT_ERR_SCHEMA,
-                    "query must yield at least a time and a value column",
-                    NULL);
-  }
-
-  /* resolve named columns */
-  int time_idx = -1, value_idx = -1;
-  int group_idx[FORECAST_MAX_GROUP_COLS];
-  for (int g = 0; g < opts.n_group_cols; g++)
-    group_idx[g] = -1;
-  for (int i = 0; i < ncol; i++) {
-    const char *name = sqlite3_column_name(stmt, i);
-    if (opts.time_col && name && strcmp(name, opts.time_col) == 0)
-      time_idx = i;
-    if (opts.value_col && name && strcmp(name, opts.value_col) == 0)
-      value_idx = i;
-    for (int g = 0; g < opts.n_group_cols; g++) {
-      if (name && strcmp(name, opts.group_cols[g]) == 0)
-        group_idx[g] = i;
-    }
-  }
-  if (opts.time_col && time_idx < 0) {
-    sqlite3_finalize(stmt);
-    int rc2 = fc_error(cur, PREDICT_ERR_SCHEMA, "no such time_col: ",
-                       opts.time_col);
-    forecast_opts_free(&opts);
-    return rc2;
-  }
-  if (opts.value_col && value_idx < 0) {
-    sqlite3_finalize(stmt);
-    int rc2 = fc_error(cur, PREDICT_ERR_SCHEMA, "no such value_col: ",
-                       opts.value_col);
-    forecast_opts_free(&opts);
-    return rc2;
-  }
-  for (int g = 0; g < opts.n_group_cols; g++) {
-    if (group_idx[g] < 0) {
-      sqlite3_finalize(stmt);
-      int rc2 = fc_error(cur, PREDICT_ERR_SCHEMA, "no such group col: ",
-                         opts.group_cols[g]);
-      forecast_opts_free(&opts);
-      return rc2;
-    }
-  }
-
-  /* collect rows */
-  SeriesBuf *series = NULL;
-  int n_series = 0, series_cap = 0;
-  i64 total_rows = 0;
-  int inference_done = (time_idx >= 0 && value_idx >= 0);
-
-  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-    if (!inference_done) {
-      /* infer from the first row: time = named or first parseable/int
-       * column; value = named or first numeric column that isn't time */
-      for (int i = 0; time_idx < 0 && i < ncol; i++) {
-        int t = sqlite3_column_type(stmt, i);
-        if (t == SQLITE_INTEGER) {
-          time_idx = i;
-        } else if (t == SQLITE_TEXT) {
-          i64 ms;
-          if (predict0_parse_timestamp(
-                  (const char *)sqlite3_column_text(stmt, i), &ms) == 0)
-            time_idx = i;
-        }
-      }
-      for (int i = 0; value_idx < 0 && i < ncol; i++) {
-        if (i == time_idx)
-          continue;
-        int in_groups = 0;
-        for (int g = 0; g < opts.n_group_cols; g++)
-          if (group_idx[g] == i)
-            in_groups = 1;
-        if (in_groups)
-          continue;
-        int t = sqlite3_column_type(stmt, i);
-        if (t == SQLITE_INTEGER || t == SQLITE_FLOAT)
-          value_idx = i;
-      }
-      if (time_idx < 0 || value_idx < 0) {
-        sqlite3_finalize(stmt);
-        for (int i = 0; i < n_series; i++) {
-          sqlite3_free(series[i].key);
-          sqlite3_free(series[i].ts);
-          sqlite3_free(series[i].val);
-        }
-        sqlite3_free(series);
-        forecast_opts_free(&opts);
-        return fc_error(cur, PREDICT_ERR_SCHEMA,
-                        "could not infer time/value columns", NULL);
-      }
-      inference_done = 1;
-    }
-
-    if (++total_rows > FORECAST_MAX_TOTAL_ROWS) {
-      sqlite3_finalize(stmt);
-      for (int i = 0; i < n_series; i++) {
-        sqlite3_free(series[i].key);
-        sqlite3_free(series[i].ts);
-        sqlite3_free(series[i].val);
-      }
-      sqlite3_free(series);
-      forecast_opts_free(&opts);
-      return fc_error(cur, PREDICT_ERR_RESOURCE, "too many input rows", NULL);
-    }
-
-    /* series key: group values joined with 0x1F */
-    /* dynamic key: fixed buffers truncate long group values, silently
-     * merging distinct series */
-    char *key = sqlite3_mprintf("%s", "");
-    for (int g = 0; key && g < opts.n_group_cols; g++) {
-      const char *gv = (const char *)sqlite3_column_text(stmt, group_idx[g]);
-      key = sqlite3_mprintf("%z%s%s", key, g ? "\x1f" : "", gv ? gv : "");
-    }
-    if (!key) {
-      rc = SQLITE_NOMEM;
-      break;
-    }
-
-    SeriesBuf *s = series_find(&series, &n_series, &series_cap, key);
-    sqlite3_free(key);
-    if (!s) {
-      rc = SQLITE_NOMEM;
-      break;
-    }
-    if (s->non_numeric)
-      continue;
-
-    i64 ms = 0;
-    int tt = sqlite3_column_type(stmt, time_idx);
-    if (tt == SQLITE_INTEGER) {
-      /* 13-digit integers are already epoch ms; shorter are seconds */
-      i64 raw = sqlite3_column_int64(stmt, time_idx);
-      /* epoch column: reject negatives (bug source) and out-of-domain
-
-       * values as non_numeric rather than formatting garbage */
-
-      if (raw < 0) {
-
-        s->non_numeric = 1;
-
-        continue;
-
-      }
-
-      ms = raw >= PREDICT_EPOCH_MS_THRESHOLD ? raw : raw * 1000;
-
-      if (ms > PREDICT_MS_MAX) {
-
-        s->non_numeric = 1;
-
-        continue;
-
-      }
-    } else if (predict0_parse_timestamp(
-                   (const char *)sqlite3_column_text(stmt, time_idx), &ms)) {
-      s->non_numeric = 1; /* unparseable time in this series */
-      continue;
-    }
-    int vt = sqlite3_column_type(stmt, value_idx);
-    if (vt != SQLITE_INTEGER && vt != SQLITE_FLOAT) {
-      s->non_numeric = 1;
-      continue;
-    }
-
-    if (s->n == s->cap) {
-      int nc = s->cap ? s->cap * 2 : 64;
-      i64 *nts = sqlite3_realloc(s->ts, sizeof(i64) * nc);
-      f64 *nval = sqlite3_realloc(s->val, sizeof(f64) * nc);
-      if (!nts || !nval) {
-        sqlite3_free(nts);
-        rc = SQLITE_NOMEM;
-        break;
-      }
-      s->ts = nts;
-      s->val = nval;
-      s->cap = nc;
-    }
-    s->ts[s->n] = ms;
-    s->val[s->n] = sqlite3_column_double(stmt, value_idx);
-    s->n++;
-  }
-  /* capture resolved column names for the receipt before finalize */
-  char *resolved_time = NULL, *resolved_value = NULL;
-  if (time_idx >= 0)
-    resolved_time = sqlite3_mprintf("%s", sqlite3_column_name(stmt, time_idx));
-  if (value_idx >= 0)
-    resolved_value =
-        sqlite3_mprintf("%s", sqlite3_column_name(stmt, value_idx));
-
-  sqlite3_finalize(stmt);
-  if (rc != SQLITE_DONE && rc != SQLITE_ROW && rc != SQLITE_OK) {
-    sqlite3_free(resolved_time);
-    sqlite3_free(resolved_value);
-    for (int i = 0; i < n_series; i++) {
-      sqlite3_free(series[i].key);
-      sqlite3_free(series[i].ts);
-      sqlite3_free(series[i].val);
-    }
-    sqlite3_free(series);
-    forecast_opts_free(&opts);
-    return fc_error(cur, PREDICT_ERR_RESOURCE, "query execution failed",
-                    NULL);
   }
 
   /* forecast every series into cursor rows */
@@ -1374,214 +1398,27 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   if (strcmp(model_id, "stub-seasonal-naive") == 0)
     theta_mode = 0;
 
-  /* --- lean collection (same validation path as forecast) --- */
-  sqlite3_stmt *stmt = NULL;
-  const char *tail = NULL;
-  int rc = sqlite3_prepare_v2(db, query, -1, &stmt, &tail);
-  if (rc != SQLITE_OK || !stmt) {
-    if (stmt)
-      sqlite3_finalize(stmt);
-    rc = an_error(cur, PREDICT_ERR_SCHEMA, "query does not parse: ",
-                  sqlite3_errmsg(db));
-    forecast_opts_free(&opts);
-    return rc;
-  }
-  while (tail && (*tail == ' ' || *tail == '\n' || *tail == ';' ||
-                  *tail == '\t'))
-    tail++;
-  if ((tail && *tail != '\0') || !sqlite3_stmt_readonly(stmt)) {
-    int readonly = sqlite3_stmt_readonly(stmt);
-    sqlite3_finalize(stmt);
-    forecast_opts_free(&opts);
-    return readonly
-               ? an_error(cur, PREDICT_ERR_SCHEMA,
-                          "query must be a single statement", NULL)
-               : an_error(cur, PREDICT_ERR_QUERY_NOT_READONLY,
-                          "query must be a read-only SELECT", NULL);
-  }
-  int ncol = sqlite3_column_count(stmt);
-  if (ncol < 2) {
-    sqlite3_finalize(stmt);
-    forecast_opts_free(&opts);
-    return an_error(cur, PREDICT_ERR_SCHEMA,
-                    "query must yield at least a time and a value column",
-                    NULL);
-  }
-  int time_idx = -1, value_idx = -1;
-  int group_idx[FORECAST_MAX_GROUP_COLS];
-  for (int g = 0; g < opts.n_group_cols; g++)
-    group_idx[g] = -1;
-  for (int i = 0; i < ncol; i++) {
-    const char *name = sqlite3_column_name(stmt, i);
-    if (opts.time_col && name && strcmp(name, opts.time_col) == 0)
-      time_idx = i;
-    if (opts.value_col && name && strcmp(name, opts.value_col) == 0)
-      value_idx = i;
-    for (int g = 0; g < opts.n_group_cols; g++)
-      if (name && strcmp(name, opts.group_cols[g]) == 0)
-        group_idx[g] = i;
-  }
-  if ((opts.time_col && time_idx < 0) || (opts.value_col && value_idx < 0)) {
-    sqlite3_finalize(stmt);
-    int r = an_error(cur, PREDICT_ERR_SCHEMA, "no such named column", NULL);
-    forecast_opts_free(&opts);
-    return r;
-  }
-  for (int g = 0; g < opts.n_group_cols; g++) {
-    if (group_idx[g] < 0) {
-      sqlite3_finalize(stmt);
-      int r = an_error(cur, PREDICT_ERR_SCHEMA, "no such group col: ",
-                       opts.group_cols[g]);
-      forecast_opts_free(&opts);
-      return r;
-    }
-  }
-
+  /* prepare + collect the series (shared with forecast) */
   SeriesBuf *series = NULL;
-  int n_series = 0, series_cap = 0;
-  i64 total_rows = 0;
-  int inference_done = (time_idx >= 0 && value_idx >= 0);
-
-  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-    if (!inference_done) {
-      for (int i = 0; time_idx < 0 && i < ncol; i++) {
-        int t = sqlite3_column_type(stmt, i);
-        if (t == SQLITE_INTEGER) {
-          time_idx = i;
-        } else if (t == SQLITE_TEXT) {
-          i64 ms;
-          if (predict0_parse_timestamp(
-                  (const char *)sqlite3_column_text(stmt, i), &ms) == 0)
-            time_idx = i;
-        }
-      }
-      for (int i = 0; value_idx < 0 && i < ncol; i++) {
-        if (i == time_idx)
-          continue;
-        int in_groups = 0;
-        for (int g = 0; g < opts.n_group_cols; g++)
-          if (group_idx[g] == i)
-            in_groups = 1;
-        if (in_groups)
-          continue;
-        int t = sqlite3_column_type(stmt, i);
-        if (t == SQLITE_INTEGER || t == SQLITE_FLOAT)
-          value_idx = i;
-      }
-      if (time_idx < 0 || value_idx < 0)
-        break;
-      inference_done = 1;
-    }
-    if (++total_rows > FORECAST_MAX_TOTAL_ROWS)
-      break;
-
-    /* dynamic key: fixed buffers truncate long group values, silently
-     * merging distinct series */
-    char *key = sqlite3_mprintf("%s", "");
-    for (int g = 0; key && g < opts.n_group_cols; g++) {
-      const char *gv = (const char *)sqlite3_column_text(stmt, group_idx[g]);
-      key = sqlite3_mprintf("%z%s%s", key, g ? "\x1f" : "", gv ? gv : "");
-    }
-    if (!key) {
-      rc = SQLITE_NOMEM;
-      break;
-    }
-    SeriesBuf *s = series_find(&series, &n_series, &series_cap, key);
-    sqlite3_free(key);
-    if (!s) {
-      rc = SQLITE_NOMEM;
-      break;
-    }
-    if (s->non_numeric)
-      continue;
-    i64 ms = 0;
-    int tt = sqlite3_column_type(stmt, time_idx);
-    if (tt == SQLITE_INTEGER) {
-      /* 13-digit integers are already epoch ms; shorter are seconds */
-      i64 raw = sqlite3_column_int64(stmt, time_idx);
-      /* epoch column: reject negatives (bug source) and out-of-domain
-
-       * values as non_numeric rather than formatting garbage */
-
-      if (raw < 0) {
-
-        s->non_numeric = 1;
-
-        continue;
-
-      }
-
-      ms = raw >= PREDICT_EPOCH_MS_THRESHOLD ? raw : raw * 1000;
-
-      if (ms > PREDICT_MS_MAX) {
-
-        s->non_numeric = 1;
-
-        continue;
-
-      }
-    } else if (predict0_parse_timestamp(
-                   (const char *)sqlite3_column_text(stmt, time_idx), &ms)) {
-      s->non_numeric = 1;
-      continue;
-    }
-    int vt = sqlite3_column_type(stmt, value_idx);
-    if (vt != SQLITE_INTEGER && vt != SQLITE_FLOAT) {
-      s->non_numeric = 1;
-      continue;
-    }
-    if (s->n == s->cap) {
-      int nc = s->cap ? s->cap * 2 : 64;
-      i64 *nts = sqlite3_realloc(s->ts, sizeof(i64) * nc);
-      f64 *nval = sqlite3_realloc(s->val, sizeof(f64) * nc);
-      if (!nts || !nval) {
-        sqlite3_free(nts);
-        rc = SQLITE_NOMEM;
-        break;
-      }
-      s->ts = nts;
-      s->val = nval;
-      s->cap = nc;
-    }
-    s->ts[s->n] = ms;
-    s->val[s->n] = sqlite3_column_double(stmt, value_idx);
-    s->n++;
-  }
-  int schema_fail = !inference_done && total_rows > 0;
-  int too_many = total_rows > FORECAST_MAX_TOTAL_ROWS;
+  int n_series = 0;
   char *resolved_time = NULL, *resolved_value = NULL;
-  if (time_idx >= 0)
-    resolved_time = sqlite3_mprintf("%s", sqlite3_column_name(stmt, time_idx));
-  if (value_idx >= 0)
-    resolved_value =
-        sqlite3_mprintf("%s", sqlite3_column_name(stmt, value_idx));
-  sqlite3_finalize(stmt);
+  char *cerr = NULL;
+  int rc = collect_series(db, query, &opts, &series, &n_series,
+                          &resolved_time, &resolved_value, &cerr);
 
 #define AN_FREE_SERIES()                                                      \
   do {                                                                        \
-    for (int i = 0; i < n_series; i++) {                                      \
-      sqlite3_free(series[i].key);                                            \
-      sqlite3_free(series[i].ts);                                             \
-      sqlite3_free(series[i].val);                                            \
-    }                                                                         \
-    sqlite3_free(series);                                                     \
-    sqlite3_free(resolved_time);                                              \
-    sqlite3_free(resolved_value);                                             \
-    forecast_opts_free(&opts);                                                \
+    series_array_free(series, n_series);                                      \
+    sqlite3_free(resolved_time);                                             \
+    sqlite3_free(resolved_value);                                            \
+    forecast_opts_free(&opts);                                               \
   } while (0)
 
-  if (schema_fail) {
-    AN_FREE_SERIES();
-    return an_error(cur, PREDICT_ERR_SCHEMA,
-                    "could not infer time/value columns", NULL);
-  }
-  if (too_many) {
-    AN_FREE_SERIES();
-    return an_error(cur, PREDICT_ERR_RESOURCE, "too many input rows", NULL);
-  }
-  if (rc == SQLITE_NOMEM) {
-    AN_FREE_SERIES();
-    return SQLITE_NOMEM;
+  if (rc != SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = cerr;
+    forecast_opts_free(&opts);
+    return rc;
   }
 
   /* score every series */

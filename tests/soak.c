@@ -75,11 +75,33 @@ int main(void) {
                     1))
       goto done_fail;
 
-    /* error paths every iteration too */
+    /* error paths every iteration too — including every collect_series
+     * failure branch, for both ops, so valgrind sees the partial-series
+     * cleanup under load */
     run_discard(db, "SELECT * FROM forecast('DELETE FROM series', 3)", 0);
     run_discard(db,
                 "SELECT * FROM forecast('SELECT ts, value FROM series', 3,"
                 " '{\"bogus\":1}')",
+                0);
+    run_discard(db, "SELECT * FROM forecast('NOT SQL', 3)", 0);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts FROM series', 3)", 0);
+    run_discard(db,
+                "SELECT * FROM forecast('SELECT ts, value FROM series', 3,"
+                " '{\"time_col\":\"nope\"}')",
+                0);
+    run_discard(db,
+                "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
+                " 3, '{\"group_cols\":[\"nope\"]}')",
+                0);
+    run_discard(db,
+                "SELECT * FROM detect_anomalies('SELECT grp AS a, grp AS b"
+                " FROM series')",
+                0);
+    run_discard(db,
+                "SELECT * FROM detect_anomalies('DELETE FROM series')", 0);
+    run_discard(db,
+                "SELECT * FROM detect_anomalies('SELECT ts, value FROM"
+                " series', '{\"value_col\":\"nope\"}')",
                 0);
     run_discard(db,
                 "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
