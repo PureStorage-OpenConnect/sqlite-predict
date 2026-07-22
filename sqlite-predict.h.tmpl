@@ -1,0 +1,38 @@
+#ifndef SQLITE_PREDICT_H
+#define SQLITE_PREDICT_H
+
+#define SQLITE_PREDICT_VERSION "v${VERSION}"
+#define SQLITE_PREDICT_DATE "${DATE}"
+#define SQLITE_PREDICT_SOURCE "${SOURCE}"
+#define SQLITE_PREDICT_VERSION_MAJOR ${VERSION_MAJOR}
+#define SQLITE_PREDICT_VERSION_MINOR ${VERSION_MINOR}
+#define SQLITE_PREDICT_VERSION_PATCH ${VERSION_PATCH}
+#define SQLITE_PREDICT_SPEC "0005-draft"
+
+#ifdef SQLITE_CORE
+#include "sqlite3.h"
+#else
+#include "sqlite3ext.h"
+#endif
+
+#ifdef _WIN32
+#ifndef SQLITE_PREDICT_STATIC
+#define SQLITE_PREDICT_API __declspec(dllexport)
+#endif
+#endif
+#ifndef SQLITE_PREDICT_API
+#define SQLITE_PREDICT_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+SQLITE_PREDICT_API int sqlite3_predict_init(sqlite3 *db, char **pzErrMsg,
+                                            const sqlite3_api_routines *pApi);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SQLITE_PREDICT_H */

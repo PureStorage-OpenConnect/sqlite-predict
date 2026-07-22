@@ -1,0 +1,15 @@
+dist/
+vendor/sqlite3.h
+vendor/sqlite3ext.h
+vendor/sqlite3.c
+vendor/sqlite-amalgamation*
+sqlite-predict.h
+__pycache__/
+.venv/
+*.dylib
+*.so
+*.dll
+*.o
+.pytest_cache/
+tests/.python-version
+benchmarks/.python-version
