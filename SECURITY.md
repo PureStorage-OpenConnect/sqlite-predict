@@ -20,11 +20,18 @@ before public disclosure.
 process's privileges. Three inputs cross a trust boundary and receive
 particular attention:
 
-- **Model blobs.** Deserializing model weights is code-adjacent (ONNX and
-  GGUF parsers have had memory-safety CVEs). The extension verifies a
-  content hash before loading any model, and the model registry table is
-  writable by any SQL caller, so catalog and user-registered models are
-  treated identically.
+- **Model blobs and weight paths.** Deserializing model weights is
+  code-adjacent (ONNX and GGUF parsers have had memory-safety CVEs). The
+  extension verifies a content hash before loading any model, and the model
+  registry table is writable by any SQL caller, so catalog and
+  user-registered models are treated identically. `predict_register` and
+  the ONNX backend open a local file path (`weights_uri`) supplied through
+  SQL, which lets a caller make the process read and hash an arbitrary
+  file. This does not escalate past the trust boundary (loading the
+  extension already grants the host process's privileges), but operators
+  who expose SQL to lower-trust callers should keep that in mind. The
+  onnxruntime dependency exists only in the opt-in `loadable-onnx` build;
+  the default build carries no such parser.
 - **SQL arguments and inner queries.** Callers may be agents executing
   partially untrusted plans. Inner queries are enforced read-only and
   single-statement; stored receipt SQL is re-executed read-only on replay.

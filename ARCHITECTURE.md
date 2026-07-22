@@ -16,8 +16,9 @@ Source layout:
 | --- | --- |
 | `sqlite-predict.c` | entry point, function registration, shared helpers (timestamp parse/format, ULID, options parsing, normal-quantile) |
 | `predict-forecast.c` | `forecast()` and `detect_anomalies()` vtabs, the statistical models, and the shared `collect_series()` helper |
-| `predict-tabular.c` | `predict()` vtab and the in-context k-NN model |
+| `predict-tabular.c` | `predict()` vtab, the in-context k-NN model, and dispatch to a runtime backend for registered models |
 | `predict-receipts.c` | model registry, receipts, canonical hashing, the logical-digest anchor, and `predict_replay()` |
+| `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
 | `predict-internal.h` | shared types, contract constants, error codes, internal prototypes |
 | `vendor/sha256.c` | a self-contained FIPS 180-4 SHA-256 |
 
@@ -36,10 +37,22 @@ the time/value/group columns, and collect rows into per-series buffers.
 ## Models
 
 Models are looked up in a registry table (`_predict_models`) by id, with a
-content hash and a license tag. The bundled models are pure-C statistical
-methods. Foundation models are out-of-process teachers reached via
-distillation (roadmap), not per-query serving paths. The benchmarks in
-`benchmarks/` drove that decision.
+content hash, a license tag, and a `runtime`. The bundled models are pure-C
+statistical methods (`runtime='bundled'`). `predict()` dispatches by
+runtime: the default `knn5-incontext` path is unchanged and never touches
+the registry (so it still works read-only), while a named `onnx` model
+routes through the backend in `predict-onnx.c`.
+
+That backend (compiled only into `make loadable-onnx`, `-DSQLITE_PREDICT_ONNX`)
+serves the "vector" `io_spec` layout: a self-contained model mapping a
+feature vector to a prediction. It caches one onnxruntime session per
+(weights, device, precision), runs query rows in batches, and selects the
+execution provider explicitly, erasing no failure into a silent CPU
+fallback. Weights are pinned by content hash, so a receipt records exactly
+which bytes ran. Foundation-model *teachers* run in-context (the training
+rows become model context) and are the next backend layer, validated on the
+gated GPU CI job; the `benchmarks/` numbers are why the default answer for
+their accuracy is still distillation to a small vector student.
 
 ## Receipts, anchoring, and replay
 
@@ -64,9 +77,14 @@ result set.
 ## Determinism
 
 Statistical inference is deterministic on a given machine, which is what
-makes replay meaningful. Cross-machine and cross-backend determinism is
-not guaranteed (see the notes on GPU backends in `benchmarks/notes.md`);
-replay verification is same-machine.
+makes replay meaningful. The ONNX CPU-fp32 path is deterministic too, so
+its receipts replay bit-exact; the receipt records the execution provider
+and precision. GPU and fp16 inference is not bit-reproducible across
+machines (different hardware and kernels round differently), so that path
+carries a `nondeterministic` receipt and replays within a tolerance,
+reporting a `match_kind` rather than a bit-exact hash — that tiered replay
+lands with the GPU backend. Cross-machine, cross-backend bit-equality is
+never claimed (see `benchmarks/notes.md`).
 
 ## Deviations from the spec
 

@@ -78,8 +78,14 @@ Foundation models (Chronos, TimesFM, TabPFN/TabFM) are treated as
 *teachers*, not serving paths. In benchmarking they were far too slow to
 call per query on CPU. The intended path for their accuracy is `distill()`,
 which compresses a teacher into a compact model that serves in
-microseconds; an optional ONNX build for running teachers directly is on
-the roadmap.
+microseconds.
+
+An opt-in ONNX build (`make loadable-onnx`) runs exported models through
+onnxruntime: register one with `predict_register()` and call it by name.
+Today it serves the "vector" case (a distilled student, or any exported
+tabular classifier/regressor) with a cached session and batched inference.
+Running a teacher such as TabFM directly, in-context, on a GPU is the next
+step. The default build never links onnxruntime.
 
 ## Installing
 
@@ -95,6 +101,12 @@ build. Requires a C99 compiler. Then, from any SQLite client:
 ```sql
 .load ./dist/predict0
 ```
+
+For the ONNX serving path, install onnxruntime (macOS: `brew install
+onnxruntime`; Linux: extract an [onnxruntime release][ort] and point
+`ONNXRUNTIME_PREFIX` at it) and build `make loadable-onnx`.
+
+[ort]: https://github.com/microsoft/onnxruntime/releases
 
 ## How it works
 
