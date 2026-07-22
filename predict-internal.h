@@ -44,6 +44,7 @@ typedef size_t usize;
 
 int predict0_forecast_init(sqlite3 *db);
 int predict0_receipts_init(sqlite3 *db);
+int predict0_tabular_init(sqlite3 *db);
 
 /* ---- shared helpers (sqlite-predict.c) ---- */
 

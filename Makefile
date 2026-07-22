@@ -36,7 +36,7 @@ prefix?=dist
 
 TARGET_LOADABLE=$(prefix)/predict0.$(LOADABLE_EXTENSION)
 
-OBJS=sqlite-predict.c predict-forecast.c predict-receipts.c vendor/sha256.c
+OBJS=sqlite-predict.c predict-forecast.c predict-receipts.c predict-tabular.c vendor/sha256.c
 
 $(prefix):
 	mkdir -p $(prefix)

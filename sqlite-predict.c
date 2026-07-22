@@ -308,5 +308,8 @@ __declspec(dllexport)
   if (rc != SQLITE_OK)
     return rc;
   rc = predict0_forecast_init(db);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = predict0_tabular_init(db);
   return rc;
 }

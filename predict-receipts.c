@@ -94,7 +94,8 @@ static const char *DDL =
     "CREATE TABLE IF NOT EXISTS _predict_models (\n"
     "  model_id     TEXT PRIMARY KEY,\n"
     "  kind         TEXT NOT NULL CHECK (kind IN\n"
-    "    ('ts-fm','ts-stat','tabular-fm','student','embedding')),\n"
+    "    ('ts-fm','ts-stat','tabular-fm','tabular-stat','student',"
+    "'embedding')),\n"
     "  runtime      TEXT NOT NULL CHECK (runtime IN\n"
     "    ('onnx','ggml','tree','remote','bundled')),\n"
     "  weights      BLOB,\n"
@@ -161,6 +162,8 @@ int predict0_receipts_ensure(sqlite3 *db, char **errmsg) {
   rc = bundled_model_row(db, "theta-classic", "ts-stat");
   if (rc == SQLITE_OK)
     rc = bundled_model_row(db, "stub-seasonal-naive", "ts-stat");
+  if (rc == SQLITE_OK)
+    rc = bundled_model_row(db, "knn5-incontext", "tabular-stat");
   if (rc != SQLITE_OK)
     *errmsg = sqlite3_mprintf("%s: cannot register bundled models",
                               PREDICT_ERR_RESOURCE);
@@ -484,7 +487,8 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   int is_forecast = strcmp(operation, "forecast") == 0;
   int is_anomalies = strcmp(operation, "detect_anomalies") == 0;
-  if (!is_forecast && !is_anomalies) {
+  int is_predict = strcmp(operation, "predict") == 0;
+  if (!is_forecast && !is_anomalies && !is_predict) {
     int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
                      "replay not implemented for this operation yet");
     RP_CLEANUP();
@@ -566,6 +570,52 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     cur->detail =
         cur->match ? sqlite3_mprintf("reproduced (%d rows)", n2)
                    : sqlite3_mprintf("result hash diverged over %d rows", n2);
+    RP_CLEANUP();
+    return SQLITE_OK;
+  }
+
+  /* predict replay: input_sql is a {"train","apply"} JSON pair; rows
+   * hash in apply order (no ORDER BY — the vtab preserves it) */
+  if (is_predict) {
+    sqlite3_stmt *run3 = NULL;
+    rc = sqlite3_prepare_v2(
+        db,
+        "SELECT row_ref, prediction, confidence FROM predict("
+        " json_extract(?1, '$.train'), json_extract(?1, '$.apply'),"
+        " json_set(?2, '$.receipt', 0))",
+        -1, &run3, NULL);
+    if (rc != SQLITE_OK) {
+      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH,
+                       "could not re-prepare predict");
+      RP_CLEANUP();
+      return r;
+    }
+    sqlite3_bind_text(run3, 1, input_sql, -1, SQLITE_STATIC);
+    sqlite3_bind_text(run3, 2, params, -1, SQLITE_STATIC);
+    predict0_hasher h3;
+    predict0_hash_init(&h3);
+    int n3 = 0;
+    while ((rc = sqlite3_step(run3)) == SQLITE_ROW) {
+      for (int i = 0; i < 3; i++)
+        hash_column_value(&h3, run3, i);
+      predict0_hash_row_end(&h3);
+      n3++;
+    }
+    int done = rc == SQLITE_DONE;
+    sqlite3_finalize(run3);
+    if (!done) {
+      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH, sqlite3_errmsg(db));
+      RP_CLEANUP();
+      return r;
+    }
+    predict0_hash_hex(&h3, cur->hash);
+    cur->match = strcmp(cur->hash, orig_hash) == 0;
+    sqlite3_free(cur->orig);
+    cur->orig = sqlite3_mprintf("%s", orig_hash);
+    sqlite3_free(cur->detail);
+    cur->detail =
+        cur->match ? sqlite3_mprintf("reproduced (%d rows)", n3)
+                   : sqlite3_mprintf("result hash diverged over %d rows", n3);
     RP_CLEANUP();
     return SQLITE_OK;
   }

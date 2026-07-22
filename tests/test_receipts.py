@@ -62,10 +62,11 @@ def test_bundled_models_registered(seeded):
         "SELECT model_id, kind, runtime, license FROM _predict_models"
         " ORDER BY model_id"
     ).fetchall()
-    ids = [r[0] for r in rows]
-    assert "theta-classic" in ids and "stub-seasonal-naive" in ids
-    for _, kind, runtime, license in rows:
-        assert kind == "ts-stat"
+    kinds = {r[0]: r[1] for r in rows}
+    assert kinds["theta-classic"] == "ts-stat"
+    assert kinds["stub-seasonal-naive"] == "ts-stat"
+    assert kinds["knn5-incontext"] == "tabular-stat"
+    for _, _, runtime, license in rows:
         assert runtime == "bundled"
         assert license == "MIT OR Apache-2.0"
 
