@@ -266,12 +266,43 @@ static int onnx_build_session(const predict0_model_row *model,
 #endif
   } else if (strcmp(device, "cuda") == 0 || strcmp(device, "tensorrt") == 0) {
 #ifdef SQLITE_PREDICT_ONNX_GPU
-    OrtStatus *ep =
-        strcmp(device, "cuda") == 0
-            ? g_ort->SessionOptionsAppendExecutionProvider_CUDA_V2(so, NULL)
-            : g_ort->SessionOptionsAppendExecutionProvider_TensorRT_V2(so,
-                                                                       NULL);
-    BUILD_CHECK(ep, PREDICT_ERR_RUNTIME_UNAVAILABLE, "append GPU EP");
+    /* Real provider-options wiring. Appending fails loud if the EP is not in
+     * this onnxruntime build (i.e. onnxruntime-gpu is required). Compiled
+     * against the CPU headers for the CI compile-check; exercised for real on
+     * the gated GPU job. */
+    int fp16 = opts->precision && strcmp(opts->precision, "fp16") == 0;
+    if (strcmp(device, "cuda") == 0) {
+      OrtCUDAProviderOptionsV2 *cu = NULL;
+      BUILD_CHECK(g_ort->CreateCUDAProviderOptions(&cu),
+                  PREDICT_ERR_RUNTIME_UNAVAILABLE, "CreateCUDAProviderOptions");
+      /* CUDA EP runs the model's own dtype; fp16 comes from an fp16 model,
+       * not an EP flag. precision is recorded in the receipt regardless. */
+      OrtStatus *ap =
+          g_ort->SessionOptionsAppendExecutionProvider_CUDA_V2(so, cu);
+      g_ort->ReleaseCUDAProviderOptions(cu);
+      BUILD_CHECK(ap, PREDICT_ERR_RUNTIME_UNAVAILABLE, "append CUDA EP");
+    } else {
+      OrtTensorRTProviderOptionsV2 *trt = NULL;
+      BUILD_CHECK(g_ort->CreateTensorRTProviderOptions(&trt),
+                  PREDICT_ERR_RUNTIME_UNAVAILABLE,
+                  "CreateTensorRTProviderOptions");
+      if (fp16) {
+        const char *keys[] = {"trt_fp16_enable"};
+        const char *vals[] = {"1"};
+        OrtStatus *up =
+            g_ort->UpdateTensorRTProviderOptions(trt, keys, vals, 1);
+        if (up) {
+          g_ort->ReleaseTensorRTProviderOptions(trt);
+          rc = onnx_fail(up, PREDICT_ERR_RUNTIME_UNAVAILABLE,
+                         "trt_fp16_enable", errmsg);
+          goto fail;
+        }
+      }
+      OrtStatus *ap =
+          g_ort->SessionOptionsAppendExecutionProvider_TensorRT_V2(so, trt);
+      g_ort->ReleaseTensorRTProviderOptions(trt);
+      BUILD_CHECK(ap, PREDICT_ERR_RUNTIME_UNAVAILABLE, "append TensorRT EP");
+    }
 #else
     /* Honest state: the GPU execution providers are validated on the gated
      * GPU CI job and compiled only into the GPU build. This CPU build does
@@ -1153,12 +1184,30 @@ int predict0_onnx_predict(sqlite3 *db, const char *model_id,
     return rc;
 
   const char *precision = opts->precision ? opts->precision : "fp32";
-  if (strcmp(precision, "fp32") != 0) {
+#ifdef SQLITE_PREDICT_ONNX_GPU
+  int prec_ok = strcmp(precision, "fp32") == 0 ||
+                strcmp(precision, "fp16") == 0 ||
+                strcmp(precision, "int8") == 0;
+#else
+  int prec_ok = strcmp(precision, "fp32") == 0;
+#endif
+  if (!prec_ok) {
     *errmsg = sqlite3_mprintf(
-        "%s: precision '%s' is not in this build (fp32 only; fp16/int8 land"
-        " with the GPU path)",
+        "%s: precision '%s' is not available in this build (fp32 only;"
+        " fp16/int8 need the GPU build, loadable-onnx-gpu)",
         PREDICT_ERR_RUNTIME_UNAVAILABLE, precision);
     return SQLITE_ERROR;
+  }
+  /* fp16/int8 only take effect on a GPU device; pairing them with cpu/coreml
+   * would silently compute fp32, so reject it rather than no-op quietly. */
+  if (strcmp(precision, "fp32") != 0) {
+    const char *dev = opts->device ? opts->device : "cpu";
+    if (strcmp(dev, "cuda") != 0 && strcmp(dev, "tensorrt") != 0) {
+      *errmsg = sqlite3_mprintf(
+          "%s: precision '%s' requires a cuda or tensorrt device", PREDICT_ERR_OPTIONS,
+          precision);
+      return SQLITE_ERROR;
+    }
   }
   if (!license_ok(model->license, opts->accept_license)) {
     *errmsg = sqlite3_mprintf(

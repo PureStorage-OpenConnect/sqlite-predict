@@ -78,6 +78,17 @@ loadable-onnx: $(prefix) vendor/sqlite3ext.h sqlite-predict.h $(ONNX_OBJS)
 	  $(ONNX_CFLAGS) $(CFLAGS) $(ONNX_OBJS) -o $(TARGET_LOADABLE) \
 	  $(LDFLAGS) $(ONNX_LDFLAGS)
 
+# GPU-enabled onnx build: adds the CUDA and TensorRT execution providers
+# (fp16/int8 precision) behind -DSQLITE_PREDICT_ONNX_GPU. Running it needs
+# an onnxruntime-gpu install; the provider-options symbols are in the C API
+# of every onnxruntime build, so this compiles and links against the CPU
+# onnxruntime for a CI compile-check. Real GPU execution is validated on the
+# gated GPU job.
+loadable-onnx-gpu: $(prefix) vendor/sqlite3ext.h sqlite-predict.h $(ONNX_OBJS)
+	$(CC) -fPIC -shared -std=c99 -Wall -Wextra -Ivendor/ -I./ -O3 \
+	  $(ONNX_CFLAGS) -DSQLITE_PREDICT_ONNX_GPU $(CFLAGS) $(ONNX_OBJS) \
+	  -o $(TARGET_LOADABLE) $(LDFLAGS) $(ONNX_LDFLAGS)
+
 debug: $(prefix) vendor/sqlite3ext.h sqlite-predict.h $(OBJS)
 	$(CC) -fPIC -shared -std=c99 -Wall -Wextra -Ivendor/ -I./ -g -O0 -DSQLITE_PREDICT_DEBUG $(CFLAGS) $(OBJS) -o $(TARGET_LOADABLE) $(LDFLAGS)
 
@@ -176,5 +187,5 @@ clean:
 format:
 	clang-format -i sqlite-predict.c predict-*.c
 
-.PHONY: loadable loadable-onnx debug test test-loadable test-onnx \
-  test-asan-onnx clean format
+.PHONY: loadable loadable-onnx loadable-onnx-gpu debug test test-loadable \
+  test-onnx test-asan-onnx clean format

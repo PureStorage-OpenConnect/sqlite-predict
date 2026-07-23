@@ -53,10 +53,16 @@ precision), run query rows in batches, and select the execution provider
 explicitly, erasing no failure into a silent CPU fallback. Weights are pinned
 by content hash, so a receipt records exactly which bytes ran, and the
 in-context receipt anchors the training rows too, so mutating the context
-breaks replay. Both run on CPU today; the GPU execution providers are the
-next layer, validated on the gated GPU CI job. Even so, the `benchmarks/`
-numbers are why the default answer for a teacher's accuracy is usually
-distillation to a small vector student.
+breaks replay. Both run on CPU. A GPU build (`make loadable-onnx-gpu`,
+`-DSQLITE_PREDICT_ONNX_GPU`) wires the CUDA and TensorRT providers and
+fp16/int8 precision; the provider-options symbols are in every onnxruntime
+C API, so it compiles and links against the CPU onnxruntime for a CI
+compile-check, while real GPU execution is validated on a dedicated GPU job.
+The receipt records the execution provider and precision, which is what
+makes GPU results honestly distinguishable from the deterministic CPU path.
+Even so, the `benchmarks/` numbers (and the TabFM→ONNX eval in
+`benchmarks/results/tabfm-onnx.md`) are why the default answer for a
+teacher's accuracy is usually distillation to a small vector student.
 
 ## Receipts, anchoring, and replay
 

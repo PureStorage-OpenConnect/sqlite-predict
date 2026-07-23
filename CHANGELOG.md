@@ -21,8 +21,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   execution-provider selection. The `vector` layout serves a self-contained
   model (a distilled student or classifier/regressor); the `in_context`
   layout serves a teacher that ingests the `train_query` rows as context
-  each call (TabFM-shaped), anchoring those rows in the receipt. The default
-  build stays zero-dependency.
+  each call (TabFM-shaped), anchoring those rows in the receipt. A GPU build
+  (`make loadable-onnx-gpu`) adds the CUDA and TensorRT execution providers
+  and fp16/int8 precision, compile-checked in CI and validated on a
+  dedicated GPU job. The default build stays zero-dependency.
 - `predict_register(model_id, config_json)` to register an external model,
   pinning its weights by content hash. `_predict_models` gains `weights_uri`
   and `io_spec`; receipts record the execution provider and precision.

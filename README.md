@@ -90,8 +90,12 @@ serves two shapes, with a cached session and batched inference:
   on each call and labels the `apply_query` rows against them, the way
   TabFM works.
 
-Both run on CPU today. Running a teacher on a GPU (CUDA/TensorRT, fp16) is
-the remaining step. The default build never links onnxruntime.
+Both run on CPU today. A GPU build (`make loadable-onnx-gpu`) adds the CUDA
+and TensorRT execution providers and fp16/int8 precision; it needs an
+onnxruntime-gpu install, is compile-checked in CI, and its GPU execution is
+validated on a dedicated GPU job. Provider selection is explicit and fails
+loud: asking for `cuda` on a build without it errors, never a silent drop to
+CPU. The default build never links onnxruntime at all.
 
 ## Installing
 
@@ -110,7 +114,9 @@ build. Requires a C99 compiler. Then, from any SQLite client:
 
 For the ONNX serving path, install onnxruntime (macOS: `brew install
 onnxruntime`; Linux: extract an [onnxruntime release][ort] and point
-`ONNXRUNTIME_PREFIX` at it) and build `make loadable-onnx`.
+`ONNXRUNTIME_PREFIX` at it) and build `make loadable-onnx`. For GPU
+execution, point `ONNXRUNTIME_PREFIX` at an onnxruntime-gpu install and
+build `make loadable-onnx-gpu`.
 
 [ort]: https://github.com/microsoft/onnxruntime/releases
 

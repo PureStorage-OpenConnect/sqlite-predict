@@ -127,3 +127,5 @@ jobs:
         run: make test-onnx
       - name: ASan + LSan soak of the onnx backend
         run: make test-asan-onnx
+      - name: Compile-check the GPU build (CUDA/TensorRT wiring)
+        run: make loadable-onnx-gpu
