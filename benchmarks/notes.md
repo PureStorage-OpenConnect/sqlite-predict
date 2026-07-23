@@ -57,7 +57,15 @@ as opt-in teachers (ONNX build), never default serving.
 
 - **OQ1 (runtime):** deferred correctly. The 33 s CPU TabFM calls and
   the distillation results mean the FM path is distill()-first; a GGML
-  or ONNX teacher build is about batch distillation, not serving.
+  or ONNX teacher build is about batch distillation, not serving. The
+  ONNX serving path shipped (vector + in_context layouts, CPU); the
+  TabFM→ONNX eval (`results/tabfm-onnx.md`) then confirmed TabFM itself
+  is not directly servable through it: it fails to export out of the box
+  (`repeat_interleave` with no `dim`), its fp32 weights (~6.5 GB) exceed
+  ONNX's 2 GB single-file limit, and its packed signature +
+  quantile/ensemble preprocessing do not fit the `in_context` contract.
+  The extension serves *distilled* students; TabFM stays the offline
+  teacher.
 - **OQ2 (in-context latency):** measured. TabFM 32 s at n=20 context
   growing to 144 s at n=300; knn5-incontext 50 ms per thousand rows.
 - **OQ4 (determinism):** all replay round-trips bitwise-reproduce on
