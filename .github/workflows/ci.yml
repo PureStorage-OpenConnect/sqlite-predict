@@ -43,14 +43,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install valgrind
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
-      - name: Build soak
-        run: make soak CC=gcc
-      - name: Run under valgrind
-        run: |
-          valgrind --leak-check=full --error-exitcode=9 \
-            --errors-for-leak-kinds=definite ./dist/soak
+      # Run valgrind inside a container instead of apt-installing it on the
+      # runner: the host's apt contends with the runner's background
+      # unattended-upgrades dpkg lock and can hang. `make test-valgrind` builds
+      # the soak in a fresh gcc:13 container (glibc + gcc coverage too) and
+      # runs it under valgrind with --error-exitcode.
+      - name: Run valgrind (containerized)
+        run: make test-valgrind
 
   fuzz-smoke:
     name: fuzz smoke (60s)
