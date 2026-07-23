@@ -40,7 +40,7 @@ read, so an agent can cite the number and an auditor can reproduce it.
 | `forecast(query, horizon [, options])` | Where is this metric going? | future rows with prediction intervals and per-series status |
 | `detect_anomalies(query [, options])` | Which points are abnormal? | anomaly-scored rows with expected value and probability |
 | `predict(train_query, apply_query [, options])` | Classify/regress unseen rows | a prediction and confidence per row, zero-shot from in-context examples |
-| `distill(train_query [, options])` | Compress a slow teacher into a fast student | a tiny decision-tree model, registered and ready for `predict()` |
+| `distill(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree or gradient-boosted forest), registered and ready for `predict()` |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag by re-running the recorded call against its anchored data state |
 
 `query` is any read-only `SELECT`; results are ordinary rows you can join,
@@ -77,14 +77,19 @@ honest statistical models:
 
 Foundation models (Chronos, TimesFM, TabPFN/TabFM) are treated as
 *teachers*, not serving paths. In benchmarking they were far too slow to
-call per query on CPU. The path to their accuracy is `distill()`: it runs
-the teacher over your training rows, fits a student on the teacher's
-predictions, and registers that student as an inline model. The student runs
-in the zero-dependency core with no onnxruntime, serves in microseconds, and
-carries the same receipts.
+call per query on CPU. The path to their accuracy is `distill()`, which
+trains a small native student and registers it as an inline model. The
+student runs in the zero-dependency core with no onnxruntime, serves in
+microseconds, and carries the same receipts.
+
+By default `distill()` trains directly on the target column. That column can
+hold your labels, or a strong teacher's predictions computed offline: run
+TabFM once over your training rows on a GPU box, store what it predicts, and
+distill compresses it into a student that runs anywhere.
 
 ```sql
--- distill the (slow) teacher into a fast native student, once
+-- distill whatever the target column holds (labels, or a teacher's
+-- precomputed predictions) into a fast native student, once
 SELECT model_id, holdout_metric FROM distill(
   'SELECT tenure, spend, plan, churned FROM customers',
   '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
@@ -94,9 +99,13 @@ SELECT * FROM predict(NULL, 'SELECT id, tenure, spend, plan FROM customers',
                       '{"model":"churn-v1"}');
 ```
 
+Pass a `teacher` to instead relabel the rows with a registered model first
+(for example, `'{"teacher":"knn5-incontext", ...}'` compresses the in-context
+k-NN into a standalone tree).
+
 Two student kinds: `'tree'` is a single decision tree (a few kilobytes,
-interpretable); `'gbt'` is a gradient-boosted forest (a few hundred
-kilobytes) that on the [TabArena benchmark](benchmarks/results/tabarena.md)
+interpretable); `'gbt'` is a gradient-boosted forest with second-order
+(Newton) leaves that on the [TabArena benchmark](benchmarks/results/tabarena.md)
 matches or beats tuned XGBoost on several tasks while still running in the
 zero-dependency core.
 

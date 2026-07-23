@@ -73,6 +73,12 @@ int main(void) {
           " '{\"target\":\"label\",\"student_id\":\"soak_gbt\","
           "\"student_kind\":\"gbt\"}')",
           1) ||
+      run_discard(
+          db,
+          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          " '{\"target\":\"label\",\"teacher\":\"knn5-incontext\","
+          "\"student_id\":\"soak_knn\",\"student_kind\":\"gbt\"}')",
+          1) ||
       run_discard(db,
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_bad',"
@@ -116,6 +122,9 @@ int main(void) {
     /* gbt-student (forest runtime) + tree/forest error paths */
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_gbt\",\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_knn\",\"receipt\":0}')",
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_bad\",\"receipt\":0}')",

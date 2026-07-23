@@ -195,6 +195,29 @@ def _load_tables(db, Xtr, ytr, Xte, task):
     return feats
 
 
+def run_ours_distill_teacher(Xtr, teacher_tr, Xte, task, kind="gbt"):
+    """Distill our native student from a precomputed teacher's train
+    predictions: the label column holds the teacher's output, so the default
+    distill() (no teacher arg) trains directly on it. This is a real distill()
+    of TabFM into a student that ships in the zero-dependency core -- no
+    onnxruntime, no TabFM at serve time."""
+    db = _ext()
+    feats = _load_tables(db, Xtr, pd.Series(teacher_tr), Xte, task)
+    db.execute(
+        f"SELECT content_hash FROM distill('SELECT {feats}, label FROM tr',"
+        f" json_object('target','label','task',?,"
+        f"'student_id','s','student_kind',?))",
+        ("classify" if task == "cls" else "regress", kind)).fetchone()
+    blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
+                      " model_id='s'").fetchone()[0]
+    rows = db.execute(
+        f"SELECT row_ref, prediction FROM predict(NULL, 'SELECT id, {feats}"
+        f" FROM te', json_object('model','s','receipt',0)) ORDER BY row_ref"
+    ).fetchall()
+    db.close()
+    return [r[1] for r in rows], blob
+
+
 def run_ours_knn5(Xtr, ytr, Xte, task):
     db = _ext()
     feats = _load_tables(db, Xtr, ytr, Xte, task)
@@ -208,12 +231,14 @@ def run_ours_knn5(Xtr, ytr, Xte, task):
 
 
 def run_ours_distill(Xtr, ytr, Xte, task, kind="tree"):
+    """Distill the in-context knn5 teacher into a native student (teacher named
+    explicitly: distill() re-runs knn5 over the rows to relabel them)."""
     db = _ext()
     feats = _load_tables(db, Xtr, ytr, Xte, task)
     db.execute(
         f"SELECT content_hash FROM distill('SELECT {feats}, label FROM tr',"
-        f" json_object('target','label','task',?,'student_id','s',"
-        f"'student_kind',?))",
+        f" json_object('target','label','task',?,'teacher','knn5-incontext',"
+        f"'student_id','s','student_kind',?))",
         ("classify" if task == "cls" else "regress", kind)).fetchone()
     blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
                       " model_id='s'").fetchone()[0]
@@ -258,12 +283,19 @@ def main():
             tabfm_p, est = run_tabfm(Xtr, ytr, Xte, task)
             rec["tabfm"] = score(yte, tabfm_p, task)
             rec["tabfm_s"] = time.time() - t0
-            # teacher train predictions for the distilled tree
+            # teacher train predictions -> distilled students
             teacher_tr = est.predict(Xtr.values)
             tree_p = sklearn_tree(Xtr, teacher_tr, Xte, task)
             rec["tree<-tabfm"] = score(yte, tree_p, task)
+            # our native gbt student, distilled from the SAME TabFM predictions
+            # through the extension (teacher='none')
+            gtp, gtblob = run_ours_distill_teacher(Xtr, teacher_tr, Xte, task,
+                                                   "gbt")
+            rec["gbt<-tabfm (ours)"] = score(yte, gtp, task)
+            student_bytes.append(gtblob)
         except Exception as e:  # noqa: BLE001
             rec["tabfm"] = rec["tree<-tabfm"] = float("nan")
+            rec["gbt<-tabfm (ours)"] = float("nan")
             rec["tabfm_s"] = float("nan")
             print("  tabfm fail:", type(e).__name__, str(e)[:120])
 
@@ -303,18 +335,18 @@ def _fmt(v):
 
 
 def _write(rows, student_bytes):
-    cols = ["xgboost", "tabfm", "tree<-tabfm", "knn5 (ours)",
-            "tree<-knn5 (ours)", "gbt<-knn5 (ours)"]
+    cols = ["xgboost", "tabfm", "tree<-tabfm", "gbt<-tabfm (ours)",
+            "knn5 (ours)", "tree<-knn5 (ours)", "gbt<-knn5 (ours)"]
     lines = ["# TabArena-spirit benchmark\n",
              "Curated OpenML subset, single 75/25 split (seed 0), features",
              f"capped at {MAX_FEAT}, rows capped at {MAX_ROWS}. Metric:",
              "**accuracy** (classification, higher better) / **RMSE**",
              "(regression, lower better). Not TabArena's full 51-task/30-split",
-             "Elo protocol — a comparability subset. TabFM = local weights,",
+             "Elo protocol, a comparability subset. TabFM = local weights,",
              f"fp32, {TABFM_ESTIMATORS}-member ensemble (reduced from 32 for",
-             "CPU tractability); `tree<-tabfm` is a depth-8 CART fit on",
-             "TabFM's train predictions (the distillation principle; our",
-             "extension serves the `tree<-knn5` version natively).\n",
+             "CPU tractability); `tree<-tabfm` is a sklearn CART on TabFM's",
+             "train predictions, while `gbt<-tabfm (ours)` and the `<-knn5`",
+             "students all run through the extension's own distill().\n",
              "| dataset | task | n | d | " + " | ".join(cols) + " | tabfm s |",
              "| --- | --- | --- | --- | " + " | ".join("---" for _ in cols) +
              " | --- |"]
@@ -324,7 +356,7 @@ def _write(rows, student_bytes):
         cells.append(_fmt(r.get("tabfm_s")))
         lines.append("| " + " | ".join(cells) + " |")
     if student_bytes:
-        lines.append(f"\nNative tree-student size: "
+        lines.append(f"\nNative student size: "
                      f"{min(student_bytes)}-{max(student_bytes)} bytes "
                      f"(runs in the zero-dependency core, ~microseconds/row; "
                      f"TabFM is tens of seconds/call).")

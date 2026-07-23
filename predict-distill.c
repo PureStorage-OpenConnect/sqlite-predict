@@ -3,11 +3,15 @@
  */
 /* distill() — RFC 0005 §4.2.5 — and the native tree student it produces.
  *
- * distill runs a teacher (any predict() model) over the training rows, fits a
- * CART decision tree on the teacher's predictions, evaluates it on a held-out
- * fraction, and stores it as an inline-BLOB student in _predict_models. The
- * point is compression: a 33 s in-context teacher becomes a microsecond tree
- * that runs in the zero-dependency core with no onnxruntime.
+ * distill fits a native student (a CART tree or a gradient-boosted forest) on
+ * a training signal, evaluates it on a held-out fraction, and stores it as an
+ * inline-BLOB student in _predict_models. By default the signal is the target
+ * column itself -- your labels, or a strong teacher's predictions computed
+ * offline and stored in a column (the way to compress a 33 s TabFM run into a
+ * microsecond student). Pass teacher='<model-id>' to instead relabel the rows
+ * with a registered predict() model first (e.g. compress the in-context knn5
+ * into a standalone tree). Either way the student runs in the zero-dependency
+ * core with no onnxruntime.
  *
  * This file is compiled into the core build. The student blob format is
  * implementation-defined (RFC §4.2.5); it is little-endian and rigorously
@@ -256,10 +260,11 @@ static int tree_walk(const Tree *t, const f32 *x) {
  * so the student stays reproducible. Classification uses softmax with one
  * score function per class; regression uses squared loss. */
 
-#define GBT_ROUNDS 120
+#define GBT_ROUNDS 200
 #define GBT_DEPTH 3
 #define GBT_MIN_SPLIT 5
-#define GBT_LR 0.2f
+#define GBT_LR 0.1f     /* shrinkage: many small steps generalize better than few big ones */
+#define GBT_LAMBDA 1.0f /* L2 leaf regularization (XGBoost reg_lambda default) */
 
 static const char GBT_MAGIC[8] = {'P', 'S', 'G', 'B', 'T', '0', '1', '\0'};
 
@@ -756,6 +761,8 @@ typedef struct {
   int task;
   int max_depth; /* 0 => TREE_MAX_DEPTH; shallow for GBT weak learners */
   int min_split; /* 0 => TREE_MIN_SPLIT */
+  const f32 *hess; /* GBT only: per-row Hessian; NULL => mean-value leaves */
+  f32 lambda;      /* GBT only: L2 leaf regularization */
 } Builder;
 
 static int bld_new_node(Builder *b) {
@@ -792,6 +799,17 @@ static void bld_leaf(Builder *b, int ni, const int *idx, int n) {
     }
     nd->klass = best;
     nd->conf = n ? (f32)bestc / (f32)n : 0.f;
+  } else if (b->hess) {
+    /* Newton leaf: the tree fits the gradient (b->yr), but the leaf value is
+     * the second-order step sum(grad) / (sum(hess) + lambda) -- what lifts a
+     * gradient booster to XGBoost-quality on non-squared losses. */
+    f64 g = 0, h = 0;
+    for (int i = 0; i < n; i++) {
+      g += b->yr[idx[i]];
+      h += b->hess[idx[i]];
+    }
+    nd->value = (f32)(g / (h + b->lambda));
+    nd->klass = -1;
   } else {
     f64 s = 0;
     for (int i = 0; i < n; i++)
@@ -977,10 +995,11 @@ static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
   fo->tree_off = sqlite3_malloc(sizeof(int) * (rounds * nscore + 1));
   f64 *F = sqlite3_malloc(sizeof(f64) * (size_t)n * nscore);
   f64 *p = task == 0 ? sqlite3_malloc(sizeof(f64) * (size_t)n * nscore) : NULL;
-  int *idx = sqlite3_malloc(sizeof(int) * n);
+  int *idx = sqlite3_malloc(sizeof(int) * n); /* scratch for bld_build */
   f32 *grad = sqlite3_malloc(sizeof(f32) * n);
+  f32 *hess = task == 0 ? sqlite3_malloc(sizeof(f32) * n) : NULL;
   if (!fo->init || !fo->tree_off || !F || !idx || !grad ||
-      (task == 0 && !p)) {
+      (task == 0 && (!p || !hess))) {
     rc = SQLITE_NOMEM;
     *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
     goto done;
@@ -1024,8 +1043,11 @@ static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
     }
     for (int s = 0; s < nscore; s++) {
       if (task == 0)
-        for (int i = 0; i < n; i++)
-          grad[i] = (yc[i] == s ? 1.f : 0.f) - (f32)p[(size_t)i * nscore + s];
+        for (int i = 0; i < n; i++) {
+          f64 pi = p[(size_t)i * nscore + s];
+          grad[i] = (yc[i] == s ? 1.f : 0.f) - (f32)pi;
+          hess[i] = (f32)(pi * (1.0 - pi)); /* softmax curvature */
+        }
       else
         for (int i = 0; i < n; i++)
           grad[i] = (f32)(yr[i] - F[i]);
@@ -1038,6 +1060,8 @@ static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
       b.task = 1;
       b.max_depth = GBT_DEPTH;
       b.min_split = GBT_MIN_SPLIT;
+      b.hess = hess; /* NULL for regression => mean leaves (Newton for MSE) */
+      b.lambda = GBT_LAMBDA;
       for (int i = 0; i < n; i++)
         idx[i] = i;
       int root = bld_build(&b, idx, n, 0);
@@ -1076,6 +1100,7 @@ done:
   sqlite3_free(p);
   sqlite3_free(idx);
   sqlite3_free(grad);
+  sqlite3_free(hess);
   if (rc != SQLITE_OK)
     forest_free(fo);
   return rc;
@@ -1094,6 +1119,32 @@ static void dist_opts_free(DistOpts *o) {
   sqlite3_free(o->student_id);
   sqlite3_free(o->teacher);
   sqlite3_free(o->student_kind);
+}
+
+/* Return the class index for `s`, interning it into *labels (growing *cap and
+ * *nclass on first sight). Returns -1 and sets *rc = SQLITE_NOMEM on OOM; a
+ * valid index is always >= 0. */
+static int intern_label(char ***labels, int *nclass, int *cap, const char *s,
+                        int *rc) {
+  for (int k = 0; k < *nclass; k++)
+    if (strcmp((*labels)[k], s) == 0)
+      return k;
+  if (*nclass == *cap) {
+    int nc = *cap ? *cap * 2 : 8;
+    char **g = sqlite3_realloc(*labels, sizeof(char *) * nc);
+    if (!g) {
+      *rc = SQLITE_NOMEM;
+      return -1;
+    }
+    *labels = g;
+    *cap = nc;
+  }
+  (*labels)[*nclass] = sqlite3_mprintf("%s", s);
+  if (!(*labels)[*nclass]) {
+    *rc = SQLITE_NOMEM;
+    return -1;
+  }
+  return (*nclass)++;
 }
 
 static int dist_opt_cb(void *ctx, const char *key, sqlite3_value *value,
@@ -1224,7 +1275,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
   char *read_sql = NULL, *apply_sql = NULL, *teacher_sql = NULL, *params = NULL;
   sqlite3_stmt *rq = NULL, *tqs = NULL;
 
-  const char *teacher = o->teacher ? o->teacher : "default-tabular";
+  const char *teacher = o->teacher; /* NULL => train directly on the target */
   const char *task = classify ? "classify" : "regress";
 
   /* ---- 2. read features + true labels (row_number keeps a stable order) ---- */
@@ -1310,72 +1361,77 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     goto done;
   }
 
-  /* ---- 3. run the teacher to label the same rows (aligned by _rid) ---- */
-  apply_sql = sqlite3_mprintf(
-      "SELECT (row_number() OVER ()) AS _rid, %s FROM (%s) ORDER BY _rid",
-      feat_list, tq);
-  teacher_sql = sqlite3_mprintf(
-      "SELECT prediction FROM predict(%Q, %Q, json_object('target',%Q,'task',"
-      "%Q,'model',%Q,'receipt',0))",
-      tq, apply_sql, o->target, task, teacher);
-  if (!apply_sql || !teacher_sql) {
-    rc = SQLITE_NOMEM;
-    goto done;
-  }
-  if (sqlite3_prepare_v2(db, teacher_sql, -1, &tqs, NULL) != SQLITE_OK) {
-    rc = SQLITE_ERROR;
-    *errmsg = sqlite3_mprintf("%s: teacher '%s' failed: %s",
-                              PREDICT_ERR_MODEL_NOT_FOUND, teacher,
-                              sqlite3_errmsg(db));
-    goto done;
-  }
-  int ti = 0;
-  int tstep;
-  while ((tstep = sqlite3_step(tqs)) == SQLITE_ROW && ti < n) {
-    if (classify) {
-      const char *pred = (const char *)sqlite3_column_text(tqs, 0);
-      pred = pred ? pred : "";
-      int cl = -1;
-      for (int k = 0; k < nclass; k++)
-        if (strcmp(labels[k], pred) == 0)
-          cl = k;
-      if (cl < 0) {
-        if (nclass == nlab_cap) {
-          nlab_cap = nlab_cap ? nlab_cap * 2 : 8;
-          char **g = sqlite3_realloc(labels, sizeof(char *) * nlab_cap);
-          if (!g) {
-            rc = SQLITE_NOMEM;
-            goto done;
-          }
-          labels = g;
-        }
-        labels[nclass] = sqlite3_mprintf("%s", pred);
-        cl = nclass++;
+  /* ---- 3. training signal per row ----
+   * With no teacher (the default) the student trains directly on the target
+   * column: it already holds the labels, or a strong teacher's precomputed
+   * predictions (e.g. an offline TabFM run) that you want compressed into a
+   * native student that runs anywhere. A named teacher is a registered
+   * predict() model, re-run over the same rows (aligned by _rid) to relabel
+   * them. */
+  if (!teacher) {
+    for (int i = 0; i < n; i++) {
+      if (classify) {
+        int cl = intern_label(&labels, &nclass, &nlab_cap, y_true_c[i], &rc);
+        if (cl < 0)
+          goto done;
+        y_teach[i] = cl;
+      } else {
+        y_teach_r[i] = (f32)y_true_r[i];
       }
-      y_teach[ti] = cl;
-    } else {
-      y_teach_r[ti] = (f32)sqlite3_column_double(tqs, 0);
     }
-    ti++;
-  }
-  int tdone = tstep == SQLITE_DONE || ti == n;
-  char *terr = tdone ? NULL : sqlite3_mprintf("%s", sqlite3_errmsg(db));
-  sqlite3_finalize(tqs);
-  tqs = NULL;
-  if (!tdone || ti != n) {
-    rc = SQLITE_ERROR;
-    *errmsg = sqlite3_mprintf(
-        "%s: teacher produced %d labels for %d rows (%s)", PREDICT_ERR_RESOURCE,
-        ti, n, terr ? terr : "short read");
+  } else {
+    apply_sql = sqlite3_mprintf(
+        "SELECT (row_number() OVER ()) AS _rid, %s FROM (%s) ORDER BY _rid",
+        feat_list, tq);
+    teacher_sql = sqlite3_mprintf(
+        "SELECT prediction FROM predict(%Q, %Q, json_object('target',%Q,'task',"
+        "%Q,'model',%Q,'receipt',0))",
+        tq, apply_sql, o->target, task, teacher);
+    if (!apply_sql || !teacher_sql) {
+      rc = SQLITE_NOMEM;
+      goto done;
+    }
+    if (sqlite3_prepare_v2(db, teacher_sql, -1, &tqs, NULL) != SQLITE_OK) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: teacher '%s' failed: %s",
+                                PREDICT_ERR_MODEL_NOT_FOUND, teacher,
+                                sqlite3_errmsg(db));
+      goto done;
+    }
+    int ti = 0;
+    int tstep;
+    while ((tstep = sqlite3_step(tqs)) == SQLITE_ROW && ti < n) {
+      if (classify) {
+        const char *pred = (const char *)sqlite3_column_text(tqs, 0);
+        int cl =
+            intern_label(&labels, &nclass, &nlab_cap, pred ? pred : "", &rc);
+        if (cl < 0)
+          goto done;
+        y_teach[ti] = cl;
+      } else {
+        y_teach_r[ti] = (f32)sqlite3_column_double(tqs, 0);
+      }
+      ti++;
+    }
+    int tdone = tstep == SQLITE_DONE || ti == n;
+    char *terr = tdone ? NULL : sqlite3_mprintf("%s", sqlite3_errmsg(db));
+    sqlite3_finalize(tqs);
+    tqs = NULL;
+    if (!tdone || ti != n) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf(
+          "%s: teacher produced %d labels for %d rows (%s)",
+          PREDICT_ERR_RESOURCE, ti, n, terr ? terr : "short read");
+      sqlite3_free(terr);
+      goto done;
+    }
     sqlite3_free(terr);
-    goto done;
   }
-  sqlite3_free(terr);
   if (classify && nclass < 2) {
     rc = SQLITE_ERROR;
     *errmsg = sqlite3_mprintf(
-        "%s: teacher produced a single class; nothing to distill",
-        PREDICT_ERR_SCHEMA);
+        "%s: %s produced a single class; nothing to distill", PREDICT_ERR_SCHEMA,
+        teacher ? "teacher" : "target column");
     goto done;
   }
 

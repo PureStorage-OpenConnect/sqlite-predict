@@ -245,6 +245,69 @@ def test_corrupt_gbt_blob_rejected(db):
         assert "PREDICT_ERR" in str(e.value)
 
 
+def test_default_trains_on_target_column(db):
+    """With no teacher (the default), distill trains the student directly on
+    the target column -- the path for compressing a strong teacher's
+    precomputed predictions (e.g. an offline TabFM run) into a native student,
+    with no live teacher pass."""
+    _train_table(db)
+    metric = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1, f2, label FROM tab',"
+        " json_object('target','label','student_id','s',"
+        "'student_kind','gbt'))").fetchone()[0]
+    assert 0.7 <= metric <= 1.0  # learnable boundary, trained on the labels
+    rows = db.execute(
+        "SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM"
+        " tab', json_object('model','s'))").fetchall()
+    assert len(rows) == 240
+    rid = db.execute(
+        "SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM tab',"
+        " json_object('model','s')) LIMIT 1").fetchone()[0]
+    match, detail = db.execute(
+        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
+    assert match == 1, detail
+
+
+def test_default_learns_target_not_a_live_teacher(db):
+    """The distinguishing property of the default: the student learns the
+    target column verbatim. Feed labels a knn5 teacher would never invent and
+    confirm the student emits exactly that vocabulary."""
+    db.execute("CREATE TABLE p(id INTEGER, f1 REAL, f2 REAL, teach TEXT)")
+    db.executemany("INSERT INTO p VALUES (?,?,?,?)",
+                   [(i, (i % 20) * 0.1, (i // 20) * 0.1,
+                     "ALPHA" if (i % 20) * 0.1 < 1.0 else "OMEGA")
+                    for i in range(200)])
+    db.execute(
+        "SELECT * FROM distill('SELECT f1,f2,teach FROM p',"
+        " json_object('target','teach','student_id','s',"
+        "'student_kind','gbt'))").fetchone()
+    preds = {r[0] for r in db.execute(
+        "SELECT DISTINCT prediction FROM predict(NULL,'SELECT id,f1,f2 FROM p',"
+        " json_object('model','s','receipt',0))")}
+    assert preds and preds <= {"ALPHA", "OMEGA"}
+
+
+def test_named_teacher_relabels_via_model(db):
+    """An explicit teacher names a registered predict() model, which distill
+    re-runs over the rows to relabel them before fitting the student -- e.g.
+    compressing the in-context knn5 into a standalone tree."""
+    _train_table(db)
+    r = db.execute(
+        "SELECT holdout_metric, receipt_id FROM distill('SELECT f1,f2,label"
+        " FROM tab', json_object('target','label','teacher','knn5-incontext',"
+        "'student_id','s'))").fetchone()
+    assert 0.5 <= r[0] <= 1.0
+    # the receipt records the teacher lineage
+    params = db.execute("SELECT params FROM _predict_receipts WHERE receipt_id=?",
+                        (r[1],)).fetchone()[0]
+    assert "knn5-incontext" in params
+    labels = {str(x[0]) for x in db.execute("SELECT DISTINCT label FROM tab")}
+    preds = {x[0] for x in db.execute(
+        "SELECT DISTINCT prediction FROM predict(NULL,'SELECT id,f1,f2 FROM tab',"
+        " json_object('model','s','receipt',0))")}
+    assert preds <= labels
+
+
 def test_corrupt_student_blob_errors_not_crashes(db):
     """The registry is caller-writable, so a hand-crafted tree blob must be
     rejected by the bounds-checked deserializer, never crash."""

@@ -77,19 +77,29 @@ Even so, the `benchmarks/` numbers (and the TabFM→ONNX eval in
 teacher's accuracy is usually distillation to a small student.
 
 `distill()` (`predict-distill.c`) is that path, and it lives in the
-zero-dependency core. It runs the teacher (any `predict()` model, resolved
-by re-running `predict()` over the training rows), fits a student on the
-teacher's predictions, evaluates it on a held-out fraction, and writes the
-student into `_predict_models` as an inline BLOB (`runtime='tree'`,
-`kind='student'`). Two `student_kind`s share the CART trainer: `'tree'` is a
-single depth-8 tree; `'gbt'` is a gradient-boosted forest of shallow
-regression trees (softmax for classification, squared loss for regression),
-deterministic by construction — no bootstrap or feature-sampling randomness
-— so the student stays reproducible. `predict()` dispatches a `tree`-runtime
-model to the native runtime in the same file, which tells a single tree
-(`PSTREE` blob) from a forest (`PSGBT` blob) by magic and needs no
-onnxruntime. Both blob formats are little-endian and implementation-defined
-(RFC §4.2.5), and rigorously bounds-checked on read, because the registry is
+zero-dependency core. It fits a native student on a training signal,
+evaluates it on a held-out fraction, and writes the student into
+`_predict_models` as an inline BLOB (`runtime='tree'`, `kind='student'`). By
+default the signal is the `target` column of the training query — your
+labels, or a strong teacher's predictions computed offline and stored in that
+column, which is how a 30-second TabFM run becomes a microsecond student. A
+`teacher` argument names a registered `predict()` model, which `distill`
+re-runs over the rows (aligned by row number) to relabel them first — the way
+to compress the in-context knn5 into a standalone tree.
+
+Two `student_kind`s share the CART trainer. `'tree'` is a single depth-8
+tree. `'gbt'` is a gradient-boosted forest of shallow trees, and it is the
+one to reach for when accuracy matters: it fits each tree to the loss
+gradient but sets each leaf to the **second-order (Newton) step**
+`Σg / (Σh + λ)` using the softmax Hessian — the same thing that lifts
+XGBoost above a vanilla gradient booster — with shrinkage (a small learning
+rate over many rounds) doing the regularizing. It is deterministic by
+construction: no bootstrap, no feature-sampling, no early-stopping split, so
+the student stays reproducible and exactly replayable. `predict()` dispatches
+a `tree`-runtime model to the native runtime in the same file, which tells a
+single tree (`PSTREE` blob) from a forest (`PSGBT` blob) by magic and needs
+no onnxruntime. Both blob formats are little-endian and implementation-defined
+(RFC §4.2.4), and rigorously bounds-checked on read, because the registry is
 writable by any SQL caller (RFC §6.2) — a hand-crafted blob is rejected,
 never crashed on. Because the student is native and deterministic, its
 predictions carry the same exact-replay receipt as the stat models.

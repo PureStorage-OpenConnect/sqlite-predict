@@ -10,14 +10,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `forecast()`, `detect_anomalies()`, `predict()`, and `distill()`
   table-valued functions with a trailing JSON options argument.
-- `distill()` compresses a teacher (any `predict()` model) into a native
-  student, stored as an inline BLOB and executed by the zero-dependency core
-  with no onnxruntime. `student_kind='tree'` is a single CART; `'gbt'` is a
-  gradient-boosted forest that beats the single tree on every benchmark task
-  and matches or beats tuned XGBoost on several (see
-  `benchmarks/results/tabarena.md`). Both serve in microseconds, are
-  deterministic, and carry the same exact-replay receipts as the stat models.
-  The student blob is bounds-checked on read (caller-writable registry).
+- `distill()` trains a native student, stored as an inline BLOB and executed
+  by the zero-dependency core with no onnxruntime. By default it trains on the
+  target column — your labels, or a strong teacher's predictions computed
+  offline (run TabFM once, store its output, distill it into a student that
+  runs anywhere). A `teacher` argument names a registered `predict()` model to
+  relabel the rows first (e.g. compress the in-context knn5 into a tree).
+  `student_kind='tree'` is a single CART; `'gbt'` is a gradient-boosted forest
+  with second-order (Newton) leaves that matches or beats tuned XGBoost on
+  several tasks (see `benchmarks/results/tabarena.md`). Both serve in
+  microseconds, are deterministic, and carry the same exact-replay receipts as
+  the stat models. The student blob is bounds-checked on read (caller-writable
+  registry).
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`

@@ -1,11 +1,11 @@
 # TabArena-spirit benchmark
 
-Where do sqlite-predict's models land against TabFM on the kind of real
+Where do sqlite-predict's students land against TabFM on the kind of real
 tabular data TabFM was announced on? TabFM's announcement benchmarks on
 TabArena (Erickson et al. 2025), a curated OpenML suite. This is a small,
-comparable subset — a single 75/25 split (seed 0) over six OpenML tasks,
+comparable subset: a single 75/25 split (seed 0) over six OpenML tasks,
 features capped at 40, rows capped at 1500. It is **not** TabArena's full
-51-task / 30-split Elo protocol; the point is comparability and the
+51-task / 30-split Elo protocol. The point is comparability and the
 distillation delta, not a leaderboard.
 
 Metric: **accuracy** (classification, higher is better) / **RMSE**
@@ -15,60 +15,75 @@ Metric: **accuracy** (classification, higher is better) / **RMSE**
 - `tabfm` — the zero-shot foundation model, local weights, fp32, 8-member
   ensemble (reduced from the default 32 for CPU tractability, so it is a
   conservative TabFM)
-- `tree<-tabfm` — a depth-8 CART fit on TabFM's train predictions: the
-  distillation *principle* with the real teacher. Our extension can't serve
-  TabFM as a teacher, so this runs in the harness, not through `distill()`
+- `tree<-tabfm` — a depth-8 sklearn CART fit on TabFM's train predictions:
+  the distillation *principle* with a single-tree student, run in the harness
+- **`gbt<-tabfm (ours)`** — our native gradient-boosted student, distilled
+  from the **same** TabFM predictions **through the extension** (`distill()`
+  on a target column holding TabFM's offline predictions)
 - `knn5 (ours)` — our shipping in-context model, run through the extension
-- `tree<-knn5 (ours)` — `distill(student_kind='tree')`: a single native CART
-  the zero-dependency core executes, distilled from the knn5 teacher
-- `gbt<-knn5 (ours)` — `distill(student_kind='gbt')`: a native gradient-boosted
-  forest, same core runtime, same knn5 teacher
+- `tree<-knn5 (ours)` — `distill(teacher='knn5-incontext', student_kind='tree')`
+- `gbt<-knn5 (ours)` — `distill(teacher='knn5-incontext', student_kind='gbt')`
 
 Reproduce with `benchmarks/tabarena.py` (weights are local and
 non-commercial; nothing is redistributed). Categorical columns are
 ordinal-encoded uniformly, which slightly disadvantages TabFM (it is built
 for raw mixed types).
 
-| dataset | task | n | d | xgboost | tabfm | tree<-tabfm | knn5 (ours) | tree<-knn5 | **gbt<-knn5** | tabfm s |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| credit-g | cls | 1000 | 20 | 0.788 | 0.784 | 0.692 | 0.732 | 0.736 | **0.752** | 57.7 |
-| diabetes | cls | 768 | 8 | 0.776 | 0.786 | 0.740 | 0.750 | 0.734 | **0.786** | 30.6 |
-| blood-transfusion | cls | 748 | 4 | 0.743 | 0.781 | 0.770 | 0.743 | 0.749 | **0.759** | 28.1 |
-| vehicle | cls (4) | 846 | 18 | 0.750 | 0.901 | 0.679 | 0.693 | 0.642 | **0.726** | 43.9 |
-| diabetes-reg | reg | 442 | 10 | 68.7 | 56.4 | 64.3 | 63.3 | 61.9 | **58.6** | 24.1 |
-| california | reg | 1500 | 8 | 0.604 | 0.483 | 0.719 | 0.645 | 0.770 | **0.635** | 65.4 |
+| dataset | task | n | d | xgboost | tabfm | tree<-tabfm | **gbt<-tabfm** | knn5 | tree<-knn5 | gbt<-knn5 | tabfm s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| credit-g | cls | 1000 | 20 | 0.788 | 0.784 | 0.692 | 0.764 | 0.732 | 0.736 | **0.776** | 58.9 |
+| diabetes | cls | 768 | 8 | 0.776 | 0.786 | 0.740 | **0.797** | 0.750 | 0.734 | 0.786 | 31.7 |
+| blood-transfusion | cls | 748 | 4 | 0.743 | 0.781 | 0.770 | **0.775** | 0.743 | 0.749 | 0.765 | 28.1 |
+| vehicle | cls (4) | 846 | 18 | 0.750 | 0.901 | 0.679 | **0.778** | 0.693 | 0.642 | 0.741 | 43.6 |
+| diabetes-reg | reg | 442 | 10 | 68.7 | 56.4 | 64.3 | **58.4** | 63.3 | 61.9 | 59.3 | 24.1 |
+| california | reg | 1500 | 8 | 0.604 | 0.483 | 0.719 | **0.565** | 0.645 | 0.770 | 0.629 | 66.9 |
 
-Native student size: single tree **1.7–6.6 KB**, gbt forest **31–141 KB**;
+Native student size: single tree **1.7–6.6 KB**, gbt forest **30–200 KB**;
 both run in the zero-dependency core at microseconds-to-low-milliseconds per
-row, no onnxruntime. TabFM: **24–65 seconds** per call.
+row, no onnxruntime. TabFM: **24–67 seconds** per call.
 
 ## What this shows
 
-**The gbt student closes the single-tree gap and turns our native student
-into a real one.** It beats `tree<-knn5` on all six tasks, and it rescues
-exactly the two cases where the single tree collapsed: the 4-class `vehicle`
-(0.642 → **0.726**) and `california` regression (0.770 → **0.635** RMSE). On
-three of six it now **matches or beats tuned XGBoost** — `diabetes` (0.786 vs
-0.776), `blood-transfusion` (0.759 vs 0.743), and `diabetes-reg` (58.6 vs
-68.7). This is the point of the whole distillation story made real: a
-few-kilobyte-to-a-few-hundred-kilobyte model that runs everywhere, with no
-onnxruntime, holding its own against a gradient-boosting library.
+**Distilling the real TabFM into our native gbt is the headline, and it
+works.** `gbt<-tabfm` beats the single-tree `tree<-tabfm` on all six tasks,
+often by a lot: the native forest is a far better distillation vehicle than a
+lone CART. And it is the teacher that matters. On the 4-class `vehicle`,
+swapping the teacher from knn5 (0.693) to TabFM (0.901) lifts our *same*
+student from 0.741 to **0.778** — the student rides its teacher up. That is
+the whole thesis made concrete: the ceiling on a student is its teacher, and
+a stronger teacher raises it.
 
-**TabFM is still the strongest on the hardest task.** On the 4-class
-`vehicle` it reaches 0.901, well above the gbt student's 0.726 and XGBoost's
-0.750 — a foundation model earns its cost where the boundary is genuinely
-complex. Everywhere else the field is close: on the binary sets and both
-regressions the gbt student is within a few points of TabFM, sometimes
-ahead. The remaining headroom is a *teacher* gap, not a *student* one: the
-gbt student tracks its knn5 teacher well, and knn5 is not TabFM. Distilling
-the strong teacher into a gbt (a `gbt<-tabfm` column) is the obvious next
-lever, and it needs the model-serving work the TabFM→ONNX eval scoped.
+**The student sometimes beats everything in the row.** On `diabetes`,
+`gbt<-tabfm` reaches **0.797, above TabFM itself (0.786) and XGBoost
+(0.776)** — the gbt's shrinkage and L2 regularization smooth the teacher's
+predictions into a slightly better decision surface. On both regressions it
+tracks TabFM closely (diabetes-reg 58.4 vs 56.4; california 0.565 vs 0.483)
+while staying a few-hundred-kilobyte blob that needs no runtime.
 
-**knn5, the shipping in-context model, is a reasonable floor.** It ties
-XGBoost on `blood-transfusion` and is within a couple of points on the other
-binaries, trailing on multiclass and regression — a fair showing for a
-5-nearest-neighbour model with no dependencies and no training, and a good
-teacher for the gbt student to compress.
+**When knn5 is already a good teacher, the cheap path wins.** On `credit-g`,
+knn5 (0.732) is nearly as good a teacher as TabFM (0.784) for this boundary,
+and `gbt<-knn5` (0.776) edges out `gbt<-tabfm` (0.764). The lesson is not
+"always use the foundation model" but "distill the best teacher you have."
+`gbt<-knn5` needs no weights, no GPU, and no offline pass, and it matches or
+beats tuned XGBoost on `diabetes` (0.786 vs 0.776), `blood-transfusion`
+(0.765 vs 0.743), and `diabetes-reg` (59.3 vs 68.7).
+
+**What lifts the gbt above a vanilla booster.** The forest fits each tree to
+the loss gradient but sets each leaf to the second-order (Newton) step
+`Σg / (Σh + λ)` with the softmax Hessian, the same move that separates
+XGBoost from a plain gradient booster, plus shrinkage (a small learning rate
+over many rounds) for regularization. It stays deterministic: no bootstrap,
+no feature sampling, no early-stopping split, so every student carries an
+exact-replay receipt.
+
+## The recommended path
+
+For most users, `distill()` with the in-context knn5 teacher is the pragmatic
+default: no weights, no GPU, and a student that already rivals XGBoost. When a
+task is hard enough to justify a foundation model, run TabFM once offline over
+your training rows, store its predictions in a column, and distill that column
+into a native gbt (`gbt<-tabfm` above). Either way you ship a tiny model that
+runs anywhere with no onnxruntime, and every prediction carries a receipt.
 
 ## Caveats
 
@@ -76,9 +91,10 @@ teacher for the gbt student to compress.
   it as a directional read, not a ranking.
 - TabFM ran with an 8-member ensemble (default is 32), so its numbers here are
   a conservative floor; the real model is a little stronger.
-- `tree<-tabfm` is a harness demonstration of distilling the real FM; the
-  extension natively serves the `<-knn5` students. Wiring TabFM in as a
-  `distill()` teacher needs the model-serving work the TabFM→ONNX eval scoped.
+- `tree<-tabfm` uses sklearn in the harness; `gbt<-tabfm` and the `<-knn5`
+  students all run through the extension's own `distill()`. TabFM's own
+  predictions are precomputed offline (its packed in-context signature does
+  not fit the extension's serving path, per the TabFM→ONNX eval).
 - An [independent evaluation](https://github.com/devYRPauli/tabfm-evaluation)
   found upstream bugs and high-dimensional failure modes in TabFM; our subset
   stays under 40 features and did not probe those.
