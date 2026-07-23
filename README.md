@@ -81,14 +81,29 @@ which compresses a teacher into a compact model that serves in
 microseconds.
 
 An opt-in ONNX build (`make loadable-onnx`) runs exported models through
-onnxruntime: register one with `predict_register()` and call it by name. It
-serves two shapes, with a cached session and batched inference:
+onnxruntime. Point `predict_register()` at a model file and call it by name;
+the io_spec is read off the model (input/output tensors, output kind, class
+count), so the common case is one line:
+
+```sql
+SELECT predict_register('churn', '/models/churn.onnx');
+SELECT * FROM predict(NULL, 'SELECT id, tenure, spend FROM customers',
+                      '{"model":"churn"}');
+```
+
+Feature columns map by position (apply-query order); pass an explicit
+`io_spec` only to override — real class labels, a named-feature mapping, or a
+model whose tensors introspection can't disambiguate. It serves two shapes,
+with a cached session and batched inference:
 
 - **vector** — a self-contained model (a distilled student, or any exported
   tabular classifier/regressor) mapping a feature vector to a prediction.
+  A bare weights path is enough.
 - **in_context** — a teacher that ingests the `train_query` rows as context
-  on each call and labels the `apply_query` rows against them, the way
-  TabFM works.
+  on each call and labels the `apply_query` rows against them, the way TabFM
+  works. Register it with the weights path plus a `target` (the training
+  label column, which introspection can't infer): `predict_register('t',
+  '{"weights_uri":"/m.onnx","target":"label"}')`.
 
 Both run on CPU today. A GPU build (`make loadable-onnx-gpu`) adds the CUDA
 and TensorRT execution providers and fp16/int8 precision; it needs an

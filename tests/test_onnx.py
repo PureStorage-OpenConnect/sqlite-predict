@@ -79,6 +79,99 @@ def test_version_advertises_onnx(db):
     assert "onnx" in v["runtimes"]
 
 
+def test_bare_path_registration_derives_io_spec(db):
+    """The headline UX: register with just a weights path; the io_spec is
+    read off the model, and predict needs only {model} with positional
+    features (apply column order)."""
+    db.execute("CREATE TABLE apply(id INTEGER, f1 REAL, f2 REAL)")
+    cases = json.load(open(_abs("logreg_cases.json")))
+    db.executemany("INSERT INTO apply VALUES (?,?,?)",
+                   [(c["id"], c["f1"], c["f2"]) for c in cases])
+    db.execute("SELECT predict_register('clf', ?)", (_abs("logreg.onnx"),))
+    spec = json.loads(db.execute(
+        "SELECT io_spec FROM _predict_models WHERE model_id='clf'").fetchone()[0])
+    assert spec["layout"] == "vector"
+    assert spec["input"] == "float_input"
+    assert spec["nfeatures"] == 2
+    assert spec["output"]["kind"] == "probs"
+    assert spec["output"]["labels"] == ["0", "1"]
+    rows = db.execute(
+        "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+        " '{\"model\":\"clf\"}')").fetchall()
+    exp = {c["id"]: c for c in cases}
+    for rid, pred, *_ in rows:
+        assert pred == exp[rid]["label"]
+
+
+def test_bare_path_regressor_derives_value_kind(db):
+    db.execute("SELECT predict_register('reg', ?)", (_abs("linreg.onnx"),))
+    spec = json.loads(db.execute(
+        "SELECT io_spec FROM _predict_models WHERE model_id='reg'").fetchone()[0])
+    assert spec["output"]["kind"] == "value"
+    cases = json.load(open(_abs("linreg_cases.json")))
+    db.execute("CREATE TABLE ra(id INTEGER, f1 REAL, f2 REAL)")
+    db.executemany("INSERT INTO ra VALUES (?,?,?)",
+                   [(c["id"], c["f1"], c["f2"]) for c in cases])
+    rows = db.execute(
+        "SELECT row_ref, prediction FROM predict(NULL,'SELECT id, f1, f2 FROM"
+        " ra', '{\"model\":\"reg\"}')").fetchall()
+    exp = {c["id"]: c["value"] for c in cases}
+    for rid, pred in rows:
+        assert abs(float(pred) - exp[rid]) < 1e-4
+
+
+def test_incontext_weights_plus_target(db):
+    """In-context reachable simply: weights path + a top-level target (the
+    one thing introspection can't know, since it's a SQL column)."""
+    data = json.load(open(_abs("knn_incontext_cases.json")))
+    db.execute("CREATE TABLE tr(id INTEGER, f1 REAL, f2 REAL, label TEXT)")
+    db.executemany("INSERT INTO tr VALUES (?,?,?,?)",
+                   [(c["id"], c["f1"], c["f2"], c["label"])
+                    for c in data["train"]])
+    db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 REAL)")
+    db.executemany("INSERT INTO ap VALUES (?,?,?)",
+                   [(c["id"], c["f1"], c["f2"]) for c in data["apply"]])
+    cfg = json.dumps({"weights_uri": _abs("knn_incontext.onnx"),
+                      "target": "label"})
+    db.execute("SELECT predict_register('knn1', ?)", (cfg,))
+    spec = json.loads(db.execute(
+        "SELECT io_spec FROM _predict_models WHERE model_id='knn1'"
+    ).fetchone()[0])
+    assert spec["layout"] == "in_context" and spec["target"] == "label"
+    rows = db.execute(
+        "SELECT row_ref, prediction FROM predict('SELECT f1,f2,label FROM tr',"
+        " 'SELECT id,f1,f2 FROM ap', '{\"model\":\"knn1\"}')").fetchall()
+    exp = {c["id"]: c["label"] for c in data["apply"]}
+    for rid, pred in rows:
+        assert pred == exp[rid]
+
+
+def test_default_license_is_unspecified_and_runs(db):
+    """A bare-path registration defaults license to 'unspecified', which the
+    gate allows (you vouch for your own model) without accept_license."""
+    db.execute("SELECT predict_register('clf', ?)", (_abs("logreg.onnx"),))
+    lic = db.execute(
+        "SELECT license FROM _predict_models WHERE model_id='clf'").fetchone()[0]
+    assert lic == "unspecified"
+    db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
+    db.execute("INSERT INTO a VALUES (0, 0.5, 0.5)")
+    rows = db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+                      " '{\"model\":\"clf\"}')").fetchall()
+    assert len(rows) == 1
+
+
+def test_positional_feature_count_mismatch_errors(db):
+    """Positional mapping still validates the feature count against the
+    model's declared input width."""
+    db.execute("SELECT predict_register('clf', ?)", (_abs("logreg.onnx"),))
+    db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL, f3 REAL)")
+    db.execute("INSERT INTO a VALUES (0, 0.1, 0.2, 0.3)")
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2, f3 FROM a',"
+                   " '{\"model\":\"clf\"}')").fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
 def test_classifier_matches_reference(db):
     _register(db, "clf", "logreg.onnx", CLF_IO)
     cases = json.load(open(_abs("logreg_cases.json")))

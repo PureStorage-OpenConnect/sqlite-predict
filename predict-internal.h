@@ -197,6 +197,16 @@ int predict0_onnx_predict(sqlite3 *db, const char *model_id,
                           predict0_result **rows, int *n,
                           char receipt_id_out[PREDICT_ULID_BUFSIZE],
                           char **errmsg);
+
+/* Derive an io_spec by reading a model's input/output tensors, so a caller
+ * can register with just a weights path. On success returns SQLITE_OK and a
+ * sqlite3_malloc'd JSON io_spec in *io_spec_out (caller frees). Covers the
+ * unambiguous shapes (1 input -> vector; 3 inputs named x_train/y_train/
+ * x_query -> in_context; a single output whose width picks probs vs value);
+ * anything it cannot disambiguate returns an error asking for an explicit
+ * io_spec. */
+int predict0_onnx_introspect(sqlite3 *db, const char *weights_uri,
+                             char **io_spec_out, char **errmsg);
 #endif
 
 /* Deterministic logical digest of all user tables (schema + rows,

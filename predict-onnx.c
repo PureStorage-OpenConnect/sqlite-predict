@@ -83,6 +83,190 @@ static int onnx_init(char **errmsg) {
   return SQLITE_OK;
 }
 
+/* ---- io_spec introspection (derive an io_spec from the model) ---- */
+
+/* The last dimension of input/output `idx`, or -1 if dynamic/unknown; sets
+ * *elem_type to the tensor element type. */
+/* Non-zero if the status is an error; always consumes it. */
+static int st_bad(OrtStatus *st) {
+  if (st) {
+    g_ort->ReleaseStatus(st);
+    return 1;
+  }
+  return 0;
+}
+
+static int64_t tensor_last_dim(OrtSession *s, int is_input, size_t idx,
+                               ONNXTensorElementDataType *elem_type) {
+  OrtTypeInfo *ti = NULL;
+  int64_t last = -1;
+  *elem_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  if (st_bad(is_input ? g_ort->SessionGetInputTypeInfo(s, idx, &ti)
+                      : g_ort->SessionGetOutputTypeInfo(s, idx, &ti)))
+    return -1;
+  const OrtTensorTypeAndShapeInfo *tsi = NULL;
+  if (!st_bad(g_ort->CastTypeInfoToTensorInfo(ti, &tsi)) && tsi) {
+    size_t ndim = 0;
+    if (!st_bad(g_ort->GetTensorElementType(tsi, elem_type)) &&
+        !st_bad(g_ort->GetDimensionsCount(tsi, &ndim)) && ndim >= 1 &&
+        ndim <= 8) {
+      int64_t dims[8];
+      if (!st_bad(g_ort->GetDimensions(tsi, dims, ndim)))
+        last = dims[ndim - 1];
+    }
+  }
+  g_ort->ReleaseTypeInfo(ti);
+  return last;
+}
+
+int predict0_onnx_introspect(sqlite3 *db, const char *weights_uri,
+                             char **io_spec_out, char **errmsg) {
+  *io_spec_out = NULL;
+  int rc = onnx_init(errmsg);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  OrtSessionOptions *so = NULL;
+  OrtSession *sess = NULL;
+  OrtAllocator *alloc = NULL;
+  char *in_names[3] = {NULL, NULL, NULL};
+  char *out_name = NULL;
+  sqlite3_stmt *bld = NULL;
+
+  OrtStatus *st = g_ort->CreateSessionOptions(&so);
+  if (st)
+    return onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateSessionOptions", errmsg);
+  st = g_ort->CreateSession(g_env, weights_uri, so, &sess);
+  g_ort->ReleaseSessionOptions(so);
+  if (st)
+    return onnx_fail(st, PREDICT_ERR_INFERENCE,
+                     "cannot open model for introspection", errmsg);
+
+#define INTRO_FAIL(...)                                                        \
+  do {                                                                        \
+    *errmsg = sqlite3_mprintf(__VA_ARGS__);                                   \
+    rc = SQLITE_ERROR;                                                        \
+    goto done;                                                                \
+  } while (0)
+
+  size_t n_in = 0, n_out = 0;
+  if (st_bad(g_ort->GetAllocatorWithDefaultOptions(&alloc)) ||
+      st_bad(g_ort->SessionGetInputCount(sess, &n_in)) ||
+      st_bad(g_ort->SessionGetOutputCount(sess, &n_out)))
+    INTRO_FAIL("%s: could not read model metadata", PREDICT_ERR_IO_SPEC);
+
+  if (n_out != 1)
+    INTRO_FAIL("%s: model has %zu outputs; provide an explicit io_spec with"
+               " output.name",
+               PREDICT_ERR_IO_SPEC, n_out);
+  if (n_in != 1 && n_in != 3)
+    INTRO_FAIL("%s: cannot derive io_spec for %zu inputs; provide an explicit"
+               " io_spec",
+               PREDICT_ERR_IO_SPEC, n_in);
+
+  for (size_t i = 0; i < n_in; i++) {
+    char *nm = NULL;
+    if (g_ort->SessionGetInputName(sess, i, alloc, &nm) || !nm)
+      INTRO_FAIL("%s: could not read input name %zu", PREDICT_ERR_IO_SPEC, i);
+    in_names[i] = sqlite3_mprintf("%s", nm);
+    alloc->Free(alloc, nm);
+  }
+  {
+    char *nm = NULL;
+    if (g_ort->SessionGetOutputName(sess, 0, alloc, &nm) || !nm)
+      INTRO_FAIL("%s: could not read output name", PREDICT_ERR_IO_SPEC);
+    out_name = sqlite3_mprintf("%s", nm);
+    alloc->Free(alloc, nm);
+  }
+
+  /* output shape/type -> kind */
+  ONNXTensorElementDataType out_type;
+  int64_t out_w = tensor_last_dim(sess, 0, 0, &out_type);
+  if (out_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+    INTRO_FAIL("%s: output is not a float tensor; provide an explicit io_spec",
+               PREDICT_ERR_IO_SPEC);
+  int classify = out_w > 1;   /* [N,K>1] -> probs; [N,1]/[N] -> value */
+  int nlabels = classify ? (int)out_w : 0;
+
+  /* feature count from the query input's last dim (may be dynamic = -1) */
+  ONNXTensorElementDataType in_type;
+  size_t q_idx = 0; /* vector: the only input; in_context: x_query */
+  int layout_incontext = (n_in == 3);
+  if (layout_incontext) {
+    /* need inputs named x_train / y_train / x_query to map them */
+    int has_xt = 0, has_yt = 0, has_xq = 0;
+    for (int i = 0; i < 3; i++) {
+      if (strcmp(in_names[i], "x_train") == 0)
+        has_xt = 1;
+      else if (strcmp(in_names[i], "y_train") == 0)
+        has_yt = 1;
+      else if (strcmp(in_names[i], "x_query") == 0) {
+        has_xq = 1;
+        q_idx = i;
+      }
+    }
+    if (!has_xt || !has_yt || !has_xq)
+      INTRO_FAIL("%s: 3-input model must name its inputs x_train/y_train/"
+                 "x_query to auto-derive; provide an explicit io_spec",
+                 PREDICT_ERR_IO_SPEC);
+  }
+  int64_t nfeat = tensor_last_dim(sess, 1, q_idx, &in_type);
+
+  /* build the io_spec JSON via json_object (proper escaping of names) */
+  char *labels_json = NULL;
+  if (classify) {
+    sqlite3_str *ls = sqlite3_str_new(db);
+    sqlite3_str_appendchar(ls, 1, '[');
+    for (int k = 0; k < nlabels; k++)
+      sqlite3_str_appendf(ls, "%s\"%d\"", k ? "," : "", k);
+    sqlite3_str_appendchar(ls, 1, ']');
+    labels_json = sqlite3_str_finish(ls);
+  }
+
+  const char *sql =
+      layout_incontext
+          ? "SELECT json_object('layout','in_context','nfeatures',?1,"
+            "'inputs',json_object('x_train','x_train','y_train','y_train',"
+            "'x_query','x_query'),'output',"
+            "CASE WHEN ?5 THEN json_object('name',?2,'kind','probs','labels',"
+            "json(?4)) ELSE json_object('name',?2,'kind','value') END)"
+          : "SELECT json_object('layout','vector','nfeatures',?1,'input',?3,"
+            "'output',CASE WHEN ?5 THEN json_object('name',?2,'kind','probs',"
+            "'labels',json(?4)) ELSE json_object('name',?2,'kind','value')"
+            " END)";
+  if (sqlite3_prepare_v2(db, sql, -1, &bld, NULL) != SQLITE_OK)
+    INTRO_FAIL("%s: could not build io_spec", PREDICT_ERR_IO_SPEC);
+  if (nfeat > 0)
+    sqlite3_bind_int64(bld, 1, nfeat);
+  else
+    sqlite3_bind_null(bld, 1); /* dynamic feature dim: validated at run time */
+  sqlite3_bind_text(bld, 2, out_name, -1, SQLITE_STATIC);
+  sqlite3_bind_text(bld, 3, in_names[0], -1, SQLITE_STATIC);
+  if (labels_json)
+    sqlite3_bind_text(bld, 4, labels_json, -1, SQLITE_STATIC);
+  else
+    sqlite3_bind_null(bld, 4);
+  sqlite3_bind_int(bld, 5, classify);
+  if (sqlite3_step(bld) == SQLITE_ROW)
+    *io_spec_out =
+        sqlite3_mprintf("%s", (const char *)sqlite3_column_text(bld, 0));
+  sqlite3_free(labels_json);
+  if (!*io_spec_out)
+    INTRO_FAIL("%s: could not serialize io_spec", PREDICT_ERR_IO_SPEC);
+  rc = SQLITE_OK;
+
+#undef INTRO_FAIL
+done:
+  if (bld)
+    sqlite3_finalize(bld);
+  for (int i = 0; i < 3; i++)
+    sqlite3_free(in_names[i]);
+  sqlite3_free(out_name);
+  if (sess)
+    g_ort->ReleaseSession(sess);
+  return rc;
+}
+
 /* ---- io_spec parsing ---- */
 
 typedef enum { LAYOUT_VECTOR, LAYOUT_INCONTEXT } onnx_layout;
@@ -95,8 +279,9 @@ typedef struct {
   char *x_train_name;
   char *y_train_name;
   char *target_name;
-  char **features; /* feature order, shared by train + query */
-  int nfeat;
+  char **features; /* feature order (optional); empty => positional mapping */
+  int nfeat;       /* count of named features (0 => positional) */
+  int nfeatures;   /* expected feature count for validation (0 => unknown) */
   char *output_name;
   char *output_kind; /* 'probs' | 'logits' | 'label' | 'value' */
   char **labels;
@@ -186,11 +371,16 @@ static int onnx_io_parse(sqlite3 *db, const char *io_spec, onnx_io *io,
   sqlite3_free(layout);
   io->layout = is_incontext ? LAYOUT_INCONTEXT : LAYOUT_VECTOR;
 
-  /* output + feature schema are common to both layouts */
+  /* output + feature schema are common to both layouts. features[] is
+   * optional: when absent the backend maps apply columns positionally, and
+   * nfeatures (if given) is the count to validate against. */
   io->output_name = json_str(db, io_spec, "$.output.name");
   io->output_kind = json_str(db, io_spec, "$.output.kind");
   json_arr(db, io_spec, "$.features", &io->features, &io->nfeat);
   json_arr(db, io_spec, "$.output.labels", &io->labels, &io->nlabels);
+  char *nf = json_str(db, io_spec, "$.nfeatures");
+  io->nfeatures = nf ? atoi(nf) : io->nfeat; /* names imply their own count */
+  sqlite3_free(nf);
 
   int inputs_ok;
   if (io->layout == LAYOUT_VECTOR) {
@@ -206,7 +396,7 @@ static int onnx_io_parse(sqlite3 *db, const char *io_spec, onnx_io *io,
                 io->target_name;
   }
 
-  int have_out = io->output_name && io->output_kind && io->nfeat > 0;
+  int have_out = io->output_name && io->output_kind;
   int classify = io->output_kind &&
                  (strcmp(io->output_kind, "probs") == 0 ||
                   strcmp(io->output_kind, "logits") == 0 ||
@@ -215,10 +405,11 @@ static int onnx_io_parse(sqlite3 *db, const char *io_spec, onnx_io *io,
   if (!inputs_ok || !have_out || (!classify && !regress) ||
       (classify && io->nlabels == 0)) {
     *errmsg = sqlite3_mprintf(
-        "%s: io_spec needs features[], output.name/kind"
+        "%s: io_spec needs output.name/kind"
         " ('probs'|'logits'|'label'|'value'), labels[] for classifiers, and"
         " the input names for its layout (vector: input; in_context:"
-        " inputs.x_train/y_train/x_query + target)",
+        " inputs.x_train/y_train/x_query + target). features[] is optional"
+        " (positional mapping when omitted)",
         PREDICT_ERR_IO_SPEC);
     onnx_io_free(io);
     return SQLITE_ERROR;
@@ -397,7 +588,12 @@ static int onnx_get_session(const predict0_model_row *model,
 static int license_ok(const char *license, const char *accepted) {
   if (!license)
     return 0;
-  if (strcmp(license, "MIT") == 0 || strcmp(license, "Apache-2.0") == 0 ||
+  /* 'unspecified' is the default when a caller registers their own model
+   * without a license tag: they vouch for it, so it runs. The gate exists to
+   * catch redistributed non-commercial weights (e.g. TabFM), which carry an
+   * explicit restrictive tag and need accept_license to match. */
+  if (strcmp(license, "unspecified") == 0 || strcmp(license, "MIT") == 0 ||
+      strcmp(license, "Apache-2.0") == 0 ||
       strcmp(license, "MIT OR Apache-2.0") == 0 ||
       strcmp(license, "BSD-3-Clause") == 0 || strcmp(license, "CC0-1.0") == 0)
     return 1;
@@ -488,18 +684,18 @@ out:
   return rc;
 }
 
-/* Vector single-input forward pass: nbatch feature rows -> predictions. */
+/* Vector single-input forward pass: nbatch rows of F features -> preds. */
 static int run_batch(OrtSession *session, OrtMemoryInfo *mem, const onnx_io *io,
-                     int classify, const f32 *batch, int nbatch,
+                     int F, int classify, const f32 *batch, int nbatch,
                      predict0_result *rows, const int *batch_row,
                      char **errmsg) {
   if (nbatch == 0)
     return SQLITE_OK;
   int rc = SQLITE_OK;
   OrtValue *input = NULL, *output = NULL;
-  int64_t shape[2] = {nbatch, io->nfeat};
+  int64_t shape[2] = {nbatch, F};
   OrtStatus *st = g_ort->CreateTensorWithDataAsOrtValue(
-      mem, (void *)batch, sizeof(f32) * (size_t)nbatch * io->nfeat, shape, 2,
+      mem, (void *)batch, sizeof(f32) * (size_t)nbatch * F, shape, 2,
       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input);
   if (st) {
     rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateTensor", errmsg);
@@ -606,6 +802,44 @@ static int emit_predict_receipt(sqlite3 *db, const char *model_id,
   return rc;
 }
 
+/* Map the apply query's feature columns (1..an-1) to model feature slots.
+ * With names in io->features, match by name (an exact set). Without names,
+ * map positionally (apply column order = model feature order). Sets *F, the
+ * tensor feature dimension, and fills amap[0..an-2]. Validates the count
+ * against io->nfeatures when it is known. */
+static int map_apply_features(const onnx_io *io, sqlite3_stmt *as, int an,
+                              int *amap, int *F, char **errmsg) {
+  int expected = io->nfeat > 0 ? io->nfeat : io->nfeatures; /* 0 = unknown */
+  if (expected > 0 && an - 1 != expected) {
+    *errmsg = sqlite3_mprintf(
+        "%s: apply features (%d) must match the model's (%d) exactly",
+        PREDICT_ERR_SCHEMA, an - 1, expected);
+    return SQLITE_ERROR;
+  }
+  if (io->nfeat > 0) {
+    for (int i = 1; i < an; i++) {
+      const char *nm = sqlite3_column_name(as, i);
+      int found = -1;
+      for (int f = 0; f < io->nfeat; f++)
+        if (nm && strcmp(nm, io->features[f]) == 0)
+          found = f;
+      if (found < 0) {
+        *errmsg = sqlite3_mprintf(
+            "%s: apply column '%s' is not a model feature", PREDICT_ERR_SCHEMA,
+            nm ? nm : "?");
+        return SQLITE_ERROR;
+      }
+      amap[i - 1] = found;
+    }
+    *F = io->nfeat;
+  } else {
+    for (int i = 1; i < an; i++)
+      amap[i - 1] = i - 1; /* positional */
+    *F = an - 1;
+  }
+  return SQLITE_OK;
+}
+
 /* ---- the vector inference path ---- */
 
 /* Self-contained model: features -> prediction, train_sql unused. io and
@@ -622,17 +856,13 @@ static int onnx_vector(sqlite3 *db, const char *model_id, const char *apply_sql,
    * from any failure below */
   predict0_result *rows = NULL;
   int nrows = 0, rcap = 0;
-  f32 *batch = sqlite3_malloc(sizeof(f32) * ONNX_BATCH * io->nfeat);
-  int *batch_row = sqlite3_malloc(sizeof(int) * ONNX_BATCH);
+  f32 *batch = NULL;
+  int *batch_row = NULL;
   int *amap = NULL;
+  int F = 0;
   OrtMemoryInfo *mem = NULL;
   sqlite3_stmt *as = NULL;
 
-  if (!batch || !batch_row) {
-    rc = SQLITE_NOMEM;
-    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-    goto done;
-  }
   {
     OrtStatus *st = g_ort->CreateCpuMemoryInfo(OrtArenaAllocator,
                                                OrtMemTypeDefault, &mem);
@@ -662,34 +892,21 @@ static int onnx_vector(sqlite3 *db, const char *model_id, const char *apply_sql,
         PREDICT_ERR_SCHEMA);
     goto done;
   }
-  if (an - 1 != io->nfeat) {
-    rc = SQLITE_ERROR;
-    *errmsg = sqlite3_mprintf(
-        "%s: apply features (%d) must match the model's (%d) exactly",
-        PREDICT_ERR_SCHEMA, an - 1, io->nfeat);
-    goto done;
-  }
-  /* map each apply feature column to a model feature slot (exact set) */
   amap = sqlite3_malloc(sizeof(int) * (an - 1));
-  if (!amap) {
+  batch_row = sqlite3_malloc(sizeof(int) * ONNX_BATCH);
+  if (!amap || !batch_row) {
     rc = SQLITE_NOMEM;
     *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
     goto done;
   }
-  for (int i = 1; i < an; i++) {
-    const char *nm = sqlite3_column_name(as, i);
-    int found = -1;
-    for (int f = 0; f < io->nfeat; f++)
-      if (nm && strcmp(nm, io->features[f]) == 0)
-        found = f;
-    if (found < 0) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf(
-          "%s: apply column '%s' is not a model feature", PREDICT_ERR_SCHEMA,
-          nm ? nm : "?");
-      goto done;
-    }
-    amap[i - 1] = found;
+  rc = map_apply_features(io, as, an, amap, &F, errmsg);
+  if (rc != SQLITE_OK)
+    goto done;
+  batch = sqlite3_malloc(sizeof(f32) * ONNX_BATCH * F);
+  if (!batch) {
+    rc = SQLITE_NOMEM;
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+    goto done;
   }
 
   int nbatch = 0;
@@ -718,7 +935,7 @@ static int onnx_vector(sqlite3 *db, const char *model_id, const char *apply_sql,
         out->ref_t =
             sqlite3_mprintf("%s", (const char *)sqlite3_column_text(as, 0));
 
-      f32 *slot = &batch[(size_t)nbatch * io->nfeat];
+      f32 *slot = &batch[(size_t)nbatch * F];
       int bad = 0;
       for (int i = 1; i < an; i++) {
         int ct = sqlite3_column_type(as, i);
@@ -745,8 +962,8 @@ static int onnx_vector(sqlite3 *db, const char *model_id, const char *apply_sql,
       goto done;
     }
 
-    rc = run_batch(session, mem, io, classify, batch, nbatch, rows, batch_row,
-                   errmsg);
+    rc = run_batch(session, mem, io, F, classify, batch, nbatch, rows,
+                   batch_row, errmsg);
     if (rc != SQLITE_OK)
       goto done;
     nbatch = 0;
@@ -786,16 +1003,17 @@ done:
  * y_train as int64 class indices (classify) or f32 values (regress). */
 static int collect_train(sqlite3 *db, const char *train_sql, const onnx_io *io,
                          int classify, f32 **x_out, void **y_out, int *nt_out,
-                         char **errmsg) {
+                         int *F_out, char **errmsg) {
   *x_out = NULL;
   *y_out = NULL;
   *nt_out = 0;
+  *F_out = 0;
   sqlite3_stmt *ts = NULL;
   int rc = SQLITE_OK;
   f32 *X = NULL;
   i64 *yi = NULL;
   f32 *yf = NULL;
-  int nt = 0, cap = 0;
+  int nt = 0, cap = 0, F = 0;
 
   if (!train_sql) {
     *errmsg = sqlite3_mprintf(
@@ -821,27 +1039,36 @@ static int collect_train(sqlite3 *db, const char *train_sql, const onnx_io *io,
     *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
     return SQLITE_NOMEM;
   }
+  /* map train columns to feature slots. Named: match io->features. Positional
+   * (no names): every non-target column becomes the next feature, in order. */
   int nfeat_seen = 0;
   for (int i = 0; i < tn; i++) {
     const char *nm = sqlite3_column_name(ts, i);
     fmap[i] = -1;
-    if (nm && strcmp(nm, io->target_name) == 0) {
+    if (nm && target_idx < 0 && strcmp(nm, io->target_name) == 0) {
       target_idx = i;
       continue;
     }
-    for (int f = 0; f < io->nfeat; f++)
-      if (nm && strcmp(nm, io->features[f]) == 0) {
-        fmap[i] = f;
-        nfeat_seen++;
-      }
+    if (io->nfeat > 0) {
+      for (int f = 0; f < io->nfeat; f++)
+        if (nm && strcmp(nm, io->features[f]) == 0) {
+          fmap[i] = f;
+          nfeat_seen++;
+        }
+    } else {
+      fmap[i] = nfeat_seen++; /* positional slot */
+    }
   }
-  if (target_idx < 0 || nfeat_seen != io->nfeat) {
+  F = io->nfeat > 0 ? io->nfeat : nfeat_seen;
+  int names_ok = io->nfeat == 0 || nfeat_seen == io->nfeat;
+  int count_ok = io->nfeatures == 0 || F == io->nfeatures;
+  if (target_idx < 0 || F == 0 || !names_ok || !count_ok) {
     sqlite3_free(fmap);
     sqlite3_finalize(ts);
     *errmsg = sqlite3_mprintf(
-        "%s: train_query must expose target '%s' and exactly the model's %d"
-        " features",
-        PREDICT_ERR_SCHEMA, io->target_name, io->nfeat);
+        "%s: train_query must expose target '%s' and the model's %d features",
+        PREDICT_ERR_SCHEMA, io->target_name,
+        io->nfeatures ? io->nfeatures : io->nfeat);
     return SQLITE_ERROR;
   }
 
@@ -849,7 +1076,7 @@ static int collect_train(sqlite3 *db, const char *train_sql, const onnx_io *io,
   while ((step = sqlite3_step(ts)) == SQLITE_ROW) {
     if (nt == cap) {
       cap = cap ? cap * 2 : 256;
-      f32 *gX = sqlite3_realloc(X, sizeof(f32) * (size_t)cap * io->nfeat);
+      f32 *gX = sqlite3_realloc(X, sizeof(f32) * (size_t)cap * F);
       if (!gX) {
         rc = SQLITE_NOMEM;
         goto oom;
@@ -871,7 +1098,7 @@ static int collect_train(sqlite3 *db, const char *train_sql, const onnx_io *io,
         yf = g;
       }
     }
-    f32 *row = &X[(size_t)nt * io->nfeat];
+    f32 *row = &X[(size_t)nt * F];
     for (int i = 0; i < tn; i++) {
       if (fmap[i] < 0)
         continue;
@@ -880,7 +1107,7 @@ static int collect_train(sqlite3 *db, const char *train_sql, const onnx_io *io,
         rc = SQLITE_ERROR;
         *errmsg = sqlite3_mprintf(
             "%s: train feature '%s' is not numeric", PREDICT_ERR_SCHEMA,
-            io->features[fmap[i]]);
+            sqlite3_column_name(ts, i));
         goto fail;
       }
       row[fmap[i]] = (f32)sqlite3_column_double(ts, i);
@@ -927,6 +1154,7 @@ static int collect_train(sqlite3 *db, const char *train_sql, const onnx_io *io,
   *x_out = X;
   *y_out = classify ? (void *)yi : (void *)yf;
   *nt_out = nt;
+  *F_out = F;
   return SQLITE_OK;
 
 oom:
@@ -951,10 +1179,10 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
 
   f32 *xtrain = NULL;
   void *ytrain = NULL;
-  int nt = 0;
+  int nt = 0, F = 0, train_F = 0;
   predict0_result *rows = NULL;
   int nrows = 0, rcap = 0;
-  f32 *xquery = NULL; /* [nq_num, nfeat], only numeric query rows */
+  f32 *xquery = NULL; /* [nq_num, F], only numeric query rows */
   int *qmap = NULL;   /* numeric-query index -> result index */
   int nq = 0, qcap = 0;
   int *amap = NULL;
@@ -963,7 +1191,7 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
   sqlite3_stmt *as = NULL;
 
   rc = collect_train(db, train_sql, io, classify, &xtrain, &ytrain, &nt,
-                     errmsg);
+                     &train_F, errmsg);
   if (rc != SQLITE_OK)
     return rc;
 
@@ -981,11 +1209,11 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
     goto done;
   }
   int an = sqlite3_column_count(as);
-  if (an - 1 != io->nfeat) {
+  if (an < 2) {
     rc = SQLITE_ERROR;
     *errmsg = sqlite3_mprintf(
-        "%s: apply features (%d) must match the model's (%d) exactly",
-        PREDICT_ERR_SCHEMA, an - 1, io->nfeat);
+        "%s: apply_query needs a row_ref column plus features",
+        PREDICT_ERR_SCHEMA);
     goto done;
   }
   amap = sqlite3_malloc(sizeof(int) * (an - 1));
@@ -994,20 +1222,21 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
     *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
     goto done;
   }
-  for (int i = 1; i < an; i++) {
-    const char *nm = sqlite3_column_name(as, i);
-    int found = -1;
-    for (int f = 0; f < io->nfeat; f++)
-      if (nm && strcmp(nm, io->features[f]) == 0)
-        found = f;
-    if (found < 0) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf(
-          "%s: apply column '%s' is not a model feature", PREDICT_ERR_SCHEMA,
-          nm ? nm : "?");
-      goto done;
-    }
-    amap[i - 1] = found;
+  rc = map_apply_features(io, as, an, amap, &F, errmsg);
+  if (rc != SQLITE_OK)
+    goto done;
+  if (F != train_F) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf(
+        "%s: apply features (%d) must match train features (%d)",
+        PREDICT_ERR_SCHEMA, F, train_F);
+    goto done;
+  }
+  if (F > 64) { /* the per-row stack buffer below is fixed at 64 */
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: too many features (%d; max 64)",
+                              PREDICT_ERR_SCHEMA, F);
+    goto done;
   }
 
   int step;
@@ -1051,7 +1280,7 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
     }
     if (nq == qcap) {
       qcap = qcap ? qcap * 2 : 256;
-      f32 *gx = sqlite3_realloc(xquery, sizeof(f32) * (size_t)qcap * io->nfeat);
+      f32 *gx = sqlite3_realloc(xquery, sizeof(f32) * (size_t)qcap * F);
       int *gm = sqlite3_realloc(qmap, sizeof(int) * qcap);
       if (!gx || !gm) {
         sqlite3_free(gx);
@@ -1063,7 +1292,7 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
       xquery = gx;
       qmap = gm;
     }
-    memcpy(&xquery[(size_t)nq * io->nfeat], feat, sizeof(f32) * io->nfeat);
+    memcpy(&xquery[(size_t)nq * F], feat, sizeof(f32) * F);
     qmap[nq] = nrows;
     nq++;
     nrows++;
@@ -1084,9 +1313,9 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
       goto done;
     }
   }
-  int64_t xt_shape[2] = {nt, io->nfeat};
+  int64_t xt_shape[2] = {nt, F};
   OrtStatus *st = g_ort->CreateTensorWithDataAsOrtValue(
-      mem, xtrain, sizeof(f32) * (size_t)nt * io->nfeat, xt_shape, 2,
+      mem, xtrain, sizeof(f32) * (size_t)nt * F, xt_shape, 2,
       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &xt_val);
   if (st) {
     rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateTensor(x_train)", errmsg);
@@ -1107,12 +1336,11 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
 
   for (int start = 0; start < nq; start += ONNX_BATCH) {
     int nb = nq - start < ONNX_BATCH ? nq - start : ONNX_BATCH;
-    int64_t xq_shape[2] = {nb, io->nfeat};
+    int64_t xq_shape[2] = {nb, F};
     OrtValue *xq_val = NULL, *output = NULL;
     st = g_ort->CreateTensorWithDataAsOrtValue(
-        mem, &xquery[(size_t)start * io->nfeat],
-        sizeof(f32) * (size_t)nb * io->nfeat, xq_shape, 2,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &xq_val);
+        mem, &xquery[(size_t)start * F], sizeof(f32) * (size_t)nb * F, xq_shape,
+        2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &xq_val);
     if (st) {
       rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateTensor(x_query)",
                      errmsg);

@@ -48,7 +48,18 @@ serves two `io_spec` layouts. The **vector** layout is a self-contained model
 mapping a feature vector to a prediction. The **in_context** layout is a
 teacher (TabFM-shaped): it ingests the `train_query` rows as three tensors
 (`x_train`, `y_train`, `x_query`) each call and labels the query rows against
-that context. Both cache one onnxruntime session per (weights, device,
+that context.
+
+The `io_spec` is usually derived, not written. `predict_register` reads the
+model's input/output tensors (`predict0_onnx_introspect`) to fill in the
+layout, tensor names, output kind, and class count, so a bare weights path is
+a complete registration for the vector case (in-context adds only `target`,
+which is a SQL column introspection can't see). An explicit `io_spec`
+overrides the derivation. Feature columns map positionally by default (apply
+column order); a `features` list switches to name-based mapping. All the JSON
+handling — reading the `io_spec`, building the derived one — goes through
+SQLite's JSON1 (`json_extract`/`json_each`/`json_object`), never a hand-rolled
+parser. Both cache one onnxruntime session per (weights, device,
 precision), run query rows in batches, and select the execution provider
 explicitly, erasing no failure into a silent CPU fallback. Weights are pinned
 by content hash, so a receipt records exactly which bytes ran, and the

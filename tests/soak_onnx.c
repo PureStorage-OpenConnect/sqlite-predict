@@ -47,15 +47,20 @@ int main(int argc, char **argv) {
       "'f2'),'target','label','output',json_object('name','probabilities',"
       "'kind','probs','labels',json_array('0','1')))))",
       argv[2]);
-  if (run(db, reg, 1) || run(db, regic, 1)) {
+  /* bare-path registration exercises the introspection + positional path */
+  char *regauto = sqlite3_mprintf(
+      "SELECT predict_register('auto', %Q)", argv[1]);
+  if (run(db, reg, 1) || run(db, regic, 1) || run(db, regauto, 1)) {
     fprintf(stderr, "register failed\n");
     sqlite3_free(reg);
     sqlite3_free(regic);
+    sqlite3_free(regauto);
     sqlite3_close(db);
     return 1;
   }
   sqlite3_free(reg);
   sqlite3_free(regic);
+  sqlite3_free(regauto);
 
   run(db, "CREATE TABLE apply(id INTEGER, f1 REAL, f2 REAL)", 1);
   run(db,
@@ -75,6 +80,9 @@ int main(int argc, char **argv) {
             "json_object('model','clf'))", 1);
     run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
             "json_object('model','clf','receipt',0))", 1);
+    /* introspected model + positional features */
+    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+            "json_object('model','auto','receipt',0))", 1);
     /* in_context: success (train context + 1501-row query, multi-batch) */
     run(db, "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
             "'SELECT id, f1, f2 FROM apply',json_object('model','knn1'))", 1);

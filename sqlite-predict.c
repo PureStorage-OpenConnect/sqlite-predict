@@ -356,39 +356,8 @@ static void predict_register_fn(sqlite3_context *context, int argc,
     return;
   }
 
-  sqlite3_stmt *s = NULL;
-  if (sqlite3_prepare_v2(
-          db,
-          "SELECT json_extract(?1,'$.runtime'), json_extract(?1,'$.kind'),"
-          " json_extract(?1,'$.license'), json_extract(?1,'$.weights_uri'),"
-          " json_extract(?1,'$.io_spec')",
-          -1, &s, NULL) != SQLITE_OK) {
-    char *e = sqlite3_mprintf("%s: config is not valid JSON",
-                              PREDICT_ERR_OPTIONS);
-    sqlite3_result_error(context, e, -1);
-    sqlite3_free(e);
-    return;
-  }
-  sqlite3_bind_text(s, 1, config, -1, SQLITE_STATIC);
-  if (sqlite3_step(s) != SQLITE_ROW) {
-    sqlite3_finalize(s);
-    char *e = sqlite3_mprintf("%s: config is not valid JSON",
-                              PREDICT_ERR_OPTIONS);
-    sqlite3_result_error(context, e, -1);
-    sqlite3_free(e);
-    return;
-  }
-#define COL_OR_NULL(i)                                                        \
-  (sqlite3_column_type(s, i) == SQLITE_NULL                                   \
-       ? NULL                                                                 \
-       : sqlite3_mprintf("%s", (const char *)sqlite3_column_text(s, i)))
-  char *runtime = COL_OR_NULL(0);
-  char *kind = COL_OR_NULL(1);
-  char *license = COL_OR_NULL(2);
-  char *uri = COL_OR_NULL(3);
-  char *io_spec = COL_OR_NULL(4);
-#undef COL_OR_NULL
-  sqlite3_finalize(s);
+  char *runtime = NULL, *kind = NULL, *license = NULL, *uri = NULL,
+       *io_spec = NULL, *target = NULL;
 
 #define REG_FAIL(...)                                                          \
   do {                                                                        \
@@ -398,11 +367,50 @@ static void predict_register_fn(sqlite3_context *context, int argc,
     goto reg_cleanup;                                                         \
   } while (0)
 
-  if (!runtime || !kind || !license)
-    REG_FAIL("%s: config needs runtime, kind, and license",
-             PREDICT_ERR_OPTIONS);
-  /* This pass registers file-backed local runtimes; inline-weight students
-   * are registered by distill(). remote/bundled are engine-managed. */
+  /* config is either a JSON object or, for the common case, a bare path to a
+   * weights file. A bare path means "onnx student, derive the rest". */
+  const char *p = config;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    p++;
+  if (*p != '{') {
+    uri = sqlite3_mprintf("%s", config); /* bare weights path */
+  } else {
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(
+            db,
+            "SELECT json_extract(?1,'$.runtime'), json_extract(?1,'$.kind'),"
+            " json_extract(?1,'$.license'), json_extract(?1,'$.weights_uri'),"
+            " json_extract(?1,'$.io_spec'), json_extract(?1,'$.target')",
+            -1, &s, NULL) != SQLITE_OK)
+      REG_FAIL("%s: config is not valid JSON", PREDICT_ERR_OPTIONS);
+    sqlite3_bind_text(s, 1, config, -1, SQLITE_STATIC);
+    if (sqlite3_step(s) != SQLITE_ROW) {
+      sqlite3_finalize(s);
+      REG_FAIL("%s: config is not valid JSON", PREDICT_ERR_OPTIONS);
+    }
+#define COL_OR_NULL(i)                                                        \
+  (sqlite3_column_type(s, i) == SQLITE_NULL                                   \
+       ? NULL                                                                 \
+       : sqlite3_mprintf("%s", (const char *)sqlite3_column_text(s, i)))
+    runtime = COL_OR_NULL(0);
+    kind = COL_OR_NULL(1);
+    license = COL_OR_NULL(2);
+    uri = COL_OR_NULL(3);
+    io_spec = COL_OR_NULL(4);
+    target = COL_OR_NULL(5);
+#undef COL_OR_NULL
+    sqlite3_finalize(s);
+  }
+
+  /* defaults: a user registering their own model shouldn't have to restate
+   * the obvious. The onnx build derives the io_spec from the model below. */
+  if (!runtime)
+    runtime = sqlite3_mprintf("onnx");
+  if (!kind)
+    kind = sqlite3_mprintf("student");
+  if (!license)
+    license = sqlite3_mprintf("unspecified");
+
   if (strcmp(runtime, "onnx") != 0 && strcmp(runtime, "ggml") != 0 &&
       strcmp(runtime, "tree") != 0)
     REG_FAIL("%s: predict_register handles onnx|ggml|tree runtimes, got '%s'",
@@ -415,6 +423,43 @@ static void predict_register_fn(sqlite3_context *context, int argc,
     sqlite3_result_error(context, emsg, -1);
     sqlite3_free(emsg);
     goto reg_cleanup;
+  }
+
+  /* Derive the io_spec by reading the model when the caller didn't give one. */
+  if (!io_spec) {
+#ifdef SQLITE_PREDICT_ONNX
+    if (strcmp(runtime, "onnx") == 0) {
+      if (predict0_onnx_introspect(db, uri, &io_spec, &emsg) != SQLITE_OK) {
+        sqlite3_result_error(context, emsg, -1);
+        sqlite3_free(emsg);
+        goto reg_cleanup;
+      }
+      /* introspection can't know the SQL target column of an in-context
+       * model; splice in a top-level `target` when the caller gave one. */
+      if (target) {
+        sqlite3_stmt *js = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT json_set(?1,'$.target',?2)", -1, &js,
+                               NULL) == SQLITE_OK) {
+          sqlite3_bind_text(js, 1, io_spec, -1, SQLITE_STATIC);
+          sqlite3_bind_text(js, 2, target, -1, SQLITE_STATIC);
+          if (sqlite3_step(js) == SQLITE_ROW) {
+            char *merged =
+                sqlite3_mprintf("%s", (const char *)sqlite3_column_text(js, 0));
+            sqlite3_free(io_spec);
+            io_spec = merged;
+          }
+          sqlite3_finalize(js);
+        }
+      }
+    } else {
+      REG_FAIL("%s: %s models need an explicit io_spec", PREDICT_ERR_IO_SPEC,
+               runtime);
+    }
+#else
+    REG_FAIL("%s: io_spec is required in this build; the onnx build"
+             " (loadable-onnx) derives it from the model",
+             PREDICT_ERR_IO_SPEC);
+#endif
   }
 
   sqlite3_stmt *ins = NULL;
@@ -452,6 +497,7 @@ reg_cleanup:
   sqlite3_free(license);
   sqlite3_free(uri);
   sqlite3_free(io_spec);
+  sqlite3_free(target);
 }
 
 #pragma endregion

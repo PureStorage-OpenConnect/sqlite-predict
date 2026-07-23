@@ -25,9 +25,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`make loadable-onnx-gpu`) adds the CUDA and TensorRT execution providers
   and fp16/int8 precision, compile-checked in CI and validated on a
   dedicated GPU job. The default build stays zero-dependency.
-- `predict_register(model_id, config_json)` to register an external model,
+- `predict_register(model_id, config)` to register an external model,
   pinning its weights by content hash. `_predict_models` gains `weights_uri`
-  and `io_spec`; receipts record the execution provider and precision.
+  and `io_spec`; receipts record the execution provider and precision. The
+  config can be a bare weights path: the io_spec is read off the model
+  (tensor names, output kind, class count) and feature columns map by
+  position, so the common case is one line. An explicit io_spec overrides.
 - A license gate: a non-permissive model requires `accept_license` to match
   before it will run.
 - Test suite, AddressSanitizer/UBSan and valgrind soak targets, a libFuzzer
