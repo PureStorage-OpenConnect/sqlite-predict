@@ -155,6 +155,96 @@ def test_too_few_rows_errors(db):
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
 
+def _angular3(db, n=400, seed=2):
+    """A 3-class angular boundary a single shallow tree underfits."""
+    import math
+    import random
+    rng = random.Random(seed)
+    db.execute("CREATE TABLE tr3(f1 REAL, f2 REAL, label TEXT)")
+    rows = []
+    for _ in range(n):
+        a, b = rng.gauss(0, 1), rng.gauss(0, 1)
+        ang = math.atan2(b, a)
+        rows.append((a, b, "0" if ang < -1 else ("1" if ang < 1 else "2")))
+    db.executemany("INSERT INTO tr3 VALUES (?,?,?)", rows)
+
+
+def test_gbt_student_beats_single_tree(db):
+    """The point of the GBT student: an additive ensemble carries a curved
+    boundary that one shallow tree cannot."""
+    _angular3(db)
+    tm = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM tr3',"
+        " json_object('target','label','student_id','t','student_kind','tree'))"
+    ).fetchone()[0]
+    gm = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM tr3',"
+        " json_object('target','label','student_id','g','student_kind','gbt'))"
+    ).fetchone()[0]
+    assert gm >= tm
+
+
+def test_gbt_student_predicts_and_replays(db):
+    _angular3(db)
+    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tr3',"
+               " json_object('target','label','student_id','g',"
+               "'student_kind','gbt'))").fetchone()
+    runtime, blob = db.execute(
+        "SELECT runtime, length(weights) FROM _predict_models WHERE"
+        " model_id='g'").fetchone()
+    assert runtime == "tree" and blob > 0
+    db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 REAL)")
+    db.execute("INSERT INTO ap VALUES (0,0.5,0.5),(1,-1.0,-1.0),(2,-1.0,1.0)")
+    q = ("SELECT row_ref, prediction, confidence, status FROM predict(NULL,"
+         " 'SELECT id,f1,f2 FROM ap', json_object('model','g','receipt',0))")
+    r1 = db.execute(q).fetchall()
+    assert all(s == "ok" and p in ("0", "1", "2") and 0 <= c <= 1
+               for _, p, c, s in r1)
+    assert r1 == db.execute(q).fetchall()  # deterministic
+    rid = db.execute(
+        "SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM ap',"
+        " json_object('model','g')) LIMIT 1").fetchone()[0]
+    match, detail = db.execute(
+        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
+    assert match == 1, detail
+
+
+def test_gbt_regression(db):
+    db.execute("CREATE TABLE r(id INTEGER, f1 REAL, f2 REAL, y REAL)")
+    db.executemany(
+        "INSERT INTO r VALUES (?,?,?,?)",
+        [(i, i * 0.1, (i * 7) % 5, i * 0.1 + ((i * 7) % 5) * 0.5)
+         for i in range(120)])
+    m = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1,f2,y FROM r',"
+        " json_object('target','y','task','regress','student_id','rg',"
+        "'student_kind','gbt'))").fetchone()[0]
+    assert m >= 0
+    out = db.execute(
+        "SELECT prediction, status FROM predict(NULL,'SELECT id,f1,f2 FROM r',"
+        " json_object('model','rg','receipt',0))").fetchall()
+    assert all(s == "ok" and float(p) == float(p) for p, s in out)
+
+
+def test_corrupt_gbt_blob_rejected(db):
+    _angular3(db)
+    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tr3',"
+               " json_object('target','label','student_id','good',"
+               "'student_kind','gbt'))").fetchone()
+    db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
+    db.execute("INSERT INTO a VALUES (0, 0.1, 0.2)")
+    for blob in (b"PSGBT01\x00" + b"\xff" * 40, b"PSGBT01\x00" + b"\x00" * 20):
+        db.execute("DELETE FROM _predict_models WHERE model_id='bad'")
+        db.execute(
+            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+            " content_hash, license) VALUES ('bad','student','tree',?,'x',"
+            "'unspecified')", (blob,))
+        with pytest.raises(sqlite3.OperationalError) as e:
+            db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+                       " json_object('model','bad','receipt',0))").fetchall()
+        assert "PREDICT_ERR" in str(e.value)
+
+
 def test_corrupt_student_blob_errors_not_crashes(db):
     """The registry is caller-writable, so a hand-crafted tree blob must be
     rejected by the bounds-checked deserializer, never crash."""

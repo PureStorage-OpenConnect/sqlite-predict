@@ -248,6 +248,240 @@ static int tree_walk(const Tree *t, const f32 *x) {
 
 /* ---- the tree runtime (execute a student over apply rows) ---- */
 
+/* ---- gradient-boosted tree student (student_kind='gbt') ---- */
+
+/* A single depth-8 CART underfits complex boundaries; an additive ensemble of
+ * shallow regression trees (gradient boosting) closes most of the gap and is
+ * deterministic by construction — no bootstrap or feature-sampling randomness,
+ * so the student stays reproducible. Classification uses softmax with one
+ * score function per class; regression uses squared loss. */
+
+#define GBT_ROUNDS 120
+#define GBT_DEPTH 3
+#define GBT_MIN_SPLIT 5
+#define GBT_LR 0.2f
+
+static const char GBT_MAGIC[8] = {'P', 'S', 'G', 'B', 'T', '0', '1', '\0'};
+
+typedef struct {
+  int task; /* 0 classify, 1 regress */
+  int nfeat;
+  char **feat_names;
+  int nclass;
+  char **labels;
+  int n_score; /* score functions: nclass (classify) or 1 (regress) */
+  int n_rounds;
+  f32 lr;
+  f32 *init;       /* [n_score] */
+  int n_trees;     /* n_rounds * n_score */
+  int *tree_off;   /* [n_trees+1] offsets into nodes (per-tree local roots at 0) */
+  TreeNode *nodes; /* flat pool; tree j uses [tree_off[j], tree_off[j+1]) */
+} Forest;
+
+static void forest_free(Forest *f) {
+  if (!f)
+    return;
+  for (int i = 0; i < f->nfeat; i++)
+    sqlite3_free(f->feat_names[i]);
+  sqlite3_free(f->feat_names);
+  for (int i = 0; i < f->nclass; i++)
+    sqlite3_free(f->labels[i]);
+  sqlite3_free(f->labels);
+  sqlite3_free(f->init);
+  sqlite3_free(f->tree_off);
+  sqlite3_free(f->nodes);
+  memset(f, 0, sizeof(*f));
+}
+
+/* Walk one weak learner (regression tree) whose nodes start at `nd` with
+ * 0-based left/right, returning its leaf value. `guard` bounds the hops. */
+static f32 reg_tree_value(const TreeNode *nd, int guard, const f32 *x) {
+  int node = 0;
+  for (int h = 0; h <= guard; h++) {
+    if (nd[node].feature < 0)
+      return nd[node].value;
+    node = x[nd[node].feature] < nd[node].threshold ? nd[node].left
+                                                     : nd[node].right;
+  }
+  return 0.f;
+}
+
+static f32 forest_tree_value(const Forest *f, int j, const f32 *x) {
+  int base = f->tree_off[j], guard = f->tree_off[j + 1] - base;
+  return reg_tree_value(&f->nodes[base], guard, x);
+}
+
+/* Predict one row: sets *pred (sqlite3_malloc'd) and, for classify, *conf. */
+static int forest_predict_row(const Forest *f, const f32 *x, f64 *scbuf,
+                              char **pred, f64 *conf, int *has_conf) {
+  if (f->task == 1) {
+    f64 s = f->init[0];
+    for (int j = 0; j < f->n_trees; j++)
+      s += f->lr * forest_tree_value(f, j, x);
+    *has_conf = 0;
+    *pred = sqlite3_mprintf("%.17g", s);
+    return *pred ? SQLITE_OK : SQLITE_NOMEM;
+  }
+  for (int c = 0; c < f->n_score; c++)
+    scbuf[c] = f->init[c];
+  for (int r = 0; r < f->n_rounds; r++)
+    for (int s = 0; s < f->n_score; s++)
+      scbuf[s] += f->lr * forest_tree_value(f, r * f->n_score + s, x);
+  f64 mx = scbuf[0];
+  int arg = 0;
+  for (int c = 1; c < f->n_score; c++)
+    if (scbuf[c] > mx) {
+      mx = scbuf[c];
+      arg = c;
+    }
+  f64 sum = 0;
+  for (int c = 0; c < f->n_score; c++)
+    sum += exp(scbuf[c] - mx);
+  *conf = 1.0 / sum; /* softmax at the argmax */
+  *has_conf = 1;
+  *pred = sqlite3_mprintf("%s", f->labels[arg]);
+  return *pred ? SQLITE_OK : SQLITE_NOMEM;
+}
+
+static int forest_serialize(const Forest *f, void **blob_out, int *len_out) {
+  size_t sz = sizeof(GBT_MAGIC) + 4 * 5 + 4 /*lr*/ + 4 * (size_t)f->n_score;
+  for (int i = 0; i < f->nfeat; i++)
+    sz += 4 + strlen(f->feat_names[i]);
+  for (int i = 0; i < f->nclass; i++)
+    sz += 4 + strlen(f->labels[i]);
+  sz += 4; /* n_trees */
+  for (int j = 0; j < f->n_trees; j++)
+    sz += 4 + (size_t)(f->tree_off[j + 1] - f->tree_off[j]) * (4 + 4 + 4 + 4 + 4);
+
+  u8 *buf = sqlite3_malloc((int)sz);
+  if (!buf)
+    return SQLITE_NOMEM;
+  u8 *p = buf;
+  memcpy(p, GBT_MAGIC, sizeof(GBT_MAGIC));
+  p += sizeof(GBT_MAGIC);
+  put_u32(&p, (u32)f->task);
+  put_u32(&p, (u32)f->nfeat);
+  put_u32(&p, (u32)f->nclass);
+  put_u32(&p, (u32)f->n_score);
+  put_u32(&p, (u32)f->n_rounds);
+  put_f32(&p, f->lr);
+  for (int i = 0; i < f->n_score; i++)
+    put_f32(&p, f->init[i]);
+  for (int i = 0; i < f->nfeat; i++)
+    put_str(&p, f->feat_names[i]);
+  for (int i = 0; i < f->nclass; i++)
+    put_str(&p, f->labels[i]);
+  put_u32(&p, (u32)f->n_trees);
+  for (int j = 0; j < f->n_trees; j++) {
+    int m = f->tree_off[j + 1] - f->tree_off[j];
+    put_u32(&p, (u32)m);
+    for (int k = 0; k < m; k++) {
+      const TreeNode *n = &f->nodes[f->tree_off[j] + k];
+      put_u32(&p, (u32)n->feature);
+      put_f32(&p, n->threshold);
+      put_u32(&p, (u32)n->left);
+      put_u32(&p, (u32)n->right);
+      put_f32(&p, n->value);
+    }
+  }
+  *blob_out = buf;
+  *len_out = (int)sz;
+  return SQLITE_OK;
+}
+
+static int forest_deserialize(const void *blob, int len, Forest *f,
+                              char **errmsg) {
+  memset(f, 0, sizeof(*f));
+  Reader r = {.p = blob, .end = (const u8 *)blob + len, .err = 0};
+  if (!blob || len < (int)sizeof(GBT_MAGIC) ||
+      memcmp(blob, GBT_MAGIC, sizeof(GBT_MAGIC)) != 0) {
+    *errmsg = sqlite3_mprintf("%s: not a gbt student blob", PREDICT_ERR_SCHEMA);
+    return SQLITE_ERROR;
+  }
+  r.p += sizeof(GBT_MAGIC);
+  f->task = (int)rd_u32(&r);
+  f->nfeat = (int)rd_u32(&r);
+  f->nclass = (int)rd_u32(&r);
+  f->n_score = (int)rd_u32(&r);
+  f->n_rounds = (int)rd_u32(&r);
+  f->lr = rd_f32(&r);
+  int want_score = f->task == 0 ? f->nclass : 1;
+  if (r.err || f->task < 0 || f->task > 1 || f->nfeat <= 0 ||
+      f->nfeat > TREE_MAX_FEAT || f->nclass < 0 || f->n_rounds <= 0 ||
+      f->n_rounds > (1 << 20) || f->n_score != want_score || f->n_score <= 0)
+    goto bad;
+
+  f->init = sqlite3_malloc(sizeof(f32) * f->n_score);
+  if (!f->init)
+    goto oom;
+  for (int i = 0; i < f->n_score; i++)
+    f->init[i] = rd_f32(&r);
+  f->feat_names = sqlite3_malloc(sizeof(char *) * f->nfeat);
+  if (!f->feat_names)
+    goto oom;
+  memset(f->feat_names, 0, sizeof(char *) * f->nfeat);
+  for (int i = 0; i < f->nfeat; i++)
+    if (!(f->feat_names[i] = rd_str(&r)))
+      goto bad;
+  if (f->nclass > 0) {
+    f->labels = sqlite3_malloc(sizeof(char *) * f->nclass);
+    if (!f->labels)
+      goto oom;
+    memset(f->labels, 0, sizeof(char *) * f->nclass);
+    for (int i = 0; i < f->nclass; i++)
+      if (!(f->labels[i] = rd_str(&r)))
+        goto bad;
+  }
+  f->n_trees = (int)rd_u32(&r);
+  if (r.err || f->n_trees != f->n_rounds * f->n_score)
+    goto bad;
+  f->tree_off = sqlite3_malloc(sizeof(int) * (f->n_trees + 1));
+  if (!f->tree_off)
+    goto oom;
+  f->tree_off[0] = 0;
+  int pool_cap = 0;
+  for (int j = 0; j < f->n_trees; j++) {
+    int m = (int)rd_u32(&r);
+    if (r.err || m <= 0 || m > (1 << 20))
+      goto bad;
+    int need = f->tree_off[j] + m;
+    if (need > pool_cap) {
+      pool_cap = need > pool_cap * 2 ? need : pool_cap * 2;
+      TreeNode *g = sqlite3_realloc(f->nodes, sizeof(TreeNode) * pool_cap);
+      if (!g)
+        goto oom;
+      f->nodes = g;
+    }
+    for (int k = 0; k < m; k++) {
+      TreeNode *n = &f->nodes[f->tree_off[j] + k];
+      memset(n, 0, sizeof(*n));
+      n->feature = (i32)rd_u32(&r);
+      n->threshold = rd_f32(&r);
+      n->left = (i32)rd_u32(&r);
+      n->right = (i32)rd_u32(&r);
+      n->value = rd_f32(&r);
+      n->klass = -1;
+      if (r.err)
+        goto bad;
+      if (n->feature >= 0 &&
+          (n->feature >= f->nfeat || n->left < 0 || n->left >= m ||
+           n->right < 0 || n->right >= m))
+        goto bad; /* internal children stay within this tree */
+    }
+    f->tree_off[j + 1] = need;
+  }
+  return SQLITE_OK;
+
+oom:
+  forest_free(f);
+  *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+  return SQLITE_NOMEM;
+bad:
+  forest_free(f);
+  *errmsg = sqlite3_mprintf("%s: corrupt gbt student blob", PREDICT_ERR_SCHEMA);
+  return SQLITE_ERROR;
+}
+
 int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
                       const predict0_model_row *model,
                       const predict0_backend_opts *opts,
@@ -270,15 +504,36 @@ int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
     return SQLITE_ERROR;
   }
 
+  /* one runtime for both native students: a single CART (PSTREE) or a
+   * gradient-boosted forest (PSGBT), told apart by the blob magic */
+  int is_forest = model->weights_len >= (int)sizeof(GBT_MAGIC) &&
+                  memcmp(model->weights, GBT_MAGIC, sizeof(GBT_MAGIC)) == 0;
   Tree tree;
-  int rc = tree_deserialize(model->weights, model->weights_len, &tree, errmsg);
+  Forest forest;
+  memset(&tree, 0, sizeof(tree));
+  memset(&forest, 0, sizeof(forest));
+  int rc = is_forest ? forest_deserialize(model->weights, model->weights_len,
+                                          &forest, errmsg)
+                     : tree_deserialize(model->weights, model->weights_len,
+                                        &tree, errmsg);
   if (rc != SQLITE_OK)
     return rc;
-  int classify = tree.task == 0;
+  int nfeat = is_forest ? forest.nfeat : tree.nfeat;
+  char **feat_names = is_forest ? forest.feat_names : tree.feat_names;
+  int classify = (is_forest ? forest.task : tree.task) == 0;
+  f64 *scbuf = NULL;
+  if (is_forest && classify) {
+    scbuf = sqlite3_malloc(sizeof(f64) * forest.n_score);
+    if (!scbuf) {
+      forest_free(&forest);
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      return SQLITE_NOMEM;
+    }
+  }
 
   predict0_result *rows = NULL;
   int nrows = 0, rcap = 0;
-  int *amap = NULL; /* apply feature col -> tree feature slot */
+  int *amap = NULL; /* apply feature col -> student feature slot */
   sqlite3_stmt *as = NULL;
 
   if (sqlite3_prepare_v2(db, apply_sql, -1, &as, NULL) != SQLITE_OK || !as) {
@@ -294,11 +549,11 @@ int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
     goto done;
   }
   int an = sqlite3_column_count(as);
-  if (an - 1 != tree.nfeat) {
+  if (an - 1 != nfeat) {
     rc = SQLITE_ERROR;
     *errmsg = sqlite3_mprintf(
         "%s: apply features (%d) must match the student's (%d)",
-        PREDICT_ERR_SCHEMA, an - 1, tree.nfeat);
+        PREDICT_ERR_SCHEMA, an - 1, nfeat);
     goto done;
   }
   amap = sqlite3_malloc(sizeof(int) * (an - 1));
@@ -310,8 +565,8 @@ int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
   for (int i = 1; i < an; i++) {
     const char *nm = sqlite3_column_name(as, i);
     int found = -1;
-    for (int f = 0; f < tree.nfeat; f++)
-      if (nm && strcmp(nm, tree.feat_names[f]) == 0)
+    for (int f = 0; f < nfeat; f++)
+      if (nm && strcmp(nm, feat_names[f]) == 0)
         found = f;
     if (found < 0) {
       rc = SQLITE_ERROR;
@@ -361,25 +616,34 @@ int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
       nrows++;
       continue;
     }
-    int leaf = tree_walk(&tree, x);
-    if (leaf < 0) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: malformed tree traversal",
-                                PREDICT_ERR_SCHEMA);
-      goto done;
-    }
-    const TreeNode *ln = &tree.nodes[leaf];
-    if (classify) {
-      out->prediction = sqlite3_mprintf("%s", tree.labels[ln->klass]);
-      out->confidence = ln->conf;
-      out->has_conf = 1;
+    if (is_forest) {
+      rc = forest_predict_row(&forest, x, scbuf, &out->prediction,
+                              &out->confidence, &out->has_conf);
+      if (rc != SQLITE_OK) {
+        *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+        goto done;
+      }
     } else {
-      out->prediction = sqlite3_mprintf("%.17g", (f64)ln->value);
-    }
-    if (!out->prediction) {
-      rc = SQLITE_NOMEM;
-      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-      goto done;
+      int leaf = tree_walk(&tree, x);
+      if (leaf < 0) {
+        rc = SQLITE_ERROR;
+        *errmsg = sqlite3_mprintf("%s: malformed tree traversal",
+                                  PREDICT_ERR_SCHEMA);
+        goto done;
+      }
+      const TreeNode *ln = &tree.nodes[leaf];
+      if (classify) {
+        out->prediction = sqlite3_mprintf("%s", tree.labels[ln->klass]);
+        out->confidence = ln->conf;
+        out->has_conf = 1;
+      } else {
+        out->prediction = sqlite3_mprintf("%.17g", (f64)ln->value);
+      }
+      if (!out->prediction) {
+        rc = SQLITE_NOMEM;
+        *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+        goto done;
+      }
     }
     out->status = "ok";
     nrows++;
@@ -465,7 +729,11 @@ done:
   if (as)
     sqlite3_finalize(as);
   sqlite3_free(amap);
-  tree_free(&tree);
+  sqlite3_free(scbuf);
+  if (is_forest)
+    forest_free(&forest);
+  else
+    tree_free(&tree);
   if (rc == SQLITE_OK) {
     *out_rows = rows;
     *out_n = nrows;
@@ -486,6 +754,8 @@ typedef struct {
   const f32 *yr; /* regress targets */
   int nclass;
   int task;
+  int max_depth; /* 0 => TREE_MAX_DEPTH; shallow for GBT weak learners */
+  int min_split; /* 0 => TREE_MIN_SPLIT */
 } Builder;
 
 static int bld_new_node(Builder *b) {
@@ -642,7 +912,9 @@ static int bld_build(Builder *b, int *idx, int n, int depth) {
   } else {
     pure = 0; /* regression leaves split on impurity, not purity */
   }
-  if (depth >= TREE_MAX_DEPTH || n < TREE_MIN_SPLIT || pure) {
+  int maxd = b->max_depth ? b->max_depth : TREE_MAX_DEPTH;
+  int mins = b->min_split ? b->min_split : TREE_MIN_SPLIT;
+  if (depth >= maxd || n < mins || pure) {
     bld_leaf(b, ni, idx, n);
     return ni;
   }
@@ -684,6 +956,129 @@ static int bld_build(Builder *b, int *idx, int n, int depth) {
   b->nodes[ni].right = R;
   b->nodes[ni].klass = -1;
   return ni;
+}
+
+
+/* Train a GBT on the teacher targets. Fills the numeric parts of *fo; the
+ * caller sets feat_names and labels (as for the single-tree path). */
+static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
+                     const i32 *yc, const f32 *yr, Forest *fo, char **errmsg) {
+  memset(fo, 0, sizeof(*fo));
+  int rounds = GBT_ROUNDS, nscore = task == 0 ? nclass : 1;
+  fo->task = task;
+  fo->nfeat = nfeat;
+  fo->nclass = nclass;
+  fo->n_score = nscore;
+  fo->n_rounds = rounds;
+  fo->lr = GBT_LR;
+
+  int rc = SQLITE_OK;
+  fo->init = sqlite3_malloc(sizeof(f32) * nscore);
+  fo->tree_off = sqlite3_malloc(sizeof(int) * (rounds * nscore + 1));
+  f64 *F = sqlite3_malloc(sizeof(f64) * (size_t)n * nscore);
+  f64 *p = task == 0 ? sqlite3_malloc(sizeof(f64) * (size_t)n * nscore) : NULL;
+  int *idx = sqlite3_malloc(sizeof(int) * n);
+  f32 *grad = sqlite3_malloc(sizeof(f32) * n);
+  if (!fo->init || !fo->tree_off || !F || !idx || !grad ||
+      (task == 0 && !p)) {
+    rc = SQLITE_NOMEM;
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+    goto done;
+  }
+
+  if (task == 0) {
+    for (int c = 0; c < nscore; c++) {
+      int cnt = 0;
+      for (int i = 0; i < n; i++)
+        cnt += yc[i] == c;
+      fo->init[c] = (f32)log((cnt + 1.0) / (n + nscore)); /* smoothed log prior */
+    }
+    for (int i = 0; i < n; i++)
+      for (int c = 0; c < nscore; c++)
+        F[(size_t)i * nscore + c] = fo->init[c];
+  } else {
+    f64 m = 0;
+    for (int i = 0; i < n; i++)
+      m += yr[i];
+    m /= n;
+    fo->init[0] = (f32)m;
+    for (int i = 0; i < n; i++)
+      F[i] = m;
+  }
+
+  fo->tree_off[0] = 0;
+  int nt = 0, pool_cap = 0;
+  for (int r = 0; r < rounds; r++) {
+    if (task == 0) { /* round-start softmax for every row */
+      for (int i = 0; i < n; i++) {
+        f64 *Fi = &F[(size_t)i * nscore], mx = Fi[0];
+        for (int c = 1; c < nscore; c++)
+          if (Fi[c] > mx)
+            mx = Fi[c];
+        f64 sum = 0;
+        for (int c = 0; c < nscore; c++)
+          sum += (p[(size_t)i * nscore + c] = exp(Fi[c] - mx));
+        for (int c = 0; c < nscore; c++)
+          p[(size_t)i * nscore + c] /= sum;
+      }
+    }
+    for (int s = 0; s < nscore; s++) {
+      if (task == 0)
+        for (int i = 0; i < n; i++)
+          grad[i] = (yc[i] == s ? 1.f : 0.f) - (f32)p[(size_t)i * nscore + s];
+      else
+        for (int i = 0; i < n; i++)
+          grad[i] = (f32)(yr[i] - F[i]);
+
+      Builder b;
+      memset(&b, 0, sizeof(b));
+      b.X = X;
+      b.nfeat = nfeat;
+      b.yr = grad;
+      b.task = 1;
+      b.max_depth = GBT_DEPTH;
+      b.min_split = GBT_MIN_SPLIT;
+      for (int i = 0; i < n; i++)
+        idx[i] = i;
+      int root = bld_build(&b, idx, n, 0);
+      if (root < 0) {
+        sqlite3_free(b.nodes);
+        rc = SQLITE_NOMEM;
+        *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+        goto done;
+      }
+      for (int i = 0; i < n; i++)
+        F[(size_t)i * nscore + s] +=
+            fo->lr * reg_tree_value(b.nodes, b.n, &X[(size_t)i * nfeat]);
+
+      int need = fo->tree_off[nt] + b.n;
+      if (need > pool_cap) {
+        pool_cap = need > pool_cap * 2 ? need : pool_cap * 2;
+        TreeNode *g = sqlite3_realloc(fo->nodes, sizeof(TreeNode) * pool_cap);
+        if (!g) {
+          sqlite3_free(b.nodes);
+          rc = SQLITE_NOMEM;
+          *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+          goto done;
+        }
+        fo->nodes = g;
+      }
+      memcpy(&fo->nodes[fo->tree_off[nt]], b.nodes, sizeof(TreeNode) * b.n);
+      fo->tree_off[nt + 1] = need;
+      nt++;
+      sqlite3_free(b.nodes);
+    }
+  }
+  fo->n_trees = nt;
+
+done:
+  sqlite3_free(F);
+  sqlite3_free(p);
+  sqlite3_free(idx);
+  sqlite3_free(grad);
+  if (rc != SQLITE_OK)
+    forest_free(fo);
+  return rc;
 }
 
 /* ---- the distill() operation ---- */
@@ -821,6 +1216,8 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
   int n = 0, cap = 0;
   Tree tree;
   memset(&tree, 0, sizeof(tree));
+  Forest forest;
+  memset(&forest, 0, sizeof(forest));
   void *blob = NULL;
   int blob_len = 0;
   int *idx = NULL;
@@ -982,77 +1379,128 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     goto done;
   }
 
-  /* ---- 4. fit the tree on the fit split (teacher targets) ---- */
+  /* ---- 4. fit the student on the fit split (teacher targets) ---- */
   int n_hold = n / 5;
   if (n_hold < 1)
     n_hold = 1;
   int n_fit = n - n_hold;
-  idx = sqlite3_malloc(sizeof(int) * n_fit);
-  if (!idx) {
-    rc = SQLITE_NOMEM;
-    goto done;
-  }
-  for (int i = 0; i < n_fit; i++)
-    idx[i] = i;
-
-  Builder b;
-  memset(&b, 0, sizeof(b));
-  b.X = X;
-  b.nfeat = nfeat;
-  b.yc = y_teach;
-  b.yr = y_teach_r;
-  b.nclass = nclass;
-  b.task = classify ? 0 : 1;
-  int root = bld_build(&b, idx, n_fit, 0);
-  if (root < 0) {
-    sqlite3_free(b.nodes);
-    rc = SQLITE_NOMEM;
-    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-    goto done;
-  }
-  /* root is index 0 by construction (first node allocated). Move the feature
-   * names into a heap array the tree owns (the local is a stack array). */
-  tree.feat_names = sqlite3_malloc(sizeof(char *) * nfeat);
-  if (!tree.feat_names) {
-    sqlite3_free(b.nodes);
-    rc = SQLITE_NOMEM;
-    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-    goto done;
-  }
-  for (int f = 0; f < nfeat; f++)
-    tree.feat_names[f] = feat_names[f];
-  tree.task = b.task;
-  tree.nfeat = nfeat;
-  tree.nclass = nclass;
-  tree.labels = labels;
-  tree.n_nodes = b.n;
-  tree.nodes = b.nodes;
-  nfeat = 0; /* feature-name strings now owned by the tree */
-  labels = NULL;
-
-  /* ---- 5. evaluate on the holdout (student vs true labels) ---- */
+  int is_gbt = o->student_kind && strcmp(o->student_kind, "gbt") == 0;
   int correct = 0;
   f64 sse = 0;
-  for (int i = n_fit; i < n; i++) {
-    int leaf = tree_walk(&tree, &X[(size_t)i * tree.nfeat]);
-    if (leaf < 0)
-      continue;
-    const TreeNode *ln = &tree.nodes[leaf];
-    if (classify) {
-      if (strcmp(tree.labels[ln->klass], y_true_c[i]) == 0)
-        correct++;
-    } else {
-      f64 d = (f64)ln->value - y_true_r[i];
-      sse += d * d;
-    }
-  }
-  res->metric = classify ? (f64)correct / n_hold : sqrt(sse / n_hold);
 
-  /* ---- 6. serialize + register the student ---- */
-  rc = tree_serialize(&tree, &blob, &blob_len);
-  if (rc != SQLITE_OK) {
-    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-    goto done;
+  if (is_gbt) {
+    rc = train_gbt(X, n_fit, nfeat, classify ? 0 : 1, nclass, y_teach,
+                   y_teach_r, &forest, errmsg);
+    if (rc != SQLITE_OK)
+      goto done;
+    forest.feat_names = sqlite3_malloc(sizeof(char *) * nfeat);
+    if (!forest.feat_names) {
+      rc = SQLITE_NOMEM;
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      goto done;
+    }
+    for (int f = 0; f < nfeat; f++)
+      forest.feat_names[f] = feat_names[f];
+    forest.labels = labels; /* transfer */
+    nfeat = 0;
+    labels = NULL;
+
+    f64 *scbuf = classify ? sqlite3_malloc(sizeof(f64) * forest.n_score) : NULL;
+    if (classify && !scbuf) {
+      rc = SQLITE_NOMEM;
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      goto done;
+    }
+    for (int i = n_fit; i < n; i++) {
+      char *pred = NULL;
+      f64 conf = 0;
+      int hc = 0;
+      if (forest_predict_row(&forest, &X[(size_t)i * forest.nfeat], scbuf,
+                             &pred, &conf, &hc) != SQLITE_OK) {
+        sqlite3_free(scbuf);
+        rc = SQLITE_NOMEM;
+        *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+        goto done;
+      }
+      if (classify) {
+        if (strcmp(pred, y_true_c[i]) == 0)
+          correct++;
+      } else {
+        f64 d = strtod(pred, NULL) - y_true_r[i];
+        sse += d * d;
+      }
+      sqlite3_free(pred);
+    }
+    sqlite3_free(scbuf);
+    res->metric = classify ? (f64)correct / n_hold : sqrt(sse / n_hold);
+    rc = forest_serialize(&forest, &blob, &blob_len);
+    if (rc != SQLITE_OK) {
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      goto done;
+    }
+  } else {
+    idx = sqlite3_malloc(sizeof(int) * n_fit);
+    if (!idx) {
+      rc = SQLITE_NOMEM;
+      goto done;
+    }
+    for (int i = 0; i < n_fit; i++)
+      idx[i] = i;
+
+    Builder b;
+    memset(&b, 0, sizeof(b));
+    b.X = X;
+    b.nfeat = nfeat;
+    b.yc = y_teach;
+    b.yr = y_teach_r;
+    b.nclass = nclass;
+    b.task = classify ? 0 : 1;
+    int root = bld_build(&b, idx, n_fit, 0);
+    if (root < 0) {
+      sqlite3_free(b.nodes);
+      rc = SQLITE_NOMEM;
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      goto done;
+    }
+    /* root is index 0 (first node allocated). Move the feature names into a
+     * heap array the tree owns (the local is a stack array). */
+    tree.feat_names = sqlite3_malloc(sizeof(char *) * nfeat);
+    if (!tree.feat_names) {
+      sqlite3_free(b.nodes);
+      rc = SQLITE_NOMEM;
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      goto done;
+    }
+    for (int f = 0; f < nfeat; f++)
+      tree.feat_names[f] = feat_names[f];
+    tree.task = b.task;
+    tree.nfeat = nfeat;
+    tree.nclass = nclass;
+    tree.labels = labels;
+    tree.n_nodes = b.n;
+    tree.nodes = b.nodes;
+    nfeat = 0; /* feature-name strings now owned by the tree */
+    labels = NULL;
+
+    for (int i = n_fit; i < n; i++) {
+      int leaf = tree_walk(&tree, &X[(size_t)i * tree.nfeat]);
+      if (leaf < 0)
+        continue;
+      const TreeNode *ln = &tree.nodes[leaf];
+      if (classify) {
+        if (strcmp(tree.labels[ln->klass], y_true_c[i]) == 0)
+          correct++;
+      } else {
+        f64 d = (f64)ln->value - y_true_r[i];
+        sse += d * d;
+      }
+    }
+    res->metric = classify ? (f64)correct / n_hold : sqrt(sse / n_hold);
+    rc = tree_serialize(&tree, &blob, &blob_len);
+    if (rc != SQLITE_OK) {
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      goto done;
+    }
   }
   {
     predict0_hasher h;
@@ -1111,11 +1559,13 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     if (sqlite3_prepare_v2(
             db,
             "SELECT json_object('target',?1,'task',?2,'teacher',?3,"
-            "'student_kind','tree','receipt',1)",
+            "'student_kind',?4,'receipt',1)",
             -1, &pj, NULL) == SQLITE_OK) {
       sqlite3_bind_text(pj, 1, o->target, -1, SQLITE_STATIC);
       sqlite3_bind_text(pj, 2, task, -1, SQLITE_STATIC);
       sqlite3_bind_text(pj, 3, teacher, -1, SQLITE_STATIC);
+      sqlite3_bind_text(pj, 4, o->student_kind ? o->student_kind : "tree", -1,
+                        SQLITE_STATIC);
       if (sqlite3_step(pj) == SQLITE_ROW)
         params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
       sqlite3_finalize(pj);
@@ -1160,6 +1610,7 @@ done:
   sqlite3_free(idx);
   sqlite3_free(blob);
   tree_free(&tree);
+  forest_free(&forest);
   return rc;
 }
 
@@ -1305,8 +1756,9 @@ static int dl_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (o.task && strcmp(o.task, "classify") != 0 &&
       strcmp(o.task, "regress") != 0)
     DL_FAIL("%s: task must be classify|regress: %s", PREDICT_ERR_TASK, o.task);
-  if (o.student_kind && strcmp(o.student_kind, "tree") != 0)
-    DL_FAIL("%s: student_kind '%s' is not available; this build trains 'tree'",
+  if (o.student_kind && strcmp(o.student_kind, "tree") != 0 &&
+      strcmp(o.student_kind, "gbt") != 0)
+    DL_FAIL("%s: student_kind '%s' is not available; use 'tree' or 'gbt'",
             PREDICT_ERR_OPTIONS, o.student_kind);
 
   char *ensure_err = NULL;

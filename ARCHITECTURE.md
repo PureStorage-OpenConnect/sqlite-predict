@@ -78,16 +78,21 @@ teacher's accuracy is usually distillation to a small student.
 
 `distill()` (`predict-distill.c`) is that path, and it lives in the
 zero-dependency core. It runs the teacher (any `predict()` model, resolved
-by re-running `predict()` over the training rows), fits a CART decision tree
-on the teacher's predictions, evaluates it on a held-out fraction, and writes
-the tree into `_predict_models` as an inline BLOB (`runtime='tree'`,
-`kind='student'`). `predict()` dispatches a `tree` model to the native tree
-runtime in the same file, so the student runs with no onnxruntime. The blob
-format is little-endian and implementation-defined (RFC §4.2.5); it is
-rigorously bounds-checked on read, because the registry is writable by any
-SQL caller (RFC §6.2) — a hand-crafted tree blob is rejected, never crashed
-on. Because the tree is native and deterministic, a student's predictions
-carry the same exact-replay receipt as the stat models.
+by re-running `predict()` over the training rows), fits a student on the
+teacher's predictions, evaluates it on a held-out fraction, and writes the
+student into `_predict_models` as an inline BLOB (`runtime='tree'`,
+`kind='student'`). Two `student_kind`s share the CART trainer: `'tree'` is a
+single depth-8 tree; `'gbt'` is a gradient-boosted forest of shallow
+regression trees (softmax for classification, squared loss for regression),
+deterministic by construction — no bootstrap or feature-sampling randomness
+— so the student stays reproducible. `predict()` dispatches a `tree`-runtime
+model to the native runtime in the same file, which tells a single tree
+(`PSTREE` blob) from a forest (`PSGBT` blob) by magic and needs no
+onnxruntime. Both blob formats are little-endian and implementation-defined
+(RFC §4.2.5), and rigorously bounds-checked on read, because the registry is
+writable by any SQL caller (RFC §6.2) — a hand-crafted blob is rejected,
+never crashed on. Because the student is native and deterministic, its
+predictions carry the same exact-replay receipt as the stat models.
 
 ## Receipts, anchoring, and replay
 

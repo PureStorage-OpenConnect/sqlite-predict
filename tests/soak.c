@@ -67,10 +67,22 @@ int main(void) {
           "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
           " '{\"target\":\"label\",\"student_id\":\"soak_student\"}')",
           1) ||
+      run_discard(
+          db,
+          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          " '{\"target\":\"label\",\"student_id\":\"soak_gbt\","
+          "\"student_kind\":\"gbt\"}')",
+          1) ||
       run_discard(db,
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_bad',"
                   "'student','tree',x'505354524545303100000000','x',"
+                  "'unspecified')",
+                  1) ||
+      run_discard(db,
+                  "INSERT INTO _predict_models (model_id, kind, runtime,"
+                  " weights, content_hash, license) VALUES ('soak_gbt_bad',"
+                  "'student','tree',x'505347425430310000000000','x',"
                   "'unspecified')",
                   1))
     goto done_fail;
@@ -101,9 +113,15 @@ int main(void) {
                     1))
       goto done_fail;
 
-    /* tree-student + distill error paths */
+    /* gbt-student (forest runtime) + tree/forest error paths */
+    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_gbt\",\"receipt\":0}')",
+                1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_bad\",\"receipt\":0}')",
+                0);
+    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_gbt_bad\",\"receipt\":0}')",
                 0);
     run_discard(db,
                 "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"

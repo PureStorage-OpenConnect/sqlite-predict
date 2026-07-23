@@ -78,21 +78,27 @@ honest statistical models:
 Foundation models (Chronos, TimesFM, TabPFN/TabFM) are treated as
 *teachers*, not serving paths. In benchmarking they were far too slow to
 call per query on CPU. The path to their accuracy is `distill()`: it runs
-the teacher over your training rows, fits a decision-tree student on the
-teacher's predictions, and registers that student as an inline model. The
-student is a few hundred bytes, runs in the zero-dependency core with no
-onnxruntime, serves in microseconds, and carries the same receipts.
+the teacher over your training rows, fits a student on the teacher's
+predictions, and registers that student as an inline model. The student runs
+in the zero-dependency core with no onnxruntime, serves in microseconds, and
+carries the same receipts.
 
 ```sql
 -- distill the (slow) teacher into a fast native student, once
 SELECT model_id, holdout_metric FROM distill(
   'SELECT tenure, spend, plan, churned FROM customers',
-  '{"target":"churned","student_id":"churn-v1"}');
+  '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
 
 -- then serve it per row, forever
 SELECT * FROM predict(NULL, 'SELECT id, tenure, spend, plan FROM customers',
                       '{"model":"churn-v1"}');
 ```
+
+Two student kinds: `'tree'` is a single decision tree (a few kilobytes,
+interpretable); `'gbt'` is a gradient-boosted forest (a few hundred
+kilobytes) that on the [TabArena benchmark](benchmarks/results/tabarena.md)
+matches or beats tuned XGBoost on several tasks while still running in the
+zero-dependency core.
 
 An opt-in ONNX build (`make loadable-onnx`) runs exported models through
 onnxruntime. Point `predict_register()` at a model file and call it by name;

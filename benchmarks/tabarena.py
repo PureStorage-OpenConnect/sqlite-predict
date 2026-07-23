@@ -207,14 +207,14 @@ def run_ours_knn5(Xtr, ytr, Xte, task):
     return [r[1] for r in rows]
 
 
-def run_ours_distill(Xtr, ytr, Xte, task):
+def run_ours_distill(Xtr, ytr, Xte, task, kind="tree"):
     db = _ext()
     feats = _load_tables(db, Xtr, ytr, Xte, task)
-    info = db.execute(
-        f"SELECT content_hash, holdout_metric FROM distill('SELECT {feats},"
-        f" label FROM tr', json_object('target','label','task',?,"
-        f"'student_id','s'))",
-        ("classify" if task == "cls" else "regress",)).fetchone()
+    db.execute(
+        f"SELECT content_hash FROM distill('SELECT {feats}, label FROM tr',"
+        f" json_object('target','label','task',?,'student_id','s',"
+        f"'student_kind',?))",
+        ("classify" if task == "cls" else "regress", kind)).fetchone()
     blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
@@ -275,12 +275,20 @@ def main():
             print("  knn5 fail:", str(e)[:120])
 
         try:
-            dp, blob = run_ours_distill(Xtr, ytr, Xte, task)
+            dp, blob = run_ours_distill(Xtr, ytr, Xte, task, "tree")
             rec["tree<-knn5 (ours)"] = score(yte, dp, task)
             student_bytes.append(blob)
         except Exception as e:  # noqa: BLE001
             rec["tree<-knn5 (ours)"] = float("nan")
-            print("  distill fail:", str(e)[:120])
+            print("  tree-distill fail:", str(e)[:120])
+
+        try:
+            gp, gblob = run_ours_distill(Xtr, ytr, Xte, task, "gbt")
+            rec["gbt<-knn5 (ours)"] = score(yte, gp, task)
+            student_bytes.append(gblob)
+        except Exception as e:  # noqa: BLE001
+            rec["gbt<-knn5 (ours)"] = float("nan")
+            print("  gbt-distill fail:", str(e)[:120])
 
         print("  ", {k: (round(v, 3) if isinstance(v, float) else v)
                      for k, v in rec.items()})
@@ -296,7 +304,7 @@ def _fmt(v):
 
 def _write(rows, student_bytes):
     cols = ["xgboost", "tabfm", "tree<-tabfm", "knn5 (ours)",
-            "tree<-knn5 (ours)"]
+            "tree<-knn5 (ours)", "gbt<-knn5 (ours)"]
     lines = ["# TabArena-spirit benchmark\n",
              "Curated OpenML subset, single 75/25 split (seed 0), features",
              f"capped at {MAX_FEAT}, rows capped at {MAX_ROWS}. Metric:",
