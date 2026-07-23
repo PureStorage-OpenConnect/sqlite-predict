@@ -40,6 +40,7 @@ read, so an agent can cite the number and an auditor can reproduce it.
 | `forecast(query, horizon [, options])` | Where is this metric going? | future rows with prediction intervals and per-series status |
 | `detect_anomalies(query [, options])` | Which points are abnormal? | anomaly-scored rows with expected value and probability |
 | `predict(train_query, apply_query [, options])` | Classify/regress unseen rows | a prediction and confidence per row, zero-shot from in-context examples |
+| `distill(train_query [, options])` | Compress a slow teacher into a fast student | a tiny decision-tree model, registered and ready for `predict()` |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag by re-running the recorded call against its anchored data state |
 
 `query` is any read-only `SELECT`; results are ordinary rows you can join,
@@ -76,9 +77,22 @@ honest statistical models:
 
 Foundation models (Chronos, TimesFM, TabPFN/TabFM) are treated as
 *teachers*, not serving paths. In benchmarking they were far too slow to
-call per query on CPU. The intended path for their accuracy is `distill()`,
-which compresses a teacher into a compact model that serves in
-microseconds.
+call per query on CPU. The path to their accuracy is `distill()`: it runs
+the teacher over your training rows, fits a decision-tree student on the
+teacher's predictions, and registers that student as an inline model. The
+student is a few hundred bytes, runs in the zero-dependency core with no
+onnxruntime, serves in microseconds, and carries the same receipts.
+
+```sql
+-- distill the (slow) teacher into a fast native student, once
+SELECT model_id, holdout_metric FROM distill(
+  'SELECT tenure, spend, plan, churned FROM customers',
+  '{"target":"churned","student_id":"churn-v1"}');
+
+-- then serve it per row, forever
+SELECT * FROM predict(NULL, 'SELECT id, tenure, spend, plan FROM customers',
+                      '{"model":"churn-v1"}');
+```
 
 An opt-in ONNX build (`make loadable-onnx`) runs exported models through
 onnxruntime. Point `predict_register()` at a model file and call it by name;

@@ -59,6 +59,22 @@ int main(void) {
                   1))
     goto done_fail;
 
+  /* distill a native tree student from the knn teacher, and register a
+   * deliberately corrupt tree blob, so the sanitizers cover the distill
+   * training path, the tree runtime, and the bounds-checked deserializer. */
+  if (run_discard(
+          db,
+          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          " '{\"target\":\"label\",\"student_id\":\"soak_student\"}')",
+          1) ||
+      run_discard(db,
+                  "INSERT INTO _predict_models (model_id, kind, runtime,"
+                  " weights, content_hash, license) VALUES ('soak_bad',"
+                  "'student','tree',x'505354524545303100000000','x',"
+                  "'unspecified')",
+                  1))
+    goto done_fail;
+
   for (int i = 0; i < 50; i++) {
     if (run_discard(db,
                     "SELECT * FROM forecast('SELECT ts, value FROM series',"
@@ -78,8 +94,24 @@ int main(void) {
                     "'SELECT f1, f2, label FROM tab WHERE id < 100',"
                     "'SELECT id, f1, f2 FROM tab WHERE id >= 100',"
                     " '{\"target\":\"label\"}')",
+                    1) ||
+        run_discard(db,
+                    "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_student\",\"receipt\":0}')",
                     1))
       goto done_fail;
+
+    /* tree-student + distill error paths */
+    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_bad\",\"receipt\":0}')",
+                0);
+    run_discard(db,
+                "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+                " '{\"target\":\"label\",\"student_id\":\"soak_student\"}')",
+                0);
+    run_discard(db, "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+                    " '{\"student_id\":\"nope\"}')",
+                0);
 
     /* error paths every iteration too — including every collect_series
      * failure branch, for both ops, so valgrind sees the partial-series

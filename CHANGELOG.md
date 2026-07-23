@@ -8,8 +8,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `forecast()`, `detect_anomalies()`, and `predict()` table-valued
-  functions with a trailing JSON options argument.
+- `forecast()`, `detect_anomalies()`, `predict()`, and `distill()`
+  table-valued functions with a trailing JSON options argument.
+- `distill()` compresses a teacher (any `predict()` model) into a native
+  CART decision-tree student, stored as an inline BLOB and executed by the
+  zero-dependency core with no onnxruntime. The student serves in
+  microseconds and carries the same exact-replay receipts as the stat
+  models. The tree blob is bounds-checked on read (caller-writable registry).
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`

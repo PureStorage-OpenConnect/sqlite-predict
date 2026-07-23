@@ -14,7 +14,7 @@ static void predict_version_fn(sqlite3_context *context, int argc,
   UNUSED_PARAMETER(argc);
   UNUSED_PARAMETER(argv);
   char *json = sqlite3_mprintf(
-      "{\"extension\":\"%s\",\"spec\":\"%s\",\"runtimes\":[\"stat\""
+      "{\"extension\":\"%s\",\"spec\":\"%s\",\"runtimes\":[\"stat\",\"tree\""
 #ifdef SQLITE_PREDICT_ONNX
       ",\"onnx\""
 #endif
@@ -551,5 +551,8 @@ __declspec(dllexport)
   if (rc != SQLITE_OK)
     return rc;
   rc = predict0_tabular_init(db);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = predict0_distill_init(db);
   return rc;
 }

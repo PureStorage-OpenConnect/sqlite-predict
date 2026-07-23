@@ -19,6 +19,7 @@ Source layout:
 | `predict-tabular.c` | `predict()` vtab, the in-context k-NN model, and dispatch to a runtime backend for registered models |
 | `predict-receipts.c` | model registry, receipts, canonical hashing, the logical-digest anchor, and `predict_replay()` |
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
+| `predict-distill.c` | `distill()`, the CART trainer, and the native tree-student runtime (zero-dependency core) |
 | `predict-internal.h` | shared types, contract constants, error codes, internal prototypes |
 | `vendor/sha256.c` | a self-contained FIPS 180-4 SHA-256 |
 
@@ -73,7 +74,20 @@ The receipt records the execution provider and precision, which is what
 makes GPU results honestly distinguishable from the deterministic CPU path.
 Even so, the `benchmarks/` numbers (and the TabFM→ONNX eval in
 `benchmarks/results/tabfm-onnx.md`) are why the default answer for a
-teacher's accuracy is usually distillation to a small vector student.
+teacher's accuracy is usually distillation to a small student.
+
+`distill()` (`predict-distill.c`) is that path, and it lives in the
+zero-dependency core. It runs the teacher (any `predict()` model, resolved
+by re-running `predict()` over the training rows), fits a CART decision tree
+on the teacher's predictions, evaluates it on a held-out fraction, and writes
+the tree into `_predict_models` as an inline BLOB (`runtime='tree'`,
+`kind='student'`). `predict()` dispatches a `tree` model to the native tree
+runtime in the same file, so the student runs with no onnxruntime. The blob
+format is little-endian and implementation-defined (RFC §4.2.5); it is
+rigorously bounds-checked on read, because the registry is writable by any
+SQL caller (RFC §6.2) — a hand-crafted tree blob is rejected, never crashed
+on. Because the tree is native and deterministic, a student's predictions
+carry the same exact-replay receipt as the stat models.
 
 ## Receipts, anchoring, and replay
 

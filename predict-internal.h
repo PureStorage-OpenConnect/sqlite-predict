@@ -75,6 +75,7 @@ typedef size_t usize;
 int predict0_forecast_init(sqlite3 *db);
 int predict0_receipts_init(sqlite3 *db);
 int predict0_tabular_init(sqlite3 *db);
+int predict0_distill_init(sqlite3 *db);
 
 /* ---- shared helpers (sqlite-predict.c) ---- */
 
@@ -180,6 +181,18 @@ typedef struct {
 } predict0_result;
 
 void predict0_results_free(predict0_result *rows, int n);
+
+/* Execute a native tree student (runtime='tree') from its inline-BLOB
+ * weights, over the rows of apply_sql. Fills rows/n (apply order; free with
+ * predict0_results_free) and, when opts->receipt, emits a receipt into
+ * receipt_id_out. The tree runtime lives in the zero-dependency core, so a
+ * distilled student runs with no onnxruntime. Returns SQLITE_OK or an
+ * SQLITE_ code with *errmsg set (PREDICT_ERR_* lead). */
+int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
+                      const predict0_model_row *model,
+                      const predict0_backend_opts *opts,
+                      predict0_result **rows, int *n,
+                      char receipt_id_out[PREDICT_ULID_BUFSIZE], char **errmsg);
 
 #ifdef SQLITE_PREDICT_ONNX
 /* ONNX inference for predict(). Dispatches on the model's io_spec layout:

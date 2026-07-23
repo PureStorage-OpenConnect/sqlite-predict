@@ -276,31 +276,10 @@ static sqlite3_stmt *pr_prepare(pred_cursor *cur, sqlite3 *db,
   return stmt;
 }
 
-#ifdef SQLITE_PREDICT_ONNX
-/* Dispatch to the onnx backend and adopt its results into the cursor.
- * Ownership of each result's strings is transferred (not copied) into the
- * PredRow, so the neutral array is freed without double-free. */
-static int run_onnx(pred_cursor *cur, sqlite3 *db, const char *model_id,
-                    const char *train_sql, const char *apply_sql,
-                    const predict0_model_row *m, PredOpts *opts) {
-  predict0_backend_opts bopts;
-  bopts.device = opts->device;
-  bopts.precision = opts->precision;
-  bopts.accept_license = opts->accept_license;
-  bopts.receipt = opts->receipt;
-
-  predict0_result *res = NULL;
-  int n = 0;
-  char receipt_id[PREDICT_ULID_BUFSIZE];
-  receipt_id[0] = '\0';
-  char *emsg = NULL;
-  int rc = predict0_onnx_predict(db, model_id, train_sql, apply_sql, m, &bopts,
-                                 &res, &n, receipt_id, &emsg);
-  if (rc != SQLITE_OK) {
-    sqlite3_free(cur->base.pVtab->zErrMsg);
-    cur->base.pVtab->zErrMsg = emsg; /* already PREDICT_ERR_*-prefixed */
-    return SQLITE_ERROR;
-  }
+/* Adopt a runtime backend's neutral result array into the cursor's PredRow
+ * rows, transferring string ownership so the neutral array frees cleanly. */
+static int pr_adopt(pred_cursor *cur, predict0_result *res, int n,
+                    const char *receipt_id, int receipt_on) {
   if (n > 0) {
     cur->rows = sqlite3_malloc(sizeof(PredRow) * n);
     if (!cur->rows) {
@@ -322,13 +301,63 @@ static int run_onnx(pred_cursor *cur, sqlite3 *db, const char *model_id,
     o->confidence = r->confidence;
     o->has_conf = r->has_conf;
     o->status = r->status;
-    if (opts->receipt && receipt_id[0])
-      memcpy(o->receipt_id, receipt_id, sizeof(receipt_id));
+    if (receipt_on && receipt_id && receipt_id[0])
+      memcpy(o->receipt_id, receipt_id, PREDICT_ULID_BUFSIZE);
     cur->n_rows++;
   }
   predict0_results_free(res, n);
   cur->i = 0;
   return SQLITE_OK;
+}
+
+static void backend_opts_from(predict0_backend_opts *b, PredOpts *o) {
+  b->device = o->device;
+  b->precision = o->precision;
+  b->accept_license = o->accept_license;
+  b->receipt = o->receipt;
+}
+
+/* Dispatch to the native tree student (zero-dependency core) and adopt. */
+static int run_student(pred_cursor *cur, sqlite3 *db, const char *model_id,
+                       const char *apply_sql, const predict0_model_row *m,
+                       PredOpts *opts) {
+  predict0_backend_opts bopts;
+  backend_opts_from(&bopts, opts);
+  predict0_result *res = NULL;
+  int n = 0;
+  char receipt_id[PREDICT_ULID_BUFSIZE];
+  receipt_id[0] = '\0';
+  char *emsg = NULL;
+  int rc = predict0_tree_run(db, model_id, apply_sql, m, &bopts, &res, &n,
+                             receipt_id, &emsg);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(cur->base.pVtab->zErrMsg);
+    cur->base.pVtab->zErrMsg = emsg;
+    return SQLITE_ERROR;
+  }
+  return pr_adopt(cur, res, n, receipt_id, opts->receipt);
+}
+
+#ifdef SQLITE_PREDICT_ONNX
+/* Dispatch to the onnx backend and adopt its results into the cursor. */
+static int run_onnx(pred_cursor *cur, sqlite3 *db, const char *model_id,
+                    const char *train_sql, const char *apply_sql,
+                    const predict0_model_row *m, PredOpts *opts) {
+  predict0_backend_opts bopts;
+  backend_opts_from(&bopts, opts);
+  predict0_result *res = NULL;
+  int n = 0;
+  char receipt_id[PREDICT_ULID_BUFSIZE];
+  receipt_id[0] = '\0';
+  char *emsg = NULL;
+  int rc = predict0_onnx_predict(db, model_id, train_sql, apply_sql, m, &bopts,
+                                 &res, &n, receipt_id, &emsg);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(cur->base.pVtab->zErrMsg);
+    cur->base.pVtab->zErrMsg = emsg; /* already PREDICT_ERR_*-prefixed */
+    return SQLITE_ERROR;
+  }
+  return pr_adopt(cur, res, n, receipt_id, opts->receipt);
 }
 #endif
 
@@ -386,7 +415,9 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       pred_opts_free(&opts);
       return rc;
     }
-    if (m.runtime && strcmp(m.runtime, "onnx") == 0) {
+    if (m.runtime && strcmp(m.runtime, "tree") == 0) {
+      rc = run_student(cur, db, model_id, apply_sql, &m, &opts);
+    } else if (m.runtime && strcmp(m.runtime, "onnx") == 0) {
 #ifdef SQLITE_PREDICT_ONNX
       rc = run_onnx(cur, db, model_id, train_sql, apply_sql, &m, &opts);
 #else
