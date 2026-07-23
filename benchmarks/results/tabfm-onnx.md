@@ -49,30 +49,52 @@ transform, outlier handling) and expanded into an *ensemble* of views whose
 outputs are blended. None of that preprocessing or ensembling can live
 inside a SQL extension.
 
-## It does not export cleanly to ONNX
+## Exporting it takes work, but it does run
 
-1. **Out of the box: fails.** The torch→ONNX translator cannot convert
-   `aten.repeat_interleave` when called with no `dim` (the model's
-   `train_size.repeat_interleave(hc)` in `RowInteraction`):
-   `NotImplementedError: No conversion available yet when dim is None`.
-2. **With a one-line patch** (`dim=0`, identical for a 1-D tensor) the graph
-   captures and exports in ~36 s, but the patched op leaves shape-rank
-   inconsistencies (`[1,6]` vs `[6]`) that surface as onnxruntime
-   shape-merge warnings and a broken run. A correct export needs real model
-   edits, not a monkeypatch.
-3. **Size.** At 1.64B params, fp32 weights are ~6.5 GB, past ONNX's 2 GB
-   single-file protobuf limit. A self-contained `.onnx` is impossible;
-   it must use external-data format (graph + a separate weights blob), which
-   neither the inline-BLOB student path nor a single-file `weights_uri`
-   assumes. Quantization would be needed to get near a servable size.
+Getting a loadable ONNX out of TabFM took two fixes, both reproduced in
+`benchmarks/tabfm_onnx_external.py`:
+
+1. **One unexportable op.** The torch→ONNX translator cannot convert
+   `aten.repeat_interleave` with no `dim` (the model's
+   `train_size.repeat_interleave(hc)` in `ColEmbedding`, model.py:353):
+   `NotImplementedError: No conversion available yet when dim is None`. A
+   naive `dim=0` exports but leaves `ts`'s shape metadata inconsistent, so
+   onnxruntime rejects the downstream `arange < ts` with a `Less`
+   `[ShapeInferenceError] Incompatible dimensions`. Rewriting that one call
+   as `view(-1,1).expand(-1,hc).reshape(-1)` (identical values, clean
+   `Expand`+`Reshape` shape inference) fixes it. It is a one-line model edit,
+   not something the extension can do.
+2. **External-data format.** At 1.64B params, fp32 weights are ~6.5 GB, past
+   ONNX's 2 GB single-file protobuf limit. A self-contained `.onnx` is
+   impossible; the export splits into an 8.5 MB graph plus a 6.56 GB external
+   weights blob. Neither the inline-BLOB student path nor a single-file
+   `weights_uri` assumes that split.
+
+With both fixes, the full model runs in onnxruntime and is numerically
+faithful:
+
+| thing | value |
+| --- | --- |
+| export (dynamo, external data) | ~35 s |
+| graph / external data | 8.5 MB / 6.56 GB |
+| onnxruntime session load | ~13 s (one-time) |
+| forward (CPU, fp32, 1 ensemble member) | 798 ms |
+| max &#124;pytorch − onnx&#124; logit diff | 1.3e-2 |
+| query-label agreement pytorch vs onnx | **100%** |
+
+The ~0.01 logit gap is ordinary cross-runtime float variance from operator
+fusion; every prediction is identical, so this is not the silent MPS-style
+divergence. The 798 ms is one ensemble member on a 150-row context; the full
+`TabFMClassifier` ensemble is still the tens-of-seconds figure.
 
 ## Verdict
 
-Serving TabFM *directly* through the extension would require, at minimum:
-model-code patches to export at all, an external-data ONNX over 2 GB, an
-`io_spec` expanded with `train_size`/`cat_mask`/`d` (or a wrapper graph that
-internalizes the packing), and the sklearn preprocessing + ensemble pushed
-into SQL or the graph. That is a large amount of work to serve a model that
+TabFM *can* be exported to ONNX and runs faithfully, but serving it directly
+through the extension would still require: a one-line model patch to export,
+an external-data ONNX over 2 GB, an `io_spec` expanded with
+`train_size`/`cat_mask`/`d` (or a wrapper graph that internalizes the
+packing), and the sklearn preprocessing + ensemble pushed into SQL or the
+graph. That is a large amount of work and machinery to serve a model that
 still costs tens of seconds per call.
 
 This is exactly the case the RFC's teacher/student split was built for. The

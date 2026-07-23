@@ -59,8 +59,10 @@ as opt-in teachers (ONNX build), never default serving.
   the distillation results mean the FM path is distill()-first; a GGML
   or ONNX teacher build is about batch distillation, not serving. The
   ONNX serving path shipped (vector + in_context layouts, CPU); the
-  TabFM→ONNX eval (`results/tabfm-onnx.md`) then confirmed TabFM itself
-  is not directly servable through it: it fails to export out of the box
+  TabFM→ONNX eval (`results/tabfm-onnx.md`) then characterized TabFM itself.
+  It can be exported and run (one-line model patch + external-data format,
+  ~798 ms/forward, 100% label agreement with PyTorch; see the results doc)
+  but is not directly servable: the patch is upstream model surgery
   (`repeat_interleave` with no `dim`), its fp32 weights (~6.5 GB) exceed
   ONNX's 2 GB single-file limit, and its packed signature +
   quantile/ensemble preprocessing do not fit the `in_context` contract.
