@@ -161,6 +161,7 @@ fuzz-docker:
 # which would wipe the host's dist/ through the bind mount.
 test-valgrind: vendor/sqlite3ext.h sqlite-predict.h
 	docker run --rm -v $$(pwd):/src -w /src gcc:13 bash -c "\
+	  mkdir -p dist && \
 	  apt-get update -qq && apt-get install -y -qq valgrind > /dev/null && \
 	  gcc -std=c99 -g -O0 -Ivendor/ -I./ -DSQLITE_CORE -DSQLITE_PREDICT_STATIC \
 	    tests/soak.c $(OBJS) vendor/sqlite3.c -o dist/soak-linux -lm -lpthread -ldl && \
