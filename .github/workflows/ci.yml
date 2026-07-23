@@ -64,8 +64,8 @@ jobs:
             -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -DSQLITE_STRICT_SUBTYPE=1 \
             -Ivendor/ -I./ \
             fuzz/fuzz_predict.c sqlite-predict.c predict-forecast.c \
-            predict-tabular.c predict-receipts.c vendor/sha256.c \
-            vendor/sqlite3.c -o fuzz_predict -lm -lpthread -ldl
+            predict-tabular.c predict-receipts.c predict-distill.c \
+            vendor/sha256.c vendor/sqlite3.c -o fuzz_predict -lm -lpthread -ldl
           ./fuzz_predict -max_total_time=60 -max_len=512 fuzz/seeds
 
   windows:
