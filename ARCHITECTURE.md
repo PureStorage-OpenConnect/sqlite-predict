@@ -87,9 +87,10 @@ column, which is how a 30-second TabFM run becomes a microsecond student. A
 re-runs over the rows (aligned by row number) to relabel them first — the way
 to compress the in-context knn5 into a standalone tree.
 
-Two `student_kind`s share the CART trainer. `'tree'` is a single depth-8
-tree. `'gbt'` is a gradient-boosted forest of shallow trees, and it is the
-one to reach for when accuracy matters: it fits each tree to the loss
+Three `student_kind`s exist. `'tree'` and `'gbt'` share the CART trainer;
+`'tree'` is a single depth-8 tree. `'gbt'` is a gradient-boosted forest of
+shallow trees, and it is the go-to when accuracy matters: it fits each tree to
+the loss
 gradient but sets each leaf to the **second-order (Newton) step**
 `Σg / (Σh + λ)` using the softmax Hessian — the same thing that lifts
 XGBoost above a vanilla gradient booster — with shrinkage (a small learning
@@ -100,11 +101,17 @@ the student stays reproducible and exactly replayable. Given `proba` and
 distribution (soft-label distillation): the softmax cross-entropy target
 becomes the teacher's probability rather than a hard one-hot, so the student
 inherits a foundation model's calibration instead of only its argmax, while
-the holdout is still scored against the true `target` labels. `predict()` dispatches
+the holdout is still scored against the true `target` labels. `'mlp'` is the
+third kind: a one-hidden-layer softmax net (classification only) trained with
+deterministic full-batch Adam, for warped boundaries an axis-aligned tree
+ensemble cannot render however good the targets are. It also consumes soft
+targets, so a smooth student learns a smooth teacher's distribution directly.
+`predict()` dispatches
 a `tree`-runtime model to the native runtime in the same file, which tells a
-single tree (`PSTREE` blob) from a forest (`PSGBT` blob) by magic and needs
-no onnxruntime. Both blob formats are little-endian and normatively specified
-and versioned (RFC §4.1.6, `PSTREE01` / `PSGBT01`), so a stored student stays
+single tree (`PSTREE` blob) from a forest (`PSGBT` blob) from a net (`PSMLP`
+blob) by magic and needs
+no onnxruntime. The blob formats are little-endian and normatively specified
+and versioned (RFC §4.1.6, `PSTREE01` / `PSGBT01` / `PSMLP01`), so a stored student stays
 servable across upgrades, snapshots, and forks, and a serving-only module can
 execute a blob it never trained. They are rigorously bounds-checked on read,
 because the registry is

@@ -103,11 +103,13 @@ Pass a `teacher` to instead relabel the rows with a registered model first
 (for example, `'{"teacher":"knn5-incontext", ...}'` compresses the in-context
 k-NN into a standalone tree).
 
-Two student kinds: `'tree'` is a single decision tree (a few kilobytes,
+Three student kinds: `'tree'` is a single decision tree (a few kilobytes,
 interpretable); `'gbt'` is a gradient-boosted forest with second-order
 (Newton) leaves that on the [TabArena benchmark](benchmarks/results/tabarena-full.md)
-matches or beats tuned XGBoost on most tasks while still running in the
-zero-dependency core.
+matches or beats tuned XGBoost on most tasks; `'mlp'` is a one-hidden-layer
+neural net (classification only) for boundaries an axis-aligned tree ensemble
+renders poorly. All three run in the zero-dependency core, are deterministic,
+and replay exactly.
 
 When the teacher gives calibrated probabilities (as a foundation model does),
 distill its whole distribution instead of its hard label with `proba` and

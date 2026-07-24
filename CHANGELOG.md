@@ -18,8 +18,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   relabel the rows first (e.g. compress the in-context knn5 into a tree).
   `student_kind='tree'` is a single CART; `'gbt'` is a gradient-boosted forest
   with second-order (Newton) leaves that matches or beats tuned XGBoost on most
-  tasks (see `benchmarks/results/tabarena-full.md`). With `proba` and `classes`
-  the gbt student distills the teacher's full probability distribution
+  tasks (see `benchmarks/results/tabarena-full.md`); `'mlp'` is a
+  one-hidden-layer neural net (classification only) for boundaries an
+  axis-aligned tree ensemble renders poorly. With `proba` and `classes` the
+  gbt and mlp students distill the teacher's full probability distribution
   (soft-label distillation) instead of its hard argmax, preserving the
   calibration a foundation-model teacher provides. Both serve in microseconds,
   are deterministic, and carry the same exact-replay receipts as the stat

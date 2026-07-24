@@ -246,11 +246,11 @@ def run_ours_distill_teacher(Xtr, teacher_tr, Xte, task, kind="gbt"):
     return [r[1] for r in rows], blob
 
 
-def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte):
-    """Soft-label distillation of TabFM: the student learns TabFM's per-class
-    probability distribution (predict_proba) via the extension's proba/classes
-    options, instead of its hard argmax. The true labels stay in `label` so the
-    holdout is scored against ground truth."""
+def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte, kind="gbt"):
+    """Soft-label distillation of TabFM: the student (gbt or mlp) learns TabFM's
+    per-class probability distribution (predict_proba) via the extension's
+    proba/classes options, instead of its hard argmax. The true labels stay in
+    `label` so the holdout is scored against ground truth."""
     import json
     db = _ext()
     k, K = Xtr.shape[1], proba.shape[1]
@@ -269,9 +269,9 @@ def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte):
     db.execute(
         f"SELECT content_hash FROM distill('SELECT {fl}, {pl}, label FROM tr',"
         f" json_object('target','label','proba',json(?),'classes',json(?),"
-        f"'student_id','s'))",
+        f"'student_kind',?,'student_id','s'))",
         (json.dumps([f"p{j}" for j in range(K)]),
-         json.dumps([str(c) for c in classes])))
+         json.dumps([str(c) for c in classes]), kind))
     blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
@@ -280,6 +280,35 @@ def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte):
     ).fetchall()
     db.close()
     return [r[1] for r in rows], blob
+
+
+def meta_features(Xtr, ytr, Xte, yte):
+    """Cheap dataset descriptors to test whether the mlp-vs-gbt winner is
+    predictable: a linearity gap (tree vs logistic regression) and an
+    axis-alignment gain (does rotating the features with PCA help a shallow
+    tree -> the boundary is oblique -> smooth-model-favorable)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import accuracy_score
+    m = {}
+    try:
+        lr = LogisticRegression(max_iter=300, n_jobs=1)
+        lr.fit(Xtr.values, ytr)
+        m["mf_logreg"] = accuracy_score(yte, lr.predict(Xte.values))
+    except Exception:  # noqa: BLE001
+        m["mf_logreg"] = float("nan")
+    try:
+        t = DecisionTreeClassifier(max_depth=4, random_state=SEED)
+        t.fit(Xtr.values, ytr)
+        m["mf_tree4"] = accuracy_score(yte, t.predict(Xte.values))
+        p = PCA(random_state=SEED).fit(Xtr.values)
+        tr = DecisionTreeClassifier(max_depth=4, random_state=SEED)
+        tr.fit(p.transform(Xtr.values), ytr)
+        m["mf_tree4_pca"] = accuracy_score(yte, tr.predict(p.transform(Xte.values)))
+    except Exception:  # noqa: BLE001
+        m["mf_tree4"] = m["mf_tree4_pca"] = float("nan")
+    return m
 
 
 def run_ours_knn5(Xtr, ytr, Xte, task):
@@ -373,15 +402,28 @@ def main():
             rec["gbt<-tabfm (ours)"] = score(yte, gtp, task)
             student_bytes.append(gtblob)
             if task == "cls":  # soft-label distillation of TabFM's distribution
-                sp, sblob = run_ours_distill_soft(Xtr, ytr, proba, classes, Xte)
+                sp, sblob = run_ours_distill_soft(Xtr, ytr, proba, classes, Xte,
+                                                  "gbt")
                 rec["gbt<-tabfm soft (ours)"] = score(yte, sp, task)
                 student_bytes.append(sblob)
+                # the smooth student on the same soft targets (#3)
+                mp, mblob = run_ours_distill_soft(Xtr, ytr, proba, classes, Xte,
+                                                  "mlp")
+                rec["mlp<-tabfm soft (ours)"] = score(yte, mp, task)
+                student_bytes.append(mblob)
         except Exception as e:  # noqa: BLE001
             rec["tabfm"] = rec["tree<-tabfm"] = float("nan")
             rec["gbt<-tabfm (ours)"] = float("nan")
             rec["gbt<-tabfm soft (ours)"] = float("nan")
+            rec["mlp<-tabfm soft (ours)"] = float("nan")
             rec["tabfm_s"] = float("nan")
             print("  tabfm fail:", type(e).__name__, str(e)[:120])
+
+        if task == "cls":  # dataset descriptors for meta-selection analysis
+            try:
+                rec.update(meta_features(Xtr, ytr, Xte, yte))
+            except Exception as e:  # noqa: BLE001
+                print("  meta fail:", str(e)[:80])
 
         try:
             rec["knn5 (ours)"] = score(yte, run_ours_knn5(Xtr, ytr, Xte, task),
@@ -423,8 +465,8 @@ def _fmt(v):
 
 def _write(rows, student_bytes):
     cols = ["xgboost", "tabfm", "tree<-tabfm", "gbt<-tabfm (ours)",
-            "gbt<-tabfm soft (ours)", "knn5 (ours)", "tree<-knn5 (ours)",
-            "gbt<-knn5 (ours)"]
+            "gbt<-tabfm soft (ours)", "mlp<-tabfm soft (ours)", "knn5 (ours)",
+            "tree<-knn5 (ours)", "gbt<-knn5 (ours)"]
     lines = ["# TabArena-spirit benchmark\n",
              "Curated OpenML subset, single 75/25 split (seed 0), features",
              f"capped at {MAX_FEAT}, rows capped at {MAX_ROWS}. Metric:",
