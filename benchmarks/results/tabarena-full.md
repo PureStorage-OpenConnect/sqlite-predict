@@ -148,11 +148,48 @@ test whether the mlp-vs-gbt winner is predictable. It is not: the datasets
 where the mlp wins and where the gbt wins have nearly identical descriptors
 (axis-alignment gain −0.022 vs −0.029, linearity gap +0.032 vs +0.031,
 dimensionality 23 vs 24). The affinity is real but not classifiable from these
-features. This is the honest answer to "which student for this data": because
-the students distill in microseconds, the reliable move is to fit all of them
-and keep the one with the best held-out accuracy, not to predict the winner
-from meta-features. Empirical selection beats meta-prediction when the
-candidates are nearly free.
+features. Because the students distill in microseconds, the reliable move is
+not to predict the winner from meta-features but to fit all of them and select
+after the fact. The question that leaves is: select on *what*, when you have no
+test labels?
+
+## Selecting a student without labels
+
+The whole point of distilling on a local database is that you usually will not
+have ground truth for the rows you are about to predict. So the practical
+question is not "which student is best" (the oracle needs labels) but "can you
+*pick* the best student without them." The only thing measurable in that
+regime is **fidelity**: how often a student reproduces the teacher's prediction
+on the (unlabeled) rows you are about to score. We selected the highest-fidelity
+of the three TabFM students per dataset and used the true labels *only as the
+judge*.
+
+| selector | recovers the accuracy-best | mean test acc | gap to oracle |
+| --- | --- | --- | --- |
+| **fidelity to TabFM (no labels)** | **27/35 (77%)** | 0.861 | **+0.003** |
+| holdout accuracy (small labeled probe) | 20/35 (57%) | 0.857 | +0.006 |
+| always gbt (soft) | — | 0.857 | +0.007 |
+| always mlp (soft) | — | 0.844 | +0.020 |
+
+Two findings, both honest and both useful:
+
+**Label-free selection works.** Picking the student that best mimics TabFM on
+the unlabeled rows recovers the accuracy-best student 77% of the time and lands
+**0.3 points** below an oracle that peeked at the answers, beating every fixed
+single-student strategy. Student selection, given a teacher, does not need
+ground truth.
+
+**And fidelity beats a small labeled probe.** The no-label selector is
+*better* than holdout accuracy (77% vs 57% recovery), because fidelity is
+measured over the full 1500-row unlabeled set while the labeled holdout is a
+noisy ~250-row split of the training data. More data, less noise, and you are
+choosing the best approximation of a strong teacher, which really is the most
+accurate one most of the time.
+
+The boundary this does not cross: fidelity selects the best approximation of
+the *teacher*, so it inherits the teacher's mistakes and will confidently pick
+the student that best reproduces a wrong teacher. *Student* selection is solved
+label-free; *teacher* selection still needs truth or a prior.
 
 ## Caveats
 

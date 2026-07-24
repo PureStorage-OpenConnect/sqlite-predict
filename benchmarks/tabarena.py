@@ -47,6 +47,10 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 CKPT = os.path.expanduser("~/.cache/sqlite-predict/tabfm")
+# Local cache of TabFM's per-dataset outputs (non-committed: TabFM predictions
+# are a non-commercial derivative). Makes the long run crash-resilient and
+# lets the student-selection analysis re-run without re-invoking TabFM.
+TABFM_CACHE = os.path.expanduser("~/.cache/sqlite-predict/tabfm-cache")
 EXT = os.path.join(os.path.dirname(__file__), "..", "dist", "predict0")
 RESULTS = os.path.join(os.path.dirname(__file__), "results", "tabarena.md")
 MAX_ROWS, MAX_FEAT, SEED = 1500, 40, 0
@@ -231,11 +235,11 @@ def run_ours_distill_teacher(Xtr, teacher_tr, Xte, task, kind="gbt"):
     onnxruntime, no TabFM at serve time."""
     db = _ext()
     feats = _load_tables(db, Xtr, pd.Series(teacher_tr), Xte, task)
-    db.execute(
-        f"SELECT content_hash FROM distill('SELECT {feats}, label FROM tr',"
+    hold = db.execute(
+        f"SELECT holdout_metric FROM distill('SELECT {feats}, label FROM tr',"
         f" json_object('target','label','task',?,"
         f"'student_id','s','student_kind',?))",
-        ("classify" if task == "cls" else "regress", kind)).fetchone()
+        ("classify" if task == "cls" else "regress", kind)).fetchone()[0]
     blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
@@ -243,7 +247,7 @@ def run_ours_distill_teacher(Xtr, teacher_tr, Xte, task, kind="gbt"):
         f" FROM te', json_object('model','s','receipt',0)) ORDER BY row_ref"
     ).fetchall()
     db.close()
-    return [r[1] for r in rows], blob
+    return [r[1] for r in rows], blob, hold
 
 
 def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte, kind="gbt"):
@@ -266,12 +270,12 @@ def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte, kind="gbt"):
                    [[i] + list(map(float, r)) for i, r in enumerate(Xte.values)])
     fl = ", ".join(f"f{i}" for i in range(k))
     pl = ", ".join(f"p{j}" for j in range(K))
-    db.execute(
-        f"SELECT content_hash FROM distill('SELECT {fl}, {pl}, label FROM tr',"
-        f" json_object('target','label','proba',json(?),'classes',json(?),"
+    hold = db.execute(
+        f"SELECT holdout_metric FROM distill('SELECT {fl}, {pl}, label FROM"
+        f" tr', json_object('target','label','proba',json(?),'classes',json(?),"
         f"'student_kind',?,'student_id','s'))",
         (json.dumps([f"p{j}" for j in range(K)]),
-         json.dumps([str(c) for c in classes]), kind))
+         json.dumps([str(c) for c in classes]), kind)).fetchone()[0]
     blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
@@ -279,7 +283,16 @@ def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte, kind="gbt"):
         f" te', json_object('model','s','receipt',0)) ORDER BY row_ref"
     ).fetchall()
     db.close()
-    return [r[1] for r in rows], blob
+    return [r[1] for r in rows], blob, hold
+
+
+def fidelity(student_preds, teacher_preds):
+    """Label-free selection signal: fraction of held-out rows where the student
+    reproduces the teacher's prediction. This is all you can measure without
+    ground truth."""
+    s = np.asarray(student_preds).astype(str)
+    t = np.asarray(teacher_preds).astype(str)
+    return float((s == t).mean())
 
 
 def meta_features(Xtr, ytr, Xte, yte):
@@ -328,11 +341,11 @@ def run_ours_distill(Xtr, ytr, Xte, task, kind="tree"):
     explicitly: distill() re-runs knn5 over the rows to relabel them)."""
     db = _ext()
     feats = _load_tables(db, Xtr, ytr, Xte, task)
-    db.execute(
-        f"SELECT content_hash FROM distill('SELECT {feats}, label FROM tr',"
+    hold = db.execute(
+        f"SELECT holdout_metric FROM distill('SELECT {feats}, label FROM tr',"
         f" json_object('target','label','task',?,'teacher','knn5-incontext',"
         f"'student_id','s','student_kind',?))",
-        ("classify" if task == "cls" else "regress", kind)).fetchone()
+        ("classify" if task == "cls" else "regress", kind)).fetchone()[0]
     blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
@@ -340,7 +353,7 @@ def run_ours_distill(Xtr, ytr, Xte, task, kind="tree"):
         f" FROM te', json_object('model','s','receipt',0)) ORDER BY row_ref"
     ).fetchall()
     db.close()
-    return [r[1] for r in rows], blob
+    return [r[1] for r in rows], blob, hold
 
 
 # ---- driver ----
@@ -380,37 +393,56 @@ def main():
             print("  xgb fail:", e)
 
         try:
-            t0 = time.time()
-            tabfm_p, est = run_tabfm(Xtr, ytr, Xte, task)
-            rec["tabfm"] = score(yte, tabfm_p, task)
-            rec["tabfm_s"] = time.time() - t0
-            # teacher train predictions -> distilled students. For
-            # classification, one predict_proba pass gives both the hard argmax
-            # (tree<-tabfm, gbt<-tabfm) and the soft distribution (no extra
-            # TabFM forward).
-            if task == "cls":
-                proba = est.predict_proba(Xtr.values)
-                classes = list(est.classes_)
-                teacher_tr = np.asarray(classes)[proba.argmax(1)]
+            import pickle
+            cp = os.path.join(TABFM_CACHE, f"{name}.pkl")
+            if os.path.exists(cp):  # TabFM outputs cached from a prior run
+                with open(cp, "rb") as fh:
+                    cd = pickle.load(fh)
+                tabfm_p, proba, classes, teacher_tr = (
+                    cd["test"], cd["proba"], cd["classes"], cd["train"])
+                rec["tabfm"] = score(yte, tabfm_p, task)
+                rec["tabfm_s"] = 0.0
             else:
-                proba = classes = None
-                teacher_tr = est.predict(Xtr.values)
+                # one predict_proba pass gives both the hard argmax and the soft
+                # distribution (no extra TabFM forward)
+                t0 = time.time()
+                tabfm_p, est = run_tabfm(Xtr, ytr, Xte, task)
+                rec["tabfm"] = score(yte, tabfm_p, task)
+                rec["tabfm_s"] = time.time() - t0
+                if task == "cls":
+                    proba = est.predict_proba(Xtr.values)
+                    classes = list(est.classes_)
+                    teacher_tr = np.asarray(classes)[proba.argmax(1)]
+                else:
+                    proba = classes = None
+                    teacher_tr = est.predict(Xtr.values)
+                os.makedirs(TABFM_CACHE, exist_ok=True)
+                with open(cp, "wb") as fh:
+                    pickle.dump({"test": tabfm_p, "proba": proba,
+                                 "classes": classes, "train": teacher_tr}, fh)
             tree_p = sklearn_tree(Xtr, teacher_tr, Xte, task)
             rec["tree<-tabfm"] = score(yte, tree_p, task)
-            gtp, gtblob = run_ours_distill_teacher(Xtr, teacher_tr, Xte, task,
-                                                   "gbt")
+            gtp, gtblob, gth = run_ours_distill_teacher(Xtr, teacher_tr, Xte,
+                                                        task, "gbt")
             rec["gbt<-tabfm (ours)"] = score(yte, gtp, task)
+            rec["gbt<-tabfm hold"] = gth
             student_bytes.append(gtblob)
             if task == "cls":  # soft-label distillation of TabFM's distribution
-                sp, sblob = run_ours_distill_soft(Xtr, ytr, proba, classes, Xte,
-                                                  "gbt")
+                sp, sblob, sh = run_ours_distill_soft(Xtr, ytr, proba, classes,
+                                                      Xte, "gbt")
                 rec["gbt<-tabfm soft (ours)"] = score(yte, sp, task)
+                rec["gbt<-tabfm soft hold"] = sh
                 student_bytes.append(sblob)
-                # the smooth student on the same soft targets (#3)
-                mp, mblob = run_ours_distill_soft(Xtr, ytr, proba, classes, Xte,
-                                                  "mlp")
+                mp, mblob, mh = run_ours_distill_soft(Xtr, ytr, proba, classes,
+                                                      Xte, "mlp")  # smooth (#3)
                 rec["mlp<-tabfm soft (ours)"] = score(yte, mp, task)
+                rec["mlp<-tabfm soft hold"] = mh
                 student_bytes.append(mblob)
+                # label-free selection signal: each student's fidelity to
+                # TabFM's held-out predictions (no ground truth used)
+                rec["gbt<-tabfm fid"] = fidelity(gtp, tabfm_p)
+                rec["gbt<-tabfm soft fid"] = fidelity(sp, tabfm_p)
+                rec["mlp<-tabfm soft fid"] = fidelity(mp, tabfm_p)
         except Exception as e:  # noqa: BLE001
             rec["tabfm"] = rec["tree<-tabfm"] = float("nan")
             rec["gbt<-tabfm (ours)"] = float("nan")
@@ -433,16 +465,18 @@ def main():
             print("  knn5 fail:", str(e)[:120])
 
         try:
-            dp, blob = run_ours_distill(Xtr, ytr, Xte, task, "tree")
+            dp, blob, dh = run_ours_distill(Xtr, ytr, Xte, task, "tree")
             rec["tree<-knn5 (ours)"] = score(yte, dp, task)
+            rec["tree<-knn5 hold"] = dh
             student_bytes.append(blob)
         except Exception as e:  # noqa: BLE001
             rec["tree<-knn5 (ours)"] = float("nan")
             print("  tree-distill fail:", str(e)[:120])
 
         try:
-            gp, gblob = run_ours_distill(Xtr, ytr, Xte, task, "gbt")
+            gp, gblob, gh = run_ours_distill(Xtr, ytr, Xte, task, "gbt")
             rec["gbt<-knn5 (ours)"] = score(yte, gp, task)
+            rec["gbt<-knn5 hold"] = gh
             student_bytes.append(gblob)
         except Exception as e:  # noqa: BLE001
             rec["gbt<-knn5 (ours)"] = float("nan")
