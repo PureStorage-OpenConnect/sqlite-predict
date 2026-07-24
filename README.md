@@ -75,12 +75,15 @@ honest statistical models:
   `forecast()` / `detect_anomalies()`
 - `knn5-incontext` (z-scored 5-NN) for `predict()`
 
-Foundation models (Chronos, TimesFM, TabPFN/TabFM) are treated as
-*teachers*, not serving paths. In benchmarking they were far too slow to
-call per query on CPU. The path to their accuracy is `distill()`, which
-trains a small native student and registers it as an inline model. The
-student runs in the zero-dependency core with no onnxruntime, serves in
-microseconds, and carries the same receipts.
+Foundation models are treated as *teachers*, not serving paths: in
+benchmarking they were far too slow to call per query on CPU. The path to
+their accuracy is `distill()`, which trains a small native student and
+registers it as an inline model that runs in the zero-dependency core with no
+onnxruntime, serves in microseconds, and carries the same receipts. So far the
+tabular teacher we distill and benchmark is **TabFM** (see
+[`benchmarks/results/tabarena-full.md`](benchmarks/results/tabarena-full.md));
+on the time-series side **Chronos** is a reference comparison, and distilling a
+forecast foundation model is future work.
 
 By default `distill()` trains directly on the target column. That column can
 hold your labels, or a strong teacher's predictions computed offline: run
@@ -225,8 +228,10 @@ without additional terms.
 
 Structure and spirit follow Alex Garcia's
 [`sqlite-vec`](https://github.com/asg017/sqlite-vec). Built on
-[SQLite](https://sqlite.org). Benchmarks compare against
-[Chronos](https://github.com/amazon-science/chronos-forecasting) and
-[TabPFN](https://github.com/PriorLabs/TabPFN)/TabFM.
+[SQLite](https://sqlite.org). Benchmarks distill and compare against Google's
+TabFM (tabular) and compare against
+[Chronos](https://github.com/amazon-science/chronos-forecasting) (time series);
+the [TabPFN](https://github.com/PriorLabs/TabPFN) line is the intellectual
+lineage for in-context tabular models.
 
 [tvf]: https://www.sqlite.org/vtab.html#tabfunc2
