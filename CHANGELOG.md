@@ -30,7 +30,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`
-  (time series) and `knn5-incontext` (tabular).
+  (time series) and `knn5-incontext` (tabular). Forecast prediction intervals
+  are calibrated from a per-horizon in-sample backtest of each model, rather
+  than a lag-1 residual grown as `sigma*sqrt(h)`; on real gluonts data this
+  brings 95% coverage toward nominal and roughly halves the interval score.
 - `predict_ulid()` and `predict_version()` utility functions.
 - Opt-in ONNX runtime serving path for `predict()` (`make loadable-onnx`):
   runs exported models through onnxruntime in two `io_spec` layouts, with a

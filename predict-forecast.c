@@ -92,20 +92,11 @@ static int detect_period(const f64 *y, int n) {
 }
 
 /* Seasonal naive with drift. Baseline floor: repeat last season (or last
- * value) plus the global drift. sigma_1 from one-step naive residuals. */
+ * value) plus the global drift. */
 static void model_seasonal_naive(const f64 *y, int n, int horizon, f64 *fc,
                                  f64 *sigma) {
   int p = detect_period(y, n);
   f64 drift = n > 1 ? (y[n - 1] - y[0]) / (n - 1) : 0;
-
-  f64 ss = 0;
-  int m = 0;
-  for (int i = 1; i < n; i++) {
-    f64 r = y[i] - y[i - 1];
-    ss += r * r;
-    m++;
-  }
-  f64 sigma1 = m > 0 ? sqrt(ss / m) : 0;
 
   for (int h = 1; h <= horizon; h++) {
     f64 base;
@@ -119,8 +110,65 @@ static void model_seasonal_naive(const f64 *y, int n, int horizon, f64 *fc,
       gap = h;
     }
     fc[h - 1] = base + drift * (f64)gap;
-    sigma[h - 1] = sigma1 * sqrt((f64)h);
   }
+
+  /* Per-horizon sigma from an in-sample backtest of this exact forecast:
+   * for each past origin, forecast h steps ahead and record the error, then
+   * take the RMS per h. This calibrates the interval to the model's real
+   * h-step error, with no lag-1-vs-seasonal scale confusion and no random-walk
+   * sqrt(h) growth assumption (both of which made the old intervals too wide
+   * on seasonal data). Falls back to lag-1 * sqrt(h) only on OOM. */
+  f64 *ss = sqlite3_malloc(sizeof(f64) * horizon);
+  int *cnt = sqlite3_malloc(sizeof(int) * horizon);
+  if (ss && cnt) {
+    for (int h = 0; h < horizon; h++) {
+      ss[h] = 0;
+      cnt[h] = 0;
+    }
+    int t0 = p > 0 ? p : 1;
+    for (int t = t0; t < n; t++) { /* history y[0..t-1], forecast y[t..] */
+      f64 dr = t > 1 ? (y[t - 1] - y[0]) / (t - 1) : 0;
+      for (int h = 1; h <= horizon && t - 1 + h < n; h++) {
+        f64 base;
+        i64 gap;
+        if (p > 0 && t >= p) {
+          int bi = t - p + ((h - 1) % p);
+          base = y[bi];
+          gap = (t - 1 + h) - bi;
+        } else {
+          base = y[t - 1];
+          gap = h;
+        }
+        f64 e = y[t - 1 + h] - (base + dr * (f64)gap);
+        ss[h - 1] += e * e;
+        cnt[h - 1]++;
+      }
+    }
+    f64 fb = 0; /* lag-1 fallback scale for thin horizons */
+    int fm = 0;
+    for (int i = 1; i < n; i++) {
+      f64 r = y[i] - y[i - 1];
+      fb += r * r;
+      fm++;
+    }
+    fb = fm > 0 ? sqrt(fb / fm) : 0;
+    for (int h = 1; h <= horizon; h++)
+      sigma[h - 1] =
+          cnt[h - 1] >= 2 ? sqrt(ss[h - 1] / cnt[h - 1]) : fb * sqrt((f64)h);
+  } else {
+    f64 s2 = 0;
+    int m = 0;
+    for (int i = 1; i < n; i++) {
+      f64 r = y[i] - y[i - 1];
+      s2 += r * r;
+      m++;
+    }
+    f64 sigma1 = m > 0 ? sqrt(s2 / m) : 0;
+    for (int h = 1; h <= horizon; h++)
+      sigma[h - 1] = sigma1 * sqrt((f64)h);
+  }
+  sqlite3_free(ss);
+  sqlite3_free(cnt);
 }
 
 /* Classic Theta(0,2) with additive seasonal adjustment: average of the
@@ -196,7 +244,6 @@ static void model_theta(const f64 *y, int n, int horizon, f64 *fc,
       best_level = level;
     }
   }
-  UNUSED_PARAMETER(best_alpha);
   f64 sigma1 = n > 1 ? sqrt(best_sse / (n - 1)) / 2 : 0;
 
   for (int h = 1; h <= horizon; h++) {
@@ -205,9 +252,46 @@ static void model_theta(const f64 *y, int n, int horizon, f64 *fc,
     if (seas && p > 0)
       theta_fc += seas[(n + h - 1) % p];
     fc[h - 1] = theta_fc;
-    sigma[h - 1] = sigma1 * sqrt((f64)h);
   }
 
+  /* Per-horizon sigma from the fitted model's in-sample h-step errors: roll
+   * the theta forecast forward from every past origin using that origin's SES
+   * level, and take the RMS error per h. Empirically calibrated per horizon,
+   * replacing the old ad-hoc sigma1 * sqrt(h) / 2 growth. */
+  f64 *lev = sqlite3_malloc(sizeof(f64) * n);
+  f64 *ss = sqlite3_malloc(sizeof(f64) * horizon);
+  int *cnt = sqlite3_malloc(sizeof(int) * horizon);
+  if (lev && ss && cnt) {
+    f64 level = 2 * yd[0] - a;
+    lev[0] = level;
+    for (int i = 1; i < n; i++) {
+      f64 z = 2 * yd[i] - (a + b * i);
+      level += best_alpha * (z - level);
+      lev[i] = level;
+    }
+    for (int h = 0; h < horizon; h++) {
+      ss[h] = 0;
+      cnt[h] = 0;
+    }
+    for (int t = 0; t < n; t++)
+      for (int h = 1; h <= horizon && t + h < n; h++) {
+        f64 f = 0.5 * (a + b * (t + h)) + 0.5 * lev[t];
+        if (seas && p > 0)
+          f += seas[(t + h) % p];
+        f64 e = y[t + h] - f;
+        ss[h - 1] += e * e;
+        cnt[h - 1]++;
+      }
+    for (int h = 1; h <= horizon; h++)
+      sigma[h - 1] =
+          cnt[h - 1] >= 2 ? sqrt(ss[h - 1] / cnt[h - 1]) : sigma1 * sqrt((f64)h);
+  } else {
+    for (int h = 1; h <= horizon; h++)
+      sigma[h - 1] = sigma1 * sqrt((f64)h);
+  }
+  sqlite3_free(lev);
+  sqlite3_free(ss);
+  sqlite3_free(cnt);
   sqlite3_free(yd);
   sqlite3_free(seas);
 }
