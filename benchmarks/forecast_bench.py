@@ -12,8 +12,12 @@ FM forecasts are cached per (model, dataset, series) under
 non-commercial derivative), so the run is crash-resilient and re-runs need no
 FM inference.
 
+TimesFM (google/timesfm-2.5-200m-pytorch) is added when the `timesfm` package
+is installed, and skipped gracefully otherwise.
+
 Run:  uv run --with "setuptools<81" --with gluonts --with numpy --with pandas \
-        --with chronos-forecasting --with torch python benchmarks/forecast_bench.py
+        --with chronos-forecasting --with torch --with "timesfm[torch]" \
+        python benchmarks/forecast_bench.py
 """
 import json, logging, os, sqlite3
 import numpy as np
@@ -120,18 +124,17 @@ def run_chronos(hist, h, _c={}):
     return expand_deciles(q[0].numpy())  # [h, 9] -> [len(QL), h]
 
 
-def run_timesfm(hist, h, freq, _c={}):
+def run_timesfm(hist, h, _freq=None, _c={}):
     if "m" not in _c:
         import timesfm
-        _c["m"] = timesfm.TimesFm(
-            hparams=timesfm.TimesFmHparams(backend="cpu", per_core_batch_size=32,
-                                           horizon_len=max(64, h),
-                                           num_layers=50, context_len=512),
-            checkpoint=timesfm.TimesFmCheckpoint(
-                huggingface_repo_id="google/timesfm-2.0-500m-pytorch"))
-    fc_freq = {"H": 0, "D": 0, "W": 1, "M": 1}.get(str(freq)[0], 0)
-    _, q = _c["m"].forecast([np.asarray(hist, dtype=float)], freq=[fc_freq])
-    return expand_deciles(np.asarray(q)[0][:h, 1:10])  # cols 1..9 = deciles
+        M = timesfm.TimesFM_2p5_200M_torch
+        m = M.from_pretrained(M.DEFAULT_REPO_ID)
+        m.compile(timesfm.ForecastConfig(
+            max_context=2048, max_horizon=64, normalize_inputs=True,
+            use_continuous_quantile_head=True, fix_quantile_crossing=True))
+        _c["m"] = m
+    _, q = _c["m"].forecast(horizon=h, inputs=[np.asarray(hist, dtype=float)])
+    return expand_deciles(np.asarray(q)[0][:h, 1:10])  # col 0 = mean, 1..9 = deciles
 
 
 def fm_forecast(runner, model, name, i, hist, h, freq=None):
