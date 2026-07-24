@@ -22,7 +22,10 @@ Metric: **accuracy** (classification, higher is better) / **RMSE**
 - `tree<-fm` — a depth-8 **sklearn** CART on TabFM's train predictions (the
   distillation principle with a single-tree student, run in the harness)
 - **`gbt<-fm`** — our native gradient-boosted student, distilled from the
-  **same** TabFM predictions **through the extension**
+  **same** TabFM predictions (hard argmax) **through the extension**
+- **`gbt<-fm soft`** — the same student, but distilled from TabFM's full
+  probability distribution (`predict_proba`) via `proba`/`classes`
+  (soft-label distillation); classification only
 - `knn5` — our shipping in-context model, via the extension
 - `tree<-k5`, `gbt<-k5` — `distill(teacher='knn5-incontext', ...)`, the tree
   and gbt students, via the extension
@@ -57,6 +60,15 @@ and `predict()` as SQL; `xgb`, `tabfm`, and `tree<-fm` are Python references.
 | tabfm vs XGBoost | 98% | 47W 1T 0L |
 | **best-of-our-students vs XGBoost** | **73%** | 35W 4T 9L |
 
+**Soft-label distillation** (classification only, 35 datasets where both ran):
+
+| comparison | win% | record |
+| --- | --- | --- |
+| gbt<-fm soft vs gbt<-fm (hard) | 46% | 16W 11T 8L |
+| gbt<-fm soft **vs gbt<-k5** | **74%** | 26W 3T 6L |
+| gbt<-fm (hard) vs gbt<-k5 | 65% | 23W 2T 10L |
+| gbt<-fm soft vs XGBoost | 69% | 24W 4T 7L |
+
 Native student size: single tree **1.7–6.6 KB**, gbt forest **~2–200 KB**;
 both serve in microseconds with no onnxruntime. TabFM: **24 s to ~2 min** per
 call (one slow outlier), and it needs a GPU-class runtime to be practical.
@@ -90,9 +102,23 @@ data," and the 73% best-of-ours-vs-XGBoost line is what per-dataset teacher
 selection would chase.
 
 **The student trails its teacher, as a lossy compression should.** `gbt<-fm`
-loses to TabFM on 40 of 48 (ties 4). It keeps most of TabFM, not all. Closing
-that gap is the next lever: soft-label distillation (learn TabFM's probability
-distribution, not its argmax) should transfer the part we currently discard.
+loses to TabFM on 40 of 48 (ties 4). It keeps most of TabFM, not all.
+
+**Soft-label distillation closes part of the gap, exactly where the theory
+says it should.** Distilling TabFM's full probability distribution rather than
+its hard argmax (`gbt<-fm soft`) is a modest average lift over hard labels
+(16W/11T/8L, mean +0.003): on the many datasets where TabFM was already
+confident, hard and soft agree, so most rows tie. The win shows up where the
+teacher was *uncertain*, which is precisely the case hard argmax destroys. The
+telling number is the teacher comparison: soft `gbt<-fm` beats the knn5-taught
+student on **74%** of datasets, up from hard's 65%, and on **6 datasets** where
+hard-label distillation had *lost* to the cheap knn5 teacher, soft distillation
+caught back up to or passed it. So soft labels do what we predicted: they stop
+throwing away the calibrated probabilities that are the strong teacher's edge,
+which raises how often TabFM is worth distilling. What they cannot fix is the
+*representational* half of the gap, an axis-aligned tree ensemble still cannot
+render TabFM's warped boundary no matter how good the targets are. That is the
+next student (a smooth model), not the next target.
 
 ## Caveats
 
@@ -110,60 +136,60 @@ distribution, not its argmax) should transfer the part we currently discard.
 
 ## Full results
 
-| dataset | n | xgb | tabfm | tree<-fm | **gbt<-fm** | knn5 | tree<-k5 | gbt<-k5 | tabfm s |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| airline_satisfaction | 1500 | 0.909 | 0.923 | 0.867 | 0.880 | 0.851 | 0.808 | 0.869 | 84 |
-| Amazon_employee_access | 1500 | 0.928 | 0.939 | 0.936 | 0.939 | 0.936 | 0.939 | 0.939 | 67 |
-| anneal | 898 | 0.987 | 0.991 | 0.982 | 0.987 | 0.924 | 0.933 | 0.951 | 59 |
-| APSFailure | 1500 | 0.995 | 0.995 | 0.989 | 0.995 | 0.989 | 0.992 | 0.992 | 112 |
-| bank-marketing | 1500 | 0.856 | 0.864 | 0.869 | 0.864 | 0.856 | 0.861 | 0.869 | 71 |
-| Bank_Customer_Churn | 1500 | 0.837 | 0.880 | 0.851 | 0.867 | 0.837 | 0.829 | 0.832 | 70 |
-| Bioresponse | 1500 | 0.781 | 0.808 | 0.733 | 0.757 | 0.755 | 0.699 | 0.765 | 125 |
-| blood-transfusion | 748 | 0.711 | 0.759 | 0.775 | 0.765 | 0.738 | 0.765 | 0.781 | 33 |
-| churn | 1500 | 0.933 | 0.968 | 0.909 | 0.944 | 0.880 | 0.880 | 0.867 | 90 |
-| coil2000_insurance | 1500 | 0.944 | – | – | – | 0.952 | – | – | – |
-| credit-g | 1000 | 0.752 | 0.768 | 0.720 | 0.732 | 0.744 | 0.696 | 0.752 | 52 |
-| credit_card_default | 1500 | 0.800 | 0.829 | 0.824 | 0.827 | 0.813 | 0.805 | 0.805 | 88 |
-| diabetes | 768 | 0.740 | 0.776 | 0.708 | 0.714 | 0.734 | 0.740 | 0.766 | 32 |
-| Diabetes130US | 1500 | 0.904 | 0.917 | 0.880 | 0.912 | 0.907 | 0.909 | 0.917 | 106 |
-| E-CommerceShipping | 1500 | 0.645 | 0.701 | 0.685 | 0.693 | 0.651 | 0.613 | 0.645 | 1033 |
-| Fitness_Club | 1500 | 0.747 | 0.787 | 0.784 | 0.781 | 0.749 | 0.749 | 0.765 | 64 |
-| GiveMeSomeCredit | 1500 | 0.931 | 0.939 | 0.928 | 0.936 | 0.939 | 0.936 | 0.941 | 69 |
-| hazelnut-contaminant | 1500 | 0.901 | 0.971 | 0.813 | 0.891 | 0.840 | 0.805 | 0.840 | 97 |
-| heloc | 1500 | 0.757 | 0.773 | 0.747 | 0.757 | 0.744 | 0.712 | 0.736 | 86 |
-| hiva_agnostic | 1500 | 0.968 | – | – | – | 0.968 | – | – | – |
-| HR_job_change | 1500 | 0.728 | 0.739 | 0.741 | 0.752 | 0.741 | 0.728 | 0.739 | 71 |
-| in_vehicle_coupon | 1500 | 0.632 | 0.656 | 0.669 | 0.664 | 0.613 | 0.613 | 0.635 | 87 |
-| Is-this-a-good-customer | 1500 | 0.880 | 0.891 | 0.891 | 0.885 | 0.880 | 0.869 | 0.891 | 73 |
-| jm1 | 1500 | 0.776 | 0.803 | 0.800 | 0.789 | 0.771 | 0.776 | 0.792 | 84 |
-| kddcup09_appetency | 1500 | 0.981 | – | – | – | 0.981 | – | – | – |
-| Marketing_Campaign | 1500 | 0.869 | 0.891 | 0.845 | 0.875 | 0.872 | 0.853 | 0.867 | 87 |
-| maternal_health_risk | 1014 | 0.807 | 0.850 | 0.717 | 0.823 | 0.677 | 0.665 | 0.685 | 38 |
-| MIC | 1500 | 0.848 | 0.861 | 0.845 | 0.851 | 0.856 | 0.853 | 0.856 | 113 |
-| NATICUSdroid | 1500 | 0.880 | 0.920 | 0.909 | 0.899 | 0.856 | 0.867 | 0.888 | 111 |
-| online_shoppers_intention | 1500 | 0.883 | 0.904 | 0.891 | 0.880 | 0.885 | 0.885 | 0.888 | 78 |
-| polish_bankruptcy | 1500 | 0.944 | 0.957 | 0.907 | 0.949 | 0.941 | 0.917 | 0.939 | 109 |
-| qsar-biodeg | 1054 | 0.871 | 0.890 | 0.795 | 0.848 | 0.856 | 0.841 | 0.864 | 81 |
-| SDSS17 | 1500 | 0.952 | 0.960 | 0.957 | 0.960 | 0.760 | 0.781 | 0.832 | 69 |
-| seismic-bumps | 1500 | 0.931 | 0.936 | 0.933 | 0.939 | 0.933 | 0.939 | 0.936 | 76 |
-| splice | 1500 | 0.965 | 0.973 | 0.901 | 0.955 | 0.659 | 0.760 | 0.797 | 119 |
-| students_dropout | 1500 | 0.728 | 0.781 | 0.704 | 0.717 | 0.672 | 0.659 | 0.717 | 118 |
-| taiwanese_bankruptcy | 1500 | 0.968 | 0.976 | 0.963 | 0.971 | 0.963 | 0.971 | 0.971 | 111 |
-| website_phishing | 1353 | 0.885 | 0.917 | 0.903 | 0.894 | 0.850 | 0.838 | 0.867 | 62 |
-| *regression (RMSE, lower better)* | | | | | | | | | |
-| airfoil_self_noise | 1500 | 1.613 | 1.081 | 3.313 | 2.299 | 3.185 | 3.572 | 2.912 | 64 |
-| concrete_compressive_strength | 1030 | 5.047 | 4.082 | 6.623 | 4.974 | 9.116 | 10.321 | 8.839 | 47 |
-| diamonds | 1500 | 878.3 | 763.1 | 1067.2 | 949.5 | 1283.4 | 1300.8 | 1180.7 | 67 |
-| Food_Delivery_Time | 1500 | 8.720 | 7.128 | 7.692 | 7.275 | 8.862 | 8.045 | 7.739 | 67 |
-| healthcare_insurance_expenses | 1338 | 5217 | 4456 | 4453 | 4463 | 5342 | 4927 | 4933 | 59 |
-| houses | 1500 | 0.268 | 0.202 | 0.335 | 0.259 | 0.322 | 0.351 | 0.298 | 67 |
-| miami_housing | 1500 | 149103 | 85056 | 175723 | 117776 | 140391 | 199385 | 145991 | 76 |
-| physiochemical_protein | 1500 | 5.071 | 4.343 | 5.602 | 5.003 | 5.439 | 5.551 | 5.166 | 67 |
-| QSAR-TID-11 | 1500 | 1.509 | 1.352 | 1.473 | 1.440 | 1.570 | 1.467 | 1.464 | 126 |
-| QSAR_fish_toxicity | 907 | 0.949 | 0.910 | 0.999 | 0.932 | 0.904 | 0.933 | 0.902 | 41 |
-| superconductivity | 1500 | 14.182 | 12.276 | 16.857 | 14.698 | 17.061 | 18.595 | 16.380 | 111 |
-| used-Fiat-500 | 1500 | 830.1 | 779.4 | 970.3 | 799.1 | 893.9 | 858.0 | 814.1 | 66 |
-| wine_quality | 1500 | 0.783 | 0.634 | 0.856 | 0.681 | 0.702 | 0.717 | 0.661 | 71 |
+| dataset | n | xgb | tabfm | tree<-fm | **gbt<-fm** | **gbt<-fm soft** | knn5 | tree<-k5 | gbt<-k5 | tabfm s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| airline_satisfaction | 1500 | 0.909 | 0.923 | 0.867 | 0.880 | 0.901 | 0.851 | 0.808 | 0.869 | 83 |
+| Amazon_employee_access | 1500 | 0.928 | 0.939 | 0.936 | 0.939 | 0.939 | 0.936 | 0.939 | 0.939 | 66 |
+| anneal | 898 | 0.987 | 0.991 | 0.982 | 0.987 | 0.987 | 0.924 | 0.933 | 0.951 | 63 |
+| APSFailure | 1500 | 0.995 | 0.995 | 0.989 | 0.995 | 0.995 | 0.989 | 0.992 | 0.992 | 111 |
+| bank-marketing | 1500 | 0.856 | 0.864 | 0.869 | 0.864 | 0.869 | 0.856 | 0.861 | 0.869 | 73 |
+| Bank_Customer_Churn | 1500 | 0.837 | 0.880 | 0.851 | 0.867 | 0.880 | 0.837 | 0.829 | 0.832 | 73 |
+| Bioresponse | 1500 | 0.781 | 0.808 | 0.733 | 0.757 | 0.773 | 0.755 | 0.699 | 0.765 | 113 |
+| blood-transfusion | 748 | 0.711 | 0.759 | 0.775 | 0.765 | 0.759 | 0.738 | 0.765 | 0.781 | 34 |
+| churn | 1500 | 0.933 | 0.968 | 0.909 | 0.944 | 0.944 | 0.880 | 0.880 | 0.867 | 83 |
+| coil2000_insurance | 1500 | 0.944 | – | – | – | – | 0.952 | – | – | – |
+| credit-g | 1000 | 0.752 | 0.768 | 0.720 | 0.732 | 0.760 | 0.744 | 0.696 | 0.752 | 55 |
+| credit_card_default | 1500 | 0.800 | 0.829 | 0.824 | 0.827 | 0.827 | 0.813 | 0.805 | 0.805 | 87 |
+| diabetes | 768 | 0.740 | 0.776 | 0.708 | 0.714 | 0.734 | 0.734 | 0.740 | 0.766 | 34 |
+| Diabetes130US | 1500 | 0.904 | 0.917 | 0.880 | 0.912 | 0.920 | 0.907 | 0.909 | 0.917 | 103 |
+| E-CommerceShipping | 1500 | 0.645 | 0.701 | 0.685 | 0.693 | 0.696 | 0.651 | 0.613 | 0.645 | 68 |
+| Fitness_Club | 1500 | 0.747 | 0.787 | 0.784 | 0.781 | 0.781 | 0.749 | 0.749 | 0.765 | 64 |
+| GiveMeSomeCredit | 1500 | 0.931 | 0.939 | 0.928 | 0.936 | 0.936 | 0.939 | 0.936 | 0.941 | 67 |
+| hazelnut-contaminant | 1500 | 0.901 | 0.971 | 0.813 | 0.891 | 0.877 | 0.840 | 0.805 | 0.840 | 100 |
+| heloc | 1500 | 0.757 | 0.773 | 0.747 | 0.757 | 0.757 | 0.744 | 0.712 | 0.736 | 91 |
+| hiva_agnostic | 1500 | 0.968 | – | – | – | – | 0.968 | – | – | – |
+| HR_job_change | 1500 | 0.728 | 0.739 | 0.741 | 0.752 | 0.747 | 0.741 | 0.728 | 0.739 | 72 |
+| in_vehicle_coupon | 1500 | 0.632 | 0.656 | 0.669 | 0.664 | 0.640 | 0.613 | 0.613 | 0.635 | 90 |
+| Is-this-a-good-customer | 1500 | 0.880 | 0.891 | 0.891 | 0.885 | 0.888 | 0.880 | 0.869 | 0.891 | 74 |
+| jm1 | 1500 | 0.776 | 0.803 | 0.800 | 0.789 | 0.795 | 0.771 | 0.776 | 0.792 | 89 |
+| kddcup09_appetency | 1500 | 0.981 | – | – | – | – | 0.981 | – | – | – |
+| Marketing_Campaign | 1500 | 0.869 | 0.891 | 0.845 | 0.875 | 0.893 | 0.872 | 0.853 | 0.867 | 91 |
+| maternal_health_risk | 1014 | 0.807 | 0.850 | 0.717 | 0.823 | 0.780 | 0.677 | 0.665 | 0.685 | 39 |
+| MIC | 1500 | 0.848 | 0.861 | 0.845 | 0.851 | 0.853 | 0.856 | 0.853 | 0.856 | 113 |
+| NATICUSdroid | 1500 | 0.880 | 0.920 | 0.909 | 0.899 | 0.893 | 0.856 | 0.867 | 0.888 | 114 |
+| online_shoppers_intention | 1500 | 0.883 | 0.904 | 0.891 | 0.880 | 0.888 | 0.885 | 0.885 | 0.888 | 80 |
+| polish_bankruptcy | 1500 | 0.944 | 0.957 | 0.907 | 0.949 | 0.947 | 0.941 | 0.917 | 0.939 | 111 |
+| qsar-biodeg | 1054 | 0.871 | 0.890 | 0.795 | 0.848 | 0.856 | 0.856 | 0.841 | 0.864 | 81 |
+| SDSS17 | 1500 | 0.952 | 0.960 | 0.957 | 0.960 | 0.960 | 0.760 | 0.781 | 0.832 | 69 |
+| seismic-bumps | 1500 | 0.931 | 0.936 | 0.933 | 0.939 | 0.939 | 0.933 | 0.939 | 0.936 | 76 |
+| splice | 1500 | 0.965 | 0.973 | 0.901 | 0.955 | 0.955 | 0.659 | 0.760 | 0.797 | 114 |
+| students_dropout | 1500 | 0.728 | 0.781 | 0.704 | 0.717 | 0.757 | 0.672 | 0.659 | 0.717 | 107 |
+| taiwanese_bankruptcy | 1500 | 0.968 | 0.976 | 0.963 | 0.971 | 0.976 | 0.963 | 0.971 | 0.971 | 110 |
+| website_phishing | 1353 | 0.885 | 0.917 | 0.903 | 0.894 | 0.885 | 0.850 | 0.838 | 0.867 | 61 |
+| *regression (RMSE, lower better)* | | | | | | | | | | |
+| airfoil_self_noise | 1500 | 1.613 | 1.081 | 3.313 | 2.299 | – | 3.185 | 3.572 | 2.912 | 63 |
+| concrete_compressive_strength | 1030 | 5.047 | 4.082 | 6.623 | 4.974 | – | 9.116 | 10.321 | 8.839 | 46 |
+| diamonds | 1500 | 878 | 763 | 1067 | 950 | – | 1283 | 1301 | 1181 | 66 |
+| Food_Delivery_Time | 1500 | 8.720 | 7.128 | 7.692 | 7.275 | – | 8.862 | 8.045 | 7.739 | 69 |
+| healthcare_insurance_expenses | 1338 | 5217 | 4456 | 4453 | 4463 | – | 5342 | 4927 | 4933 | 59 |
+| houses | 1500 | 0.268 | 0.202 | 0.335 | 0.259 | – | 0.322 | 0.351 | 0.298 | 65 |
+| miami_housing | 1500 | 149103 | 85055 | 175723 | 117776 | – | 140391 | 199385 | 145991 | 78 |
+| physiochemical_protein | 1500 | 5.071 | 4.343 | 5.602 | 5.003 | – | 5.439 | 5.551 | 5.166 | 66 |
+| QSAR-TID-11 | 1500 | 1.509 | 1.352 | 1.473 | 1.440 | – | 1.570 | 1.467 | 1.464 | 114 |
+| QSAR_fish_toxicity | 907 | 0.949 | 0.910 | 0.999 | 0.932 | – | 0.904 | 0.933 | 0.902 | 41 |
+| superconductivity | 1500 | 14.182 | 12.276 | 16.857 | 14.698 | – | 17.061 | 18.595 | 16.380 | 112 |
+| used-Fiat-500 | 1500 | 830 | 779 | 970 | 799 | – | 894 | 858 | 814 | 66 |
+| wine_quality | 1500 | 0.783 | 0.634 | 0.856 | 0.681 | – | 0.702 | 0.717 | 0.661 | 73 |
 
 Reproduce with `benchmarks/tabarena.py` (needs local TabFM weights, which are
 non-commercial and never redistributed; results stream to

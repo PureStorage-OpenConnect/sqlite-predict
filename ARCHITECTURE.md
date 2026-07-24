@@ -103,8 +103,11 @@ inherits a foundation model's calibration instead of only its argmax, while
 the holdout is still scored against the true `target` labels. `predict()` dispatches
 a `tree`-runtime model to the native runtime in the same file, which tells a
 single tree (`PSTREE` blob) from a forest (`PSGBT` blob) by magic and needs
-no onnxruntime. Both blob formats are little-endian and implementation-defined
-(RFC §4.2.4), and rigorously bounds-checked on read, because the registry is
+no onnxruntime. Both blob formats are little-endian and normatively specified
+and versioned (RFC §4.1.6, `PSTREE01` / `PSGBT01`), so a stored student stays
+servable across upgrades, snapshots, and forks, and a serving-only module can
+execute a blob it never trained. They are rigorously bounds-checked on read,
+because the registry is
 writable by any SQL caller (RFC §6.2) — a hand-crafted blob is rejected,
 never crashed on. Because the student is native and deterministic, its
 predictions carry the same exact-replay receipt as the stat models.
