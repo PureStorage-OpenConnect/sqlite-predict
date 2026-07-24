@@ -88,6 +88,12 @@ int main(void) {
           "\"proba\":[\"pc0\",\"pc1\"],\"classes\":[\"c0\",\"c1\"],"
           "\"student_id\":\"soak_soft\"}')",
           1) ||
+      run_discard( /* mlp student (softmax net) */
+          db,
+          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          " '{\"target\":\"label\",\"student_kind\":\"mlp\","
+          "\"student_id\":\"soak_mlp\"}')",
+          1) ||
       run_discard(db,
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_bad',"
@@ -98,6 +104,12 @@ int main(void) {
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_gbt_bad',"
                   "'student','tree',x'505347425430310000000000','x',"
+                  "'unspecified')",
+                  1) ||
+      run_discard(db,
+                  "INSERT INTO _predict_models (model_id, kind, runtime,"
+                  " weights, content_hash, license) VALUES ('soak_mlp_bad',"
+                  "'student','tree',x'50534D4C5030310000000000','x',"
                   "'unspecified')",
                   1))
     goto done_fail;
@@ -139,10 +151,16 @@ int main(void) {
                     " '{\"model\":\"soak_soft\",\"receipt\":0}')",
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_mlp\",\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_bad\",\"receipt\":0}')",
                 0);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_gbt_bad\",\"receipt\":0}')",
+                0);
+    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_mlp_bad\",\"receipt\":0}')",
                 0);
     run_discard(db,
                 "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"

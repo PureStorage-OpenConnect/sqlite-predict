@@ -136,13 +136,68 @@ def test_bad_task_errors(db):
     assert "PREDICT_ERR_TASK" in str(e.value)
 
 
-def test_mlp_student_kind_not_available(db):
+def test_mlp_student(db):
+    """The mlp student: a smooth softmax net, trained deterministically, that
+    predicts valid classes, replays exactly, and is a tiny blob."""
     _train_table(db)
+    metric = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM tab',"
+        " json_object('target','label','student_kind','mlp','student_id','m'))"
+    ).fetchone()[0]
+    assert 0.6 <= metric <= 1.0
+    row = db.execute("SELECT runtime, length(weights) FROM _predict_models WHERE"
+                     " model_id='m'").fetchone()
+    assert row[0] == "tree" and row[1] > 0  # inline student runtime
+    labels = {str(x[0]) for x in db.execute("SELECT DISTINCT label FROM tab")}
+    q = ("SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM"
+         " tab', json_object('model','m','receipt',0))")
+    rows = db.execute(q).fetchall()
+    assert len(rows) == 240 and {p for _, p in rows} <= labels
+    assert db.execute(q).fetchall() == rows  # deterministic
+    rid = db.execute("SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM"
+                     " tab', json_object('model','m')) LIMIT 1").fetchone()[0]
+    m, d = db.execute("SELECT match, detail FROM predict_replay(?)",
+                      (rid,)).fetchone()
+    assert m == 1, d
+
+
+def test_mlp_soft_and_regress_guard(db):
+    """The mlp student consumes soft targets (proba/classes) and is
+    classification only."""
+    _soft_table(db)
+    metric = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1,f2,pA,pB,pC,label FROM"
+        " st', json_object('target','label','proba',json_array('pA','pB','pC'),"
+        "'classes',json_array('A','B','C'),'student_kind','mlp',"
+        "'student_id','sm'))").fetchone()[0]
+    assert 0.6 <= metric <= 1.0
+    db.execute("CREATE TABLE rr(f1 REAL, f2 REAL, y REAL)")
+    db.executemany("INSERT INTO rr VALUES (?,?,?)",
+                   [(i * 0.1, (i * 7) % 5, i * 0.2) for i in range(120)])
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
-                   " json_object('target','label','student_id','s',"
-                   "'student_kind','mlp'))").fetchone()
-    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+        db.execute("SELECT * FROM distill('SELECT f1,f2,y FROM rr',"
+                   " json_object('target','y','task','regress',"
+                   "'student_kind','mlp','student_id','x'))").fetchone()
+    assert "classification only" in str(e.value)
+
+
+def test_corrupt_mlp_blob_rejected(db):
+    _train_table(db)
+    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+               " json_object('target','label','student_kind','mlp',"
+               "'student_id','ok'))").fetchone()
+    db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
+    db.execute("INSERT INTO a VALUES (0, 0.1, 0.2)")
+    for blob in (b"PSMLP01\x00" + b"\xff" * 40, b"PSMLP01\x00" + b"\x00" * 20):
+        db.execute("DELETE FROM _predict_models WHERE model_id='bad'")
+        db.execute(
+            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+            " content_hash, license) VALUES ('bad','student','tree',?,'x',"
+            "'unspecified')", (blob,))
+        with pytest.raises(sqlite3.OperationalError) as e:
+            db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+                       " json_object('model','bad','receipt',0))").fetchall()
+        assert "PREDICT_ERR" in str(e.value)
 
 
 def test_too_few_rows_errors(db):
