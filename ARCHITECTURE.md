@@ -19,7 +19,9 @@ Source layout:
 | `predict-tabular.c` | `predict()` vtab, the in-context k-NN model, and dispatch to a runtime backend for registered models |
 | `predict-receipts.c` | model registry, receipts, canonical hashing, the logical-digest anchor, and `predict_replay()` |
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
-| `predict-distill.c` | `distill()`, the CART trainer, and the native tree-student runtime (zero-dependency core) |
+| `predict-student.c` | the native student **serving** runtime: blob (de)serialization and tree / forest / MLP inference (`predict0_tree_run`). The serve side of the train/serve boundary |
+| `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on (RFC §4.1.6) |
+| `predict-distill.c` | the **training** side: the CART / gradient-boosting / MLP trainers and the `distill()` vtab. Builds student blobs that `predict-student.c` serves |
 | `predict-internal.h` | shared types, contract constants, error codes, internal prototypes |
 | `vendor/sha256.c` | a self-contained FIPS 180-4 SHA-256 |
 
