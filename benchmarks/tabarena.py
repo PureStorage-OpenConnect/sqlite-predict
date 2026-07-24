@@ -51,9 +51,39 @@ EXT = os.path.join(os.path.dirname(__file__), "..", "dist", "predict0")
 RESULTS = os.path.join(os.path.dirname(__file__), "results", "tabarena.md")
 MAX_ROWS, MAX_FEAT, SEED = 1500, 40, 0
 
-# OpenML data_ids (stable) + a couple of sklearn built-ins for reliability.
-CLS_IDS = [(31, "credit-g"), (37, "diabetes"), (1464, "blood-transfusion"),
-           (54, "vehicle")]
+# The full TabArena-v0.1 suite (OpenML suite 457): 51 curated tasks, each as
+# (dataset_id, name, task). Fetched by the TabArena dataset upload id so we get
+# exactly the curated version. task 'reg' where the suite marks 0 classes.
+TABARENA = [
+    (46913, "blood-transfusion", "cls"), (46921, "diabetes", "cls"),
+    (46906, "anneal", "cls"), (46954, "QSAR_fish_toxicity", "reg"),
+    (46918, "credit-g", "cls"), (46941, "maternal_health_risk", "cls"),
+    (46917, "concrete_compressive_strength", "reg"),
+    (46952, "qsar-biodeg", "cls"), (46931, "healthcare_insurance_expenses", "reg"),
+    (46963, "website_phishing", "cls"), (46927, "Fitness_Club", "cls"),
+    (46904, "airfoil_self_noise", "reg"),
+    (46907, "used-Fiat-500", "reg"), (46980, "MIC", "cls"),
+    (46938, "Is-this-a-good-customer", "cls"), (46940, "Marketing_Campaign", "cls"),
+    (46930, "hazelnut-contaminant", "cls"), (46956, "seismic-bumps", "cls"),
+    (46958, "splice", "cls"), (46912, "Bioresponse", "cls"),
+    (46933, "hiva_agnostic", "cls"),
+    (46960, "students_dropout", "cls"), (46915, "churn", "cls"),
+    (46953, "QSAR-TID-11", "reg"), (46950, "polish_bankruptcy", "cls"),
+    (46964, "wine_quality", "reg"), (46962, "taiwanese_bankruptcy", "cls"),
+    (46969, "NATICUSdroid", "cls"), (46916, "coil2000_insurance", "cls"),
+    (46911, "Bank_Customer_Churn", "cls"), (46932, "heloc", "cls"),
+    (46979, "jm1", "cls"), (46924, "E-CommerceShipping", "cls"),
+    (46947, "online_shoppers_intention", "cls"),
+    (46937, "in_vehicle_coupon", "cls"), (46942, "miami_housing", "reg"),
+    (46935, "HR_job_change", "cls"), (46934, "houses", "reg"),
+    (46961, "superconductivity", "reg"), (46919, "credit_card_default", "cls"),
+    (46905, "Amazon_employee_access", "cls"), (46910, "bank-marketing", "cls"),
+    (46928, "Food_Delivery_Time", "reg"), (46949, "physiochemical_protein", "reg"),
+    (46939, "kddcup09_appetency", "cls"), (46923, "diamonds", "reg"),
+    (46922, "Diabetes130US", "cls"), (46908, "APSFailure", "cls"),
+    (46955, "SDSS17", "cls"), (46920, "airline_satisfaction", "cls"),
+    (46929, "GiveMeSomeCredit", "cls"),
+]
 
 
 # ---- data ----
@@ -76,37 +106,35 @@ def _prep(X, y, task):
 
 
 def load_datasets():
-    from sklearn.datasets import (fetch_california_housing, fetch_openml,
-                                  load_diabetes)
-    out = []
-    for did, name in CLS_IDS:
+    """Yield (name, X, y, task) one dataset at a time (lazy: a 150k-row set is
+    loaded, subsampled to MAX_ROWS, and released before the next). Each dataset
+    is subsampled to <= MAX_ROWS rows and <= MAX_FEAT features so the in-context
+    TabFM teacher stays tractable on CPU; every model sees the same capped data,
+    so the relative comparison holds."""
+    from sklearn.datasets import fetch_openml
+    for did, name, task in TABARENA:
         try:
             b = fetch_openml(data_id=did, as_frame=True)
-            X, y = _prep(b.data, b.target, "cls")
-            out.append((name, X, y, "cls"))
+            X, y = _prep(b.data, b.target, task)
         except Exception as e:  # noqa: BLE001
-            print(f"skip {name}: {type(e).__name__}: {e}")
-    for name, ld in (("diabetes-reg", load_diabetes),
-                     ("california", fetch_california_housing)):
-        b = ld(as_frame=True)
-        X, y = _prep(b.data, b.target, "reg")
-        out.append((name, X, y, "reg"))
-    # subsample big datasets (TabFM context cost + wall clock)
-    trimmed = []
-    for name, X, y, task in out:
+            print(f"skip {name} (did={did}): {type(e).__name__}: {e}")
+            continue
         if len(X) > MAX_ROWS:
             idx = np.random.default_rng(SEED).choice(len(X), MAX_ROWS, False)
-            X, y = X.iloc[idx].reset_index(drop=True), y.iloc[idx].reset_index(
-                drop=True)
-        trimmed.append((name, X, y, task))
-    return trimmed
+            X = X.iloc[idx].reset_index(drop=True)
+            y = y.iloc[idx].reset_index(drop=True)
+        yield name, X, y, task
 
 
 def split(X, y, task):
     from sklearn.model_selection import train_test_split
     strat = y if task == "cls" else None
-    return train_test_split(X, y, test_size=0.25, random_state=SEED,
-                            stratify=strat)
+    try:
+        return train_test_split(X, y, test_size=0.25, random_state=SEED,
+                                stratify=strat)
+    except ValueError:
+        # a subsampled class can be too rare to stratify; fall back
+        return train_test_split(X, y, test_size=0.25, random_state=SEED)
 
 
 def score(y_true, pred, task):
@@ -253,18 +281,26 @@ def run_ours_distill(Xtr, ytr, Xte, task, kind="tree"):
 # ---- driver ----
 
 def main():
-    rng = np.random.default_rng(SEED)
-    del rng
-    datasets = load_datasets()
-    print(f"datasets: {[d[0] for d in datasets]}")
+    import json
+    import sys
+    limit = next((int(a.split("=")[1]) for a in sys.argv[1:]
+                  if a.startswith("limit=")), 0)
+    jsonl = os.path.join(os.path.dirname(RESULTS), "tabarena-full.jsonl")
+    print(f"TabArena-v0.1: {len(TABARENA)} datasets"
+          f"{f' (limit {limit})' if limit else ''}. Streaming results to"
+          f" {os.path.relpath(jsonl)}")
     rows = []
     student_bytes = []
-    for name, X, y, task in datasets:
+    jf = open(jsonl, "w")
+    for i, (name, X, y, task) in enumerate(load_datasets(), 1):
+        if limit and i > limit:
+            break
         Xtr, Xte, ytr, yte = split(X, y, task)
         rec = {"dataset": name, "task": task, "n": len(X),
                "d": X.shape[1], "classes": (y.nunique() if task == "cls"
                                             else None)}
-        print(f"\n== {name} ({task}, n={len(X)}, d={X.shape[1]}) ==")
+        print(f"\n== [{i}/{len(TABARENA)}] {name} ({task}, n={len(X)},"
+              f" d={X.shape[1]}) ==", flush=True)
 
         def timed(fn):
             t0 = time.time()
@@ -323,9 +359,12 @@ def main():
             print("  gbt-distill fail:", str(e)[:120])
 
         print("  ", {k: (round(v, 3) if isinstance(v, float) else v)
-                     for k, v in rec.items()})
+                     for k, v in rec.items()}, flush=True)
         rows.append(rec)
+        jf.write(json.dumps(rec) + "\n")
+        jf.flush()  # durable progress: a long run survives a mid-way failure
 
+    jf.close()
     _write(rows, student_bytes)
 
 

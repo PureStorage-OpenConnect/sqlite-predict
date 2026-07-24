@@ -1,4 +1,10 @@
-# TabArena-spirit benchmark
+# TabArena-spirit benchmark (6-dataset subset)
+
+> **The full 51-dataset pass is in [`tabarena-full.md`](tabarena-full.md)** and
+> is the canonical result. This page is the original hand-picked 6-dataset
+> subset; it uses the classic OpenML versions of a few datasets, so a couple of
+> numbers differ slightly from the full run, which uses the TabArena-curated
+> versions.
 
 Where do sqlite-predict's students land against TabFM on the kind of real
 tabular data TabFM was announced on? TabFM's announcement benchmarks on
