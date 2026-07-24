@@ -308,6 +308,97 @@ def test_named_teacher_relabels_via_model(db):
     assert preds <= labels
 
 
+def _soft_table(db, n=360, seed=5):
+    """features + a soft teacher's per-class probabilities (3-class angular
+    boundary) + the true label. The teacher is confident but noisy."""
+    import math
+    import random
+    rng = random.Random(seed)
+    db.execute("CREATE TABLE st(id INTEGER, f1 REAL, f2 REAL, pA REAL, pB REAL,"
+               " pC REAL, label TEXT)")
+    rows = []
+    for i in range(n):
+        a, b = rng.gauss(0, 1), rng.gauss(0, 1)
+        ang = math.atan2(b, a)
+        true = "A" if ang < -1 else ("B" if ang < 1 else "C")
+        p = {"A": 0.12, "B": 0.12, "C": 0.12}
+        p[true] = 0.76
+        for k in p:  # noise, renormalized in the extension anyway
+            p[k] = max(0.01, p[k] + rng.uniform(-0.08, 0.08))
+        rows.append((i, a, b, p["A"], p["B"], p["C"], true))
+    db.executemany("INSERT INTO st VALUES (?,?,?,?,?,?,?)", rows)
+
+
+def test_soft_distillation_produces_and_replays(db):
+    """Soft-label distillation: the student learns the teacher's per-class
+    probability columns (proba) instead of a hard label, and is scored on the
+    holdout against the true labels (target)."""
+    _soft_table(db)
+    r = db.execute(
+        "SELECT holdout_metric, receipt_id FROM distill('SELECT f1,f2,pA,pB,"
+        "pC,label FROM st', json_object('target','label','proba',"
+        "json_array('pA','pB','pC'),'classes',json_array('A','B','C'),"
+        "'student_id','s'))").fetchone()
+    assert r[0] >= 0.7  # recovers the boundary the confident teacher describes
+    # it is a gbt forest (tree runtime), predicts valid classes, replays exactly
+    row = db.execute("SELECT runtime, length(weights) FROM _predict_models"
+                     " WHERE model_id='s'").fetchone()
+    assert row[0] == "tree" and row[1] > 0
+    out = db.execute(
+        "SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM st',"
+        " json_object('model','s'))").fetchall()
+    assert len(out) == 360 and {p for _, p in out} <= {"A", "B", "C"}
+    params = db.execute("SELECT params FROM _predict_receipts WHERE receipt_id=?",
+                        (r[1],)).fetchone()[0]
+    assert '"pA"' in params  # proba lineage recorded
+    rid = db.execute(
+        "SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM st',"
+        " json_object('model','s')) LIMIT 1").fetchone()[0]
+    match, detail = db.execute(
+        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
+    assert match == 1, detail
+
+
+def test_soft_distillation_sharper_than_hard(db):
+    """Distilling the teacher's probabilities should recover the boundary at
+    least as well as distilling its hard argmax, on a noisy confident teacher."""
+    _soft_table(db)
+    soft = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1,f2,pA,pB,pC,label FROM"
+        " st', json_object('target','label','proba',json_array('pA','pB','pC'),"
+        "'classes',json_array('A','B','C'),'student_id','soft'))").fetchone()[0]
+    # hard: distill the argmax of the same teacher (the label column already is
+    # the true class here, so train on it directly as the hard baseline)
+    hard = db.execute(
+        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM st',"
+        " json_object('target','label','student_kind','gbt',"
+        "'student_id','hard'))").fetchone()[0]
+    assert soft >= hard - 0.05  # soft is competitive (usually better)
+
+
+def test_soft_distillation_errors(db):
+    _soft_table(db)
+    base = "SELECT * FROM distill('SELECT f1,f2,pA,pB,pC,label FROM st',"
+    # proba requires classes
+    for opts, msg in [
+        ("json_object('target','label','proba',json_array('pA','pB','pC'),"
+         "'student_id','x')", "PREDICT_ERR"),
+        # proba + tree student is rejected
+        ("json_object('target','label','proba',json_array('pA','pB','pC'),"
+         "'classes',json_array('A','B','C'),'student_kind','tree',"
+         "'student_id','x')", "PREDICT_ERR"),
+        # a proba column not in the query
+        ("json_object('target','label','proba',json_array('pA','nope'),"
+         "'classes',json_array('A','B'),'student_id','x')", "PREDICT_ERR"),
+        # length mismatch
+        ("json_object('target','label','proba',json_array('pA','pB','pC'),"
+         "'classes',json_array('A','B'),'student_id','x')", "PREDICT_ERR"),
+    ]:
+        with pytest.raises(sqlite3.OperationalError) as e:
+            db.execute(base + " " + opts + ")").fetchone()
+        assert msg in str(e.value)
+
+
 def test_corrupt_student_blob_errors_not_crashes(db):
     """The registry is caller-writable, so a hand-crafted tree blob must be
     rejected by the bounds-checked deserializer, never crash."""

@@ -17,10 +17,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs anywhere). A `teacher` argument names a registered `predict()` model to
   relabel the rows first (e.g. compress the in-context knn5 into a tree).
   `student_kind='tree'` is a single CART; `'gbt'` is a gradient-boosted forest
-  with second-order (Newton) leaves that matches or beats tuned XGBoost on
-  several tasks (see `benchmarks/results/tabarena.md`). Both serve in
-  microseconds, are deterministic, and carry the same exact-replay receipts as
-  the stat models. The student blob is bounds-checked on read (caller-writable
+  with second-order (Newton) leaves that matches or beats tuned XGBoost on most
+  tasks (see `benchmarks/results/tabarena-full.md`). With `proba` and `classes`
+  the gbt student distills the teacher's full probability distribution
+  (soft-label distillation) instead of its hard argmax, preserving the
+  calibration a foundation-model teacher provides. Both serve in microseconds,
+  are deterministic, and carry the same exact-replay receipts as the stat
+  models. The student blob is bounds-checked on read (caller-writable
   registry).
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.

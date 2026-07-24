@@ -105,9 +105,24 @@ k-NN into a standalone tree).
 
 Two student kinds: `'tree'` is a single decision tree (a few kilobytes,
 interpretable); `'gbt'` is a gradient-boosted forest with second-order
-(Newton) leaves that on the [TabArena benchmark](benchmarks/results/tabarena.md)
-matches or beats tuned XGBoost on several tasks while still running in the
+(Newton) leaves that on the [TabArena benchmark](benchmarks/results/tabarena-full.md)
+matches or beats tuned XGBoost on most tasks while still running in the
 zero-dependency core.
+
+When the teacher gives calibrated probabilities (as a foundation model does),
+distill its whole distribution instead of its hard label with `proba` and
+`classes`: name the per-class probability columns, and the gbt student matches
+the teacher's soft targets rather than its argmax, keeping the calibration a
+hard label throws away.
+
+```sql
+-- distill TabFM's predicted probabilities (columns p_stay, p_churn), while the
+-- true `churned` label scores the holdout
+SELECT model_id, holdout_metric FROM distill(
+  'SELECT tenure, spend, plan, p_stay, p_churn, churned FROM scored',
+  '{"target":"churned","proba":["p_stay","p_churn"],
+    "classes":["stay","churn"],"student_id":"churn-soft"}');
+```
 
 An opt-in ONNX build (`make loadable-onnx`) runs exported models through
 onnxruntime. Point `predict_register()` at a model file and call it by name;

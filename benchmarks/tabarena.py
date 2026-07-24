@@ -246,6 +246,42 @@ def run_ours_distill_teacher(Xtr, teacher_tr, Xte, task, kind="gbt"):
     return [r[1] for r in rows], blob
 
 
+def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte):
+    """Soft-label distillation of TabFM: the student learns TabFM's per-class
+    probability distribution (predict_proba) via the extension's proba/classes
+    options, instead of its hard argmax. The true labels stay in `label` so the
+    holdout is scored against ground truth."""
+    import json
+    db = _ext()
+    k, K = Xtr.shape[1], proba.shape[1]
+    feats = ", ".join(f"f{i} REAL" for i in range(k))
+    pcols = ", ".join(f"p{j} REAL" for j in range(K))
+    db.execute(f"CREATE TABLE tr({feats}, {pcols}, label TEXT)")
+    db.executemany(
+        f"INSERT INTO tr VALUES ({','.join('?' * (k + K + 1))})",
+        [list(map(float, r)) + list(map(float, pr)) + [str(y)]
+         for r, pr, y in zip(Xtr.values, proba, ytr)])
+    db.execute(f"CREATE TABLE te(id INTEGER, {feats})")
+    db.executemany(f"INSERT INTO te VALUES ({','.join('?' * (k + 1))})",
+                   [[i] + list(map(float, r)) for i, r in enumerate(Xte.values)])
+    fl = ", ".join(f"f{i}" for i in range(k))
+    pl = ", ".join(f"p{j}" for j in range(K))
+    db.execute(
+        f"SELECT content_hash FROM distill('SELECT {fl}, {pl}, label FROM tr',"
+        f" json_object('target','label','proba',json(?),'classes',json(?),"
+        f"'student_id','s'))",
+        (json.dumps([f"p{j}" for j in range(K)]),
+         json.dumps([str(c) for c in classes])))
+    blob = db.execute("SELECT length(weights) FROM _predict_models WHERE"
+                      " model_id='s'").fetchone()[0]
+    rows = db.execute(
+        f"SELECT row_ref, prediction FROM predict(NULL,'SELECT id, {fl} FROM"
+        f" te', json_object('model','s','receipt',0)) ORDER BY row_ref"
+    ).fetchall()
+    db.close()
+    return [r[1] for r in rows], blob
+
+
 def run_ours_knn5(Xtr, ytr, Xte, task):
     db = _ext()
     feats = _load_tables(db, Xtr, ytr, Xte, task)
@@ -319,19 +355,31 @@ def main():
             tabfm_p, est = run_tabfm(Xtr, ytr, Xte, task)
             rec["tabfm"] = score(yte, tabfm_p, task)
             rec["tabfm_s"] = time.time() - t0
-            # teacher train predictions -> distilled students
-            teacher_tr = est.predict(Xtr.values)
+            # teacher train predictions -> distilled students. For
+            # classification, one predict_proba pass gives both the hard argmax
+            # (tree<-tabfm, gbt<-tabfm) and the soft distribution (no extra
+            # TabFM forward).
+            if task == "cls":
+                proba = est.predict_proba(Xtr.values)
+                classes = list(est.classes_)
+                teacher_tr = np.asarray(classes)[proba.argmax(1)]
+            else:
+                proba = classes = None
+                teacher_tr = est.predict(Xtr.values)
             tree_p = sklearn_tree(Xtr, teacher_tr, Xte, task)
             rec["tree<-tabfm"] = score(yte, tree_p, task)
-            # our native gbt student, distilled from the SAME TabFM predictions
-            # through the extension (teacher='none')
             gtp, gtblob = run_ours_distill_teacher(Xtr, teacher_tr, Xte, task,
                                                    "gbt")
             rec["gbt<-tabfm (ours)"] = score(yte, gtp, task)
             student_bytes.append(gtblob)
+            if task == "cls":  # soft-label distillation of TabFM's distribution
+                sp, sblob = run_ours_distill_soft(Xtr, ytr, proba, classes, Xte)
+                rec["gbt<-tabfm soft (ours)"] = score(yte, sp, task)
+                student_bytes.append(sblob)
         except Exception as e:  # noqa: BLE001
             rec["tabfm"] = rec["tree<-tabfm"] = float("nan")
             rec["gbt<-tabfm (ours)"] = float("nan")
+            rec["gbt<-tabfm soft (ours)"] = float("nan")
             rec["tabfm_s"] = float("nan")
             print("  tabfm fail:", type(e).__name__, str(e)[:120])
 
@@ -375,7 +423,8 @@ def _fmt(v):
 
 def _write(rows, student_bytes):
     cols = ["xgboost", "tabfm", "tree<-tabfm", "gbt<-tabfm (ours)",
-            "knn5 (ours)", "tree<-knn5 (ours)", "gbt<-knn5 (ours)"]
+            "gbt<-tabfm soft (ours)", "knn5 (ours)", "tree<-knn5 (ours)",
+            "gbt<-knn5 (ours)"]
     lines = ["# TabArena-spirit benchmark\n",
              "Curated OpenML subset, single 75/25 split (seed 0), features",
              f"capped at {MAX_FEAT}, rows capped at {MAX_ROWS}. Metric:",

@@ -79,6 +79,15 @@ int main(void) {
           " '{\"target\":\"label\",\"teacher\":\"knn5-incontext\","
           "\"student_id\":\"soak_knn\",\"student_kind\":\"gbt\"}')",
           1) ||
+      run_discard( /* soft-label distillation: proba columns synthesized */
+          db,
+          "SELECT * FROM distill('SELECT f1, f2,"
+          " CASE WHEN label=''c0'' THEN 0.75 ELSE 0.25 END AS pc0,"
+          " CASE WHEN label=''c1'' THEN 0.75 ELSE 0.25 END AS pc1,"
+          " label FROM tab', '{\"target\":\"label\","
+          "\"proba\":[\"pc0\",\"pc1\"],\"classes\":[\"c0\",\"c1\"],"
+          "\"student_id\":\"soak_soft\"}')",
+          1) ||
       run_discard(db,
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_bad',"
@@ -125,6 +134,9 @@ int main(void) {
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_knn\",\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                    " '{\"model\":\"soak_soft\",\"receipt\":0}')",
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_bad\",\"receipt\":0}')",

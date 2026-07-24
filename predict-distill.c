@@ -978,9 +978,16 @@ static int bld_build(Builder *b, int *idx, int n, int depth) {
 
 
 /* Train a GBT on the teacher targets. Fills the numeric parts of *fo; the
- * caller sets feat_names and labels (as for the single-tree path). */
+ * caller sets feat_names and labels (as for the single-tree path). For
+ * classification, `soft` (when
+ * non-NULL) is a row-major [n, nclass] matrix of teacher class probabilities
+ * that replaces the hard one-hot label: the student then matches the teacher's
+ * whole distribution (soft-label distillation), transferring the calibrated
+ * probabilities a hard argmax throws away. NULL `soft` keeps the hard-label
+ * path. Regression ignores `soft`. */
 static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
-                     const i32 *yc, const f32 *yr, Forest *fo, char **errmsg) {
+                     const i32 *yc, const f32 *yr, const f32 *soft, Forest *fo,
+                     char **errmsg) {
   memset(fo, 0, sizeof(*fo));
   int rounds = GBT_ROUNDS, nscore = task == 0 ? nclass : 1;
   fo->task = task;
@@ -1007,10 +1014,21 @@ static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
 
   if (task == 0) {
     for (int c = 0; c < nscore; c++) {
-      int cnt = 0;
-      for (int i = 0; i < n; i++)
-        cnt += yc[i] == c;
-      fo->init[c] = (f32)log((cnt + 1.0) / (n + nscore)); /* smoothed log prior */
+      f64 pri;
+      if (soft) { /* mean teacher probability for the class */
+        f64 sum = 0;
+        for (int i = 0; i < n; i++)
+          sum += soft[(size_t)i * nscore + c];
+        pri = sum / n;
+        if (pri < 1e-6)
+          pri = 1e-6;
+      } else {
+        int cnt = 0;
+        for (int i = 0; i < n; i++)
+          cnt += yc[i] == c;
+        pri = (cnt + 1.0) / (n + nscore); /* smoothed */
+      }
+      fo->init[c] = (f32)log(pri);
     }
     for (int i = 0; i < n; i++)
       for (int c = 0; c < nscore; c++)
@@ -1045,7 +1063,9 @@ static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
       if (task == 0)
         for (int i = 0; i < n; i++) {
           f64 pi = p[(size_t)i * nscore + s];
-          grad[i] = (yc[i] == s ? 1.f : 0.f) - (f32)pi;
+          f32 tgt =
+              soft ? soft[(size_t)i * nscore + s] : (yc[i] == s ? 1.f : 0.f);
+          grad[i] = tgt - (f32)pi;
           hess[i] = (f32)(pi * (1.0 - pi)); /* softmax curvature */
         }
       else
@@ -1110,6 +1130,8 @@ done:
 
 typedef struct {
   char *target, *task, *student_id, *teacher, *student_kind;
+  char *proba;   /* JSON array of soft-target probability column names */
+  char *classes; /* JSON array of class labels, same order as `proba` */
   int receipt;
 } DistOpts;
 
@@ -1119,6 +1141,8 @@ static void dist_opts_free(DistOpts *o) {
   sqlite3_free(o->student_id);
   sqlite3_free(o->teacher);
   sqlite3_free(o->student_kind);
+  sqlite3_free(o->proba);
+  sqlite3_free(o->classes);
 }
 
 /* Return the class index for `s`, interning it into *labels (growing *cap and
@@ -1169,6 +1193,8 @@ static int dist_opt_cb(void *ctx, const char *key, sqlite3_value *value,
                 : strcmp(key, "student_id") == 0    ? &o->student_id
                 : strcmp(key, "teacher") == 0       ? &o->teacher
                 : strcmp(key, "student_kind") == 0  ? &o->student_kind
+                : strcmp(key, "proba") == 0         ? &o->proba
+                : strcmp(key, "classes") == 0       ? &o->classes
                                                     : NULL;
   if (slot) {
     sqlite3_free(*slot); /* free-before-assign: duplicate JSON key */
@@ -1178,8 +1204,55 @@ static int dist_opt_cb(void *ctx, const char *key, sqlite3_value *value,
 }
 
 static const char *const DIST_OPTION_KEYS[] = {
-    "target",  "task",         "student_id", "teacher",
-    "student_kind", "receipt", NULL};
+    "target",       "task",    "student_id", "teacher", "student_kind",
+    "proba",        "classes", "receipt",    NULL};
+
+/* Parse a JSON array of strings into a heap array of sqlite3_mprintf'd
+ * strings. Returns SQLITE_OK and sets out and n (caller frees each element and
+ * the array). On a non-array or parse error, returns SQLITE_ERROR with errmsg
+ * set. */
+static int parse_str_array(sqlite3 *db, const char *json, char ***out, int *n,
+                           char **errmsg) {
+  *out = NULL;
+  *n = 0;
+  int cap = 0;
+  sqlite3_stmt *st = NULL;
+  if (sqlite3_prepare_v2(db, "SELECT value FROM json_each(?) WHERE"
+                             " json_type(?) = 'array'",
+                         -1, &st, NULL) != SQLITE_OK) {
+    *errmsg = sqlite3_mprintf("%s: cannot parse option array", PREDICT_ERR_OPTIONS);
+    return SQLITE_ERROR;
+  }
+  sqlite3_bind_text(st, 1, json, -1, SQLITE_STATIC);
+  sqlite3_bind_text(st, 2, json, -1, SQLITE_STATIC);
+  int rc = SQLITE_OK;
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    if (*n == cap) {
+      cap = cap ? cap * 2 : 8;
+      char **g = sqlite3_realloc(*out, sizeof(char *) * cap);
+      if (!g) {
+        rc = SQLITE_NOMEM;
+        break;
+      }
+      *out = g;
+    }
+    (*out)[*n] = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(st, 0));
+    if (!(*out)[*n]) {
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    (*n)++;
+  }
+  sqlite3_finalize(st);
+  return rc;
+}
+
+static int name_index(char *const *arr, int n, const char *s) {
+  for (int i = 0; i < n; i++)
+    if (strcmp(arr[i], s) == 0)
+      return i;
+  return -1;
+}
 
 typedef struct {
   char *model_id;
@@ -1274,9 +1347,89 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
   int *idx = NULL;
   char *read_sql = NULL, *apply_sql = NULL, *teacher_sql = NULL, *params = NULL;
   sqlite3_stmt *rq = NULL, *tqs = NULL;
+  char **proba_names = NULL, **soft_labels = NULL; /* soft distillation */
+  int nproba = 0, nsoft = 0, *proba_col = NULL;
+  f32 *soft_P = NULL; /* [n, nproba] teacher class probabilities */
+  sqlite3_stmt *sps = NULL;
+  int soft = o->proba != NULL;
 
   const char *teacher = o->teacher; /* NULL => train directly on the target */
   const char *task = classify ? "classify" : "regress";
+
+  /* ---- soft-label distillation setup: teacher class probabilities live in
+   * named columns (`proba`), one per class (`classes`), which the gbt student
+   * matches instead of a hard label. Exclude those columns from the features
+   * and capture their indices. ---- */
+  if (soft) {
+    if (!classify) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: 'proba' (soft distillation) is"
+                                " classification only",
+                                PREDICT_ERR_OPTIONS);
+      goto done;
+    }
+    if (o->student_kind && strcmp(o->student_kind, "gbt") != 0) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: soft distillation requires"
+                                " student_kind 'gbt'",
+                                PREDICT_ERR_OPTIONS);
+      goto done;
+    }
+    if (!o->classes) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: 'proba' requires 'classes'",
+                                PREDICT_ERR_OPTIONS);
+      goto done;
+    }
+    if (parse_str_array(db, o->proba, &proba_names, &nproba, errmsg) !=
+            SQLITE_OK ||
+        parse_str_array(db, o->classes, &soft_labels, &nsoft, errmsg) !=
+            SQLITE_OK) {
+      rc = SQLITE_ERROR;
+      goto done;
+    }
+    if (nproba < 2 || nproba != nsoft) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf(
+          "%s: 'proba' and 'classes' must be equal-length arrays of >= 2",
+          PREDICT_ERR_OPTIONS);
+      goto done;
+    }
+    proba_col = sqlite3_malloc(sizeof(int) * nproba);
+    if (!proba_col) {
+      rc = SQLITE_NOMEM;
+      goto done;
+    }
+    for (int k = 0; k < nproba; k++)
+      proba_col[k] = -1;
+    int w = 0;
+    for (int r = 0; r < nfeat; r++) {
+      int k = name_index(proba_names, nproba, feat_names[r]);
+      if (k >= 0) {
+        proba_col[k] = feat_col[r]; /* query column index of this class prob */
+        sqlite3_free(feat_names[r]);
+      } else {
+        feat_names[w] = feat_names[r];
+        feat_col[w] = feat_col[r];
+        w++;
+      }
+    }
+    nfeat = w;
+    for (int k = 0; k < nproba; k++)
+      if (proba_col[k] < 0) {
+        rc = SQLITE_ERROR;
+        *errmsg = sqlite3_mprintf("%s: proba column '%s' not in train_query",
+                                  PREDICT_ERR_SCHEMA, proba_names[k]);
+        goto done;
+      }
+    if (nfeat == 0) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: no feature columns left after excluding"
+                                " proba columns",
+                                PREDICT_ERR_SCHEMA);
+      goto done;
+    }
+  }
 
   /* ---- 2. read features + true labels (row_number keeps a stable order) ---- */
   read_sql = sqlite3_mprintf(
@@ -1361,14 +1514,63 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     goto done;
   }
 
+  /* soft distillation: read the probability columns in the same row order and
+   * normalize each row to a distribution (defensive: clamp negatives, rescale;
+   * a degenerate row falls back to uniform). */
+  if (soft) {
+    soft_P = sqlite3_malloc(sizeof(f32) * (size_t)n * nproba);
+    if (!soft_P) {
+      rc = SQLITE_NOMEM;
+      goto done;
+    }
+    if (sqlite3_prepare_v2(db, read_sql, -1, &sps, NULL) != SQLITE_OK) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: could not re-read proba columns: %s",
+                                PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
+      goto done;
+    }
+    int si = 0;
+    while (si < n && sqlite3_step(sps) == SQLITE_ROW) {
+      f64 sum = 0;
+      for (int k = 0; k < nproba; k++) {
+        f64 v = sqlite3_column_double(sps, proba_col[k] + 1); /* +1 for _rid */
+        if (v < 0)
+          v = 0;
+        soft_P[(size_t)si * nproba + k] = (f32)v;
+        sum += v;
+      }
+      if (sum > 1e-12)
+        for (int k = 0; k < nproba; k++)
+          soft_P[(size_t)si * nproba + k] /= (f32)sum;
+      else
+        for (int k = 0; k < nproba; k++)
+          soft_P[(size_t)si * nproba + k] = 1.f / nproba;
+      si++;
+    }
+    sqlite3_finalize(sps);
+    sps = NULL;
+    if (si != n) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: proba re-read yielded %d of %d rows",
+                                PREDICT_ERR_RESOURCE, si, n);
+      goto done;
+    }
+  }
+
   /* ---- 3. training signal per row ----
-   * With no teacher (the default) the student trains directly on the target
-   * column: it already holds the labels, or a strong teacher's precomputed
-   * predictions (e.g. an offline TabFM run) that you want compressed into a
-   * native student that runs anywhere. A named teacher is a registered
-   * predict() model, re-run over the same rows (aligned by _rid) to relabel
-   * them. */
-  if (!teacher) {
+   * Soft distillation: the class vocabulary is the given `classes`, and the
+   * per-row soft targets are already in soft_P; there is no teacher to run.
+   * Otherwise, with no teacher (the default) the student trains directly on
+   * the target column: it already holds the labels, or a strong teacher's
+   * precomputed predictions (e.g. an offline TabFM run) that you want
+   * compressed into a native student that runs anywhere. A named teacher is a
+   * registered predict() model, re-run over the same rows (aligned by _rid) to
+   * relabel them. */
+  if (soft) {
+    labels = soft_labels; /* transfer ownership; matched to soft_P columns */
+    soft_labels = NULL;
+    nclass = nproba;
+  } else if (!teacher) {
     for (int i = 0; i < n; i++) {
       if (classify) {
         int cl = intern_label(&labels, &nclass, &nlab_cap, y_true_c[i], &rc);
@@ -1440,13 +1642,13 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
   if (n_hold < 1)
     n_hold = 1;
   int n_fit = n - n_hold;
-  int is_gbt = o->student_kind && strcmp(o->student_kind, "gbt") == 0;
+  int is_gbt = soft || (o->student_kind && strcmp(o->student_kind, "gbt") == 0);
   int correct = 0;
   f64 sse = 0;
 
   if (is_gbt) {
     rc = train_gbt(X, n_fit, nfeat, classify ? 0 : 1, nclass, y_teach,
-                   y_teach_r, &forest, errmsg);
+                   y_teach_r, soft ? soft_P : NULL, &forest, errmsg);
     if (rc != SQLITE_OK)
       goto done;
     forest.feat_names = sqlite3_malloc(sizeof(char *) * nfeat);
@@ -1615,13 +1817,18 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     if (sqlite3_prepare_v2(
             db,
             "SELECT json_object('target',?1,'task',?2,'teacher',?3,"
-            "'student_kind',?4,'receipt',1)",
+            "'student_kind',?4,'proba',json(?5),'classes',json(?6),"
+            "'receipt',1)",
             -1, &pj, NULL) == SQLITE_OK) {
       sqlite3_bind_text(pj, 1, o->target, -1, SQLITE_STATIC);
       sqlite3_bind_text(pj, 2, task, -1, SQLITE_STATIC);
       sqlite3_bind_text(pj, 3, teacher, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 4, o->student_kind ? o->student_kind : "tree", -1,
-                        SQLITE_STATIC);
+      sqlite3_bind_text(pj, 4,
+                        o->student_kind ? o->student_kind
+                                        : (soft ? "gbt" : "tree"),
+                        -1, SQLITE_STATIC);
+      sqlite3_bind_text(pj, 5, o->proba, -1, SQLITE_STATIC);
+      sqlite3_bind_text(pj, 6, o->classes, -1, SQLITE_STATIC);
       if (sqlite3_step(pj) == SQLITE_ROW)
         params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
       sqlite3_finalize(pj);
@@ -1663,6 +1870,18 @@ done:
     for (int i = 0; i < nclass; i++)
       sqlite3_free(labels[i]);
   sqlite3_free(labels);
+  if (proba_names)
+    for (int k = 0; k < nproba; k++)
+      sqlite3_free(proba_names[k]);
+  sqlite3_free(proba_names);
+  if (soft_labels) /* NULL once transferred to `labels` */
+    for (int k = 0; k < nsoft; k++)
+      sqlite3_free(soft_labels[k]);
+  sqlite3_free(soft_labels);
+  sqlite3_free(proba_col);
+  sqlite3_free(soft_P);
+  if (sps)
+    sqlite3_finalize(sps);
   sqlite3_free(idx);
   sqlite3_free(blob);
   tree_free(&tree);

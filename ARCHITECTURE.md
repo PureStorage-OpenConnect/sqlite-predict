@@ -95,7 +95,12 @@ gradient but sets each leaf to the **second-order (Newton) step**
 XGBoost above a vanilla gradient booster — with shrinkage (a small learning
 rate over many rounds) doing the regularizing. It is deterministic by
 construction: no bootstrap, no feature-sampling, no early-stopping split, so
-the student stays reproducible and exactly replayable. `predict()` dispatches
+the student stays reproducible and exactly replayable. Given `proba` and
+`classes`, the same forest distills the teacher's per-class probability
+distribution (soft-label distillation): the softmax cross-entropy target
+becomes the teacher's probability rather than a hard one-hot, so the student
+inherits a foundation model's calibration instead of only its argmax, while
+the holdout is still scored against the true `target` labels. `predict()` dispatches
 a `tree`-runtime model to the native runtime in the same file, which tells a
 single tree (`PSTREE` blob) from a forest (`PSGBT` blob) by magic and needs
 no onnxruntime. Both blob formats are little-endian and implementation-defined
