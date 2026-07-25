@@ -39,7 +39,7 @@ The numbers RFC 0005's open questions asked for, measured.
   Convergence at 300 labels marks the honest boundary.
 
 Model policy these numbers fix: cheap statistical/in-context models as
-the zero-dependency defaults; distill() as the FM value path; raw FMs
+the zero-dependency defaults; distill_predict() as the FM value path; raw FMs
 as opt-in teachers (ONNX build), never default serving.
 
 ## Dogfood (gestalt ai-ml-trends thread cache, 5,223 observations)
@@ -56,7 +56,7 @@ as opt-in teachers (ONNX build), never default serving.
 ## Open-question answers for the RFC revision
 
 - **OQ1 (runtime):** deferred correctly. The 33 s CPU TabFM calls and
-  the distillation results mean the FM path is distill()-first; a GGML
+  the distillation results mean the FM path is distill_predict()-first; a GGML
   or ONNX teacher build is about batch distillation, not serving. The
   ONNX serving path shipped (vector + in_context layouts, CPU); the
   TabFM→ONNX eval (`results/tabfm-onnx.md`) then characterized TabFM itself.

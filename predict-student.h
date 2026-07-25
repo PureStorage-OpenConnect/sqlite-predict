@@ -8,7 +8,7 @@
  * decision-tree / gradient-boosted-forest / MLP inference runtimes, and
  * predict0_tree_run (the runtime='tree' serving entry point, declared in
  * predict-internal.h). It carries no training code. The trainers and the
- * distill() vtab live in predict-distill.c and write blobs in exactly this
+ * distill_predict() vtab live in predict-distill.c and write blobs in exactly this
  * format; this file reads and executes them. */
 #ifndef PREDICT_STUDENT_H
 #define PREDICT_STUDENT_H
@@ -66,7 +66,7 @@ typedef struct {
 } MLP;
 
 /* Serialize a trained student to its inline blob (caller frees *blob_out with
- * sqlite3_free). Used by distill(); the matching deserializers are internal to
+ * sqlite3_free). Used by distill_predict(); the matching deserializers are internal to
  * the runtime and picked by blob magic. */
 int tree_serialize(const Tree *t, void **blob_out, int *len_out);
 int forest_serialize(const Forest *f, void **blob_out, int *len_out);
@@ -84,7 +84,7 @@ void tree_free(Tree *t);
 void forest_free(Forest *f);
 void mlp_free(MLP *m);
 
-/* Inference, shared by predict0_tree_run and distill()'s holdout evaluation. */
+/* Inference, shared by predict0_tree_run and distill_predict()'s holdout evaluation. */
 int tree_walk(const Tree *t, const f32 *x);
 f32 reg_tree_value(const TreeNode *nd, int guard, const f32 *x);
 int forest_predict_row(const Forest *f, const f32 *x, f64 *scbuf, char **pred,

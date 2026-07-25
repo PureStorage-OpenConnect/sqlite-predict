@@ -12,7 +12,7 @@ small-label regimes. Reports retention = (arm-floor)/(teacher-floor),
 student serve latency, and student size.
 
 sklearn students are a harness-only proxy for the C tree students the
-extension's distill() will ship.
+extension's distill_predict() will ship.
 
 Usage: uv run --with 'tabfm[pytorch]' --with safetensors --with scikit-learn \
          python distill_validation.py

@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* distill() -- RFC 0005 §4.2.4 -- and the native-student TRAINERS.
+/* distill_predict() -- RFC 0005 §4.2.4 -- and the native-student TRAINERS.
  *
  * The training half of distillation: the CART / gradient-boosted / MLP
- * trainers and the distill() table-valued function. distill() fits a student
+ * trainers and the distill_predict() table-valued function. distill_predict() fits a student
  * on a training signal (the target column by default, or a named teacher
  * model's predictions), evaluates it on a held-out fraction, serializes it via
  * predict-student.c, and registers it in _predict_models. The student then
@@ -606,7 +606,7 @@ done:
   return rc;
 }
 
-/* ---- the distill() operation ---- */
+/* ---- the distill_predict() operation ---- */
 
 typedef struct {
   char *target, *task, *student_id, *teacher, *student_kind;
@@ -1500,7 +1500,7 @@ static int dl_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdx) {
   }
   if (!seen_train) {
     pVtab->zErrMsg = sqlite3_mprintf(
-        "%s: distill(train_query, options) requires a train_query",
+        "%s: distill_predict(train_query, options) requires a train_query",
         PREDICT_ERR_SCHEMA);
     return SQLITE_ERROR;
   }
@@ -1568,9 +1568,10 @@ static int dl_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   } while (0)
 
   if (!o.target)
-    DL_FAIL("%s: distill requires a target option", PREDICT_ERR_TARGET);
+    DL_FAIL("%s: distill_predict requires a target option", PREDICT_ERR_TARGET);
   if (!o.student_id)
-    DL_FAIL("%s: distill requires a student_id option", PREDICT_ERR_OPTIONS);
+    DL_FAIL("%s: distill_predict requires a student_id option",
+            PREDICT_ERR_OPTIONS);
   if (o.task && strcmp(o.task, "classify") != 0 &&
       strcmp(o.task, "regress") != 0)
     DL_FAIL("%s: task must be classify|regress: %s", PREDICT_ERR_TASK, o.task);
@@ -2138,7 +2139,7 @@ static sqlite3_module forecastDistillModule = {
     /* xIntegrity  */ NULL};
 
 int predict0_distill_init(sqlite3 *db) {
-  int rc = sqlite3_create_module(db, "distill", &distillModule, NULL);
+  int rc = sqlite3_create_module(db, "distill_predict", &distillModule, NULL);
   if (rc != SQLITE_OK)
     return rc;
   return sqlite3_create_module(db, "distill_forecast", &forecastDistillModule,

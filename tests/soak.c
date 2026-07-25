@@ -64,24 +64,24 @@ int main(void) {
    * training path, the tree runtime, and the bounds-checked deserializer. */
   if (run_discard(
           db,
-          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
           " '{\"target\":\"label\",\"student_id\":\"soak_student\"}')",
           1) ||
       run_discard(
           db,
-          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
           " '{\"target\":\"label\",\"student_id\":\"soak_gbt\","
           "\"student_kind\":\"gbt\"}')",
           1) ||
       run_discard(
           db,
-          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
           " '{\"target\":\"label\",\"teacher\":\"knn5-incontext\","
           "\"student_id\":\"soak_knn\",\"student_kind\":\"gbt\"}')",
           1) ||
       run_discard( /* soft-label distillation: proba columns synthesized */
           db,
-          "SELECT * FROM distill('SELECT f1, f2,"
+          "SELECT * FROM distill_predict('SELECT f1, f2,"
           " CASE WHEN label=''c0'' THEN 0.75 ELSE 0.25 END AS pc0,"
           " CASE WHEN label=''c1'' THEN 0.75 ELSE 0.25 END AS pc1,"
           " label FROM tab', '{\"target\":\"label\","
@@ -90,7 +90,7 @@ int main(void) {
           1) ||
       run_discard( /* mlp student (softmax net) */
           db,
-          "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+          "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
           " '{\"target\":\"label\",\"student_kind\":\"mlp\","
           "\"student_id\":\"soak_mlp\"}')",
           1) ||
@@ -163,10 +163,10 @@ int main(void) {
                     " '{\"model\":\"soak_mlp_bad\",\"receipt\":0}')",
                 0);
     run_discard(db,
-                "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+                "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                 " '{\"target\":\"label\",\"student_id\":\"soak_student\"}')",
                 0);
-    run_discard(db, "SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+    run_discard(db, "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                     " '{\"student_id\":\"nope\"}')",
                 0);
 

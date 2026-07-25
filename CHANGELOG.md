@@ -8,9 +8,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `forecast()`, `detect_anomalies()`, `predict()`, and `distill()`
+- `forecast()`, `detect_anomalies()`, `predict()`, and `distill_predict()`
   table-valued functions with a trailing JSON options argument.
-- `distill()` trains a native student, stored as an inline BLOB and executed
+- `distill_predict()` trains a native student, stored as an inline BLOB and executed
   by the zero-dependency core with no onnxruntime. By default it trains on the
   target column — your labels, or a strong teacher's predictions computed
   offline (run TabFM once, store its output, distill it into a student that

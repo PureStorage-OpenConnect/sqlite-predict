@@ -4,7 +4,7 @@
 /* predict(train_query, apply_query, options) — RFC 0005 §4.2.3.
  * v0 backing: knn5-incontext (kind 'tabular-stat'), the measured honest
  * baseline from the benchmark campaign: z-scored 5-NN with per-column
- * categorical coding. Foundation-model teachers arrive via distill()
+ * categorical coding. Foundation-model teachers arrive via distill_predict()
  * and the opt-in ONNX build; the benchmarks showed raw in-context FMs
  * are teachers, not serving paths (30s+/call on CPU). */
 #include "predict-internal.h"

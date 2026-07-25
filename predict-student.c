@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Pure Storage, Inc.
  */
 /* Native student format + serving runtime (RFC 0005 §4.1.6). Reads and
- * executes the inline student blobs distill() produces: a single decision tree
+ * executes the inline student blobs distill_predict() produces: a single tree
  * (PSTREE01), a gradient-boosted forest (PSGBT01), or a one-hidden-layer MLP
  * (PSMLP01), told apart by the 8-byte magic. Every field is bounds-checked on
  * read, because the registry is writable by any SQL caller (RFC §6.2). This

@@ -21,7 +21,7 @@ Source layout:
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
 | `predict-student.c` | the native student **serving** runtime: blob (de)serialization and tree / forest / MLP inference (`predict0_tree_run`). The serve side of the train/serve boundary |
 | `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on (RFC §4.1.6) |
-| `predict-distill.c` | the **training** side: the CART / gradient-boosting / MLP trainers, the `distill()` vtab, and the `distill_forecast()` vtab that fits the forecast student. Builds student blobs that `predict-student.c` serves |
+| `predict-distill.c` | the **training** side: the CART / gradient-boosting / MLP trainers, the `distill_predict()` vtab, and the `distill_forecast()` vtab that fits the forecast student. Builds student blobs that `predict-student.c` serves |
 | `predict-internal.h` | shared types, contract constants, error codes, internal prototypes |
 | `vendor/sha256.c` | a self-contained FIPS 180-4 SHA-256 |
 
@@ -78,7 +78,7 @@ Even so, the `benchmarks/` numbers (and the TabFM→ONNX eval in
 `benchmarks/results/tabfm-onnx.md`) are why the default answer for a
 teacher's accuracy is usually distillation to a small student.
 
-`distill()` (`predict-distill.c`) is that path, and it lives in the
+`distill_predict()` (`predict-distill.c`) is that path, and it lives in the
 zero-dependency core. It fits a native student on a training signal,
 evaluates it on a held-out fraction, and writes the student into
 `_predict_models` as an inline BLOB (`runtime='tree'`, `kind='student'`). By

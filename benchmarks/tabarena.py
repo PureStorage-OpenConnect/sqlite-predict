@@ -7,7 +7,7 @@ lines up, on the same train/test splits:
   - xgboost                the strong tabular baseline
   - tabfm (ref)            the zero-shot foundation model (local weights)
   - knn5-incontext (ours)  our shipping in-context model, via the extension
-  - tree<-knn5 (ours)      our distill(): a native tree student, via the ext
+  - tree<-knn5 (ours)      our distill_predict(): a native tree student, via the ext
   - tree<-tabfm (ref)      a tree fit on TabFM's train predictions (the
                            distillation principle with the real FM; our
                            extension can't serve TabFM as a teacher yet)
@@ -230,13 +230,13 @@ def _load_tables(db, Xtr, ytr, Xte, task):
 def run_ours_distill_teacher(Xtr, teacher_tr, Xte, task, kind="gbt"):
     """Distill our native student from a precomputed teacher's train
     predictions: the label column holds the teacher's output, so the default
-    distill() (no teacher arg) trains directly on it. This is a real distill()
+    distill_predict() (no teacher arg) trains directly on it. This is a real distill_predict()
     of TabFM into a student that ships in the zero-dependency core -- no
     onnxruntime, no TabFM at serve time."""
     db = _ext()
     feats = _load_tables(db, Xtr, pd.Series(teacher_tr), Xte, task)
     hold = db.execute(
-        f"SELECT holdout_metric FROM distill('SELECT {feats}, label FROM tr',"
+        f"SELECT holdout_metric FROM distill_predict('SELECT {feats}, label FROM tr',"
         f" json_object('target','label','task',?,"
         f"'student_id','s','student_kind',?))",
         ("classify" if task == "cls" else "regress", kind)).fetchone()[0]
@@ -271,7 +271,7 @@ def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte, kind="gbt"):
     fl = ", ".join(f"f{i}" for i in range(k))
     pl = ", ".join(f"p{j}" for j in range(K))
     hold = db.execute(
-        f"SELECT holdout_metric FROM distill('SELECT {fl}, {pl}, label FROM"
+        f"SELECT holdout_metric FROM distill_predict('SELECT {fl}, {pl}, label FROM"
         f" tr', json_object('target','label','proba',json(?),'classes',json(?),"
         f"'student_kind',?,'student_id','s'))",
         (json.dumps([f"p{j}" for j in range(K)]),
@@ -338,11 +338,11 @@ def run_ours_knn5(Xtr, ytr, Xte, task):
 
 def run_ours_distill(Xtr, ytr, Xte, task, kind="tree"):
     """Distill the in-context knn5 teacher into a native student (teacher named
-    explicitly: distill() re-runs knn5 over the rows to relabel them)."""
+    explicitly: distill_predict() re-runs knn5 over the rows to relabel them)."""
     db = _ext()
     feats = _load_tables(db, Xtr, ytr, Xte, task)
     hold = db.execute(
-        f"SELECT holdout_metric FROM distill('SELECT {feats}, label FROM tr',"
+        f"SELECT holdout_metric FROM distill_predict('SELECT {feats}, label FROM tr',"
         f" json_object('target','label','task',?,'teacher','knn5-incontext',"
         f"'student_id','s','student_kind',?))",
         ("classify" if task == "cls" else "regress", kind)).fetchone()[0]
@@ -510,7 +510,7 @@ def _write(rows, student_bytes):
              f"fp32, {TABFM_ESTIMATORS}-member ensemble (reduced from 32 for",
              "CPU tractability); `tree<-tabfm` is a sklearn CART on TabFM's",
              "train predictions, while `gbt<-tabfm (ours)` and the `<-knn5`",
-             "students all run through the extension's own distill().\n",
+             "students all run through the extension's own distill_predict().\n",
              "| dataset | task | n | d | " + " | ".join(cols) + " | tabfm s |",
              "| --- | --- | --- | --- | " + " | ".join("---" for _ in cols) +
              " | --- |"]

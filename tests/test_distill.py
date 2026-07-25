@@ -1,4 +1,4 @@
-"""distill() and the native tree student (RFC 0005 §4.2.5).
+"""distill_predict() and the native tree student (RFC 0005 §4.2.4).
 
 distill runs a teacher over the training rows, fits a CART tree on the
 teacher's predictions, evaluates on a holdout, and registers the tree as an
@@ -20,7 +20,7 @@ def test_distill_produces_a_student(db):
     _train_table(db)
     r = db.execute(
         "SELECT model_id, content_hash, train_rows, holdout_metric, receipt_id"
-        " FROM distill('SELECT f1, f2, label FROM tab',"
+        " FROM distill_predict('SELECT f1, f2, label FROM tab',"
         " json_object('target','label','student_id','s1'))").fetchone()
     model_id, chash, rows, metric, receipt = r
     assert model_id == "s1"
@@ -37,7 +37,7 @@ def test_distill_produces_a_student(db):
 
 def test_student_predicts_and_replays(db):
     _train_table(db)
-    db.execute("SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+    db.execute("SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                " json_object('target','label','student_id','s1'))").fetchone()
     # the student runs with no train_query
     rows = db.execute(
@@ -60,7 +60,7 @@ def test_student_predicts_and_replays(db):
 
 def test_student_is_deterministic(db):
     _train_table(db)
-    db.execute("SELECT * FROM distill('SELECT f1, f2, label FROM tab',"
+    db.execute("SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                " json_object('target','label','student_id','s1'))").fetchone()
     q = ("SELECT row_ref, prediction FROM predict(NULL,"
          " 'SELECT id, f1, f2 FROM tab', json_object('model','s1','receipt',0))")
@@ -70,10 +70,10 @@ def test_student_is_deterministic(db):
 def test_distill_content_hash_is_stable(db):
     """Same data + teacher -> same student bytes -> same content hash."""
     _train_table(db)
-    h1 = db.execute("SELECT content_hash FROM distill('SELECT f1,f2,label FROM"
+    h1 = db.execute("SELECT content_hash FROM distill_predict('SELECT f1,f2,label FROM"
                     " tab', json_object('target','label','student_id','a'))"
                     ).fetchone()[0]
-    h2 = db.execute("SELECT content_hash FROM distill('SELECT f1,f2,label FROM"
+    h2 = db.execute("SELECT content_hash FROM distill_predict('SELECT f1,f2,label FROM"
                     " tab', json_object('target','label','student_id','b'))"
                     ).fetchone()[0]
     assert h1 == h2
@@ -81,10 +81,10 @@ def test_distill_content_hash_is_stable(db):
 
 def test_student_exists_is_not_overwritten(db):
     _train_table(db)
-    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+    db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                " json_object('target','label','student_id','s1'))").fetchone()
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+        db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                    " json_object('target','label','student_id','s1'))"
                    ).fetchone()
     assert "PREDICT_ERR_STUDENT_EXISTS" in str(e.value)
@@ -97,7 +97,7 @@ def test_regress_distill(db):
         [(i, i * 0.1, (i * 7) % 5, i * 0.1 + ((i * 7) % 5) * 0.5)
          for i in range(120)])
     r = db.execute(
-        "SELECT train_rows, holdout_metric FROM distill('SELECT f1, f2, y"
+        "SELECT train_rows, holdout_metric FROM distill_predict('SELECT f1, f2, y"
         " FROM r', json_object('target','y','task','regress',"
         "'student_id','rs'))").fetchone()
     assert r[0] == 120
@@ -114,7 +114,7 @@ def test_regress_distill(db):
 def test_missing_target_errors(db):
     _train_table(db)
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+        db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                    " json_object('student_id','s1'))").fetchone()
     assert "PREDICT_ERR_TARGET" in str(e.value)
 
@@ -122,7 +122,7 @@ def test_missing_target_errors(db):
 def test_missing_student_id_errors(db):
     _train_table(db)
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+        db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                    " json_object('target','label'))").fetchone()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
 
@@ -130,7 +130,7 @@ def test_missing_student_id_errors(db):
 def test_bad_task_errors(db):
     _train_table(db)
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+        db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                    " json_object('target','label','student_id','s',"
                    "'task','cluster'))").fetchone()
     assert "PREDICT_ERR_TASK" in str(e.value)
@@ -141,7 +141,7 @@ def test_mlp_student(db):
     predicts valid classes, replays exactly, and is a tiny blob."""
     _train_table(db)
     metric = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM tab',"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,label FROM tab',"
         " json_object('target','label','student_kind','mlp','student_id','m'))"
     ).fetchone()[0]
     assert 0.6 <= metric <= 1.0
@@ -166,7 +166,7 @@ def test_mlp_soft_and_regress_guard(db):
     classification only."""
     _soft_table(db)
     metric = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1,f2,pA,pB,pC,label FROM"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,pA,pB,pC,label FROM"
         " st', json_object('target','label','proba',json_array('pA','pB','pC'),"
         "'classes',json_array('A','B','C'),'student_kind','mlp',"
         "'student_id','sm'))").fetchone()[0]
@@ -175,7 +175,7 @@ def test_mlp_soft_and_regress_guard(db):
     db.executemany("INSERT INTO rr VALUES (?,?,?)",
                    [(i * 0.1, (i * 7) % 5, i * 0.2) for i in range(120)])
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM distill('SELECT f1,f2,y FROM rr',"
+        db.execute("SELECT * FROM distill_predict('SELECT f1,f2,y FROM rr',"
                    " json_object('target','y','task','regress',"
                    "'student_kind','mlp','student_id','x'))").fetchone()
     assert "classification only" in str(e.value)
@@ -183,7 +183,7 @@ def test_mlp_soft_and_regress_guard(db):
 
 def test_corrupt_mlp_blob_rejected(db):
     _train_table(db)
-    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+    db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                " json_object('target','label','student_kind','mlp',"
                "'student_id','ok'))").fetchone()
     db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
@@ -204,7 +204,7 @@ def test_too_few_rows_errors(db):
     db.execute("CREATE TABLE t(f1 REAL, f2 REAL, label TEXT)")
     db.execute("INSERT INTO t VALUES (0,0,'a'),(1,1,'b'),(2,2,'a')")
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM t',"
+        db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM t',"
                    " json_object('target','label','student_id','s'))"
                    ).fetchone()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
@@ -229,11 +229,11 @@ def test_gbt_student_beats_single_tree(db):
     boundary that one shallow tree cannot."""
     _angular3(db)
     tm = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM tr3',"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,label FROM tr3',"
         " json_object('target','label','student_id','t','student_kind','tree'))"
     ).fetchone()[0]
     gm = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM tr3',"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,label FROM tr3',"
         " json_object('target','label','student_id','g','student_kind','gbt'))"
     ).fetchone()[0]
     assert gm >= tm
@@ -241,7 +241,7 @@ def test_gbt_student_beats_single_tree(db):
 
 def test_gbt_student_predicts_and_replays(db):
     _angular3(db)
-    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tr3',"
+    db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tr3',"
                " json_object('target','label','student_id','g',"
                "'student_kind','gbt'))").fetchone()
     runtime, blob = db.execute(
@@ -271,7 +271,7 @@ def test_gbt_regression(db):
         [(i, i * 0.1, (i * 7) % 5, i * 0.1 + ((i * 7) % 5) * 0.5)
          for i in range(120)])
     m = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1,f2,y FROM r',"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,y FROM r',"
         " json_object('target','y','task','regress','student_id','rg',"
         "'student_kind','gbt'))").fetchone()[0]
     assert m >= 0
@@ -283,7 +283,7 @@ def test_gbt_regression(db):
 
 def test_corrupt_gbt_blob_rejected(db):
     _angular3(db)
-    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tr3',"
+    db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tr3',"
                " json_object('target','label','student_id','good',"
                "'student_kind','gbt'))").fetchone()
     db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
@@ -307,7 +307,7 @@ def test_default_trains_on_target_column(db):
     with no live teacher pass."""
     _train_table(db)
     metric = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1, f2, label FROM tab',"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1, f2, label FROM tab',"
         " json_object('target','label','student_id','s',"
         "'student_kind','gbt'))").fetchone()[0]
     assert 0.7 <= metric <= 1.0  # learnable boundary, trained on the labels
@@ -333,7 +333,7 @@ def test_default_learns_target_not_a_live_teacher(db):
                      "ALPHA" if (i % 20) * 0.1 < 1.0 else "OMEGA")
                     for i in range(200)])
     db.execute(
-        "SELECT * FROM distill('SELECT f1,f2,teach FROM p',"
+        "SELECT * FROM distill_predict('SELECT f1,f2,teach FROM p',"
         " json_object('target','teach','student_id','s',"
         "'student_kind','gbt'))").fetchone()
     preds = {r[0] for r in db.execute(
@@ -348,7 +348,7 @@ def test_named_teacher_relabels_via_model(db):
     compressing the in-context knn5 into a standalone tree."""
     _train_table(db)
     r = db.execute(
-        "SELECT holdout_metric, receipt_id FROM distill('SELECT f1,f2,label"
+        "SELECT holdout_metric, receipt_id FROM distill_predict('SELECT f1,f2,label"
         " FROM tab', json_object('target','label','teacher','knn5-incontext',"
         "'student_id','s'))").fetchone()
     assert 0.5 <= r[0] <= 1.0
@@ -390,7 +390,7 @@ def test_soft_distillation_produces_and_replays(db):
     holdout against the true labels (target)."""
     _soft_table(db)
     r = db.execute(
-        "SELECT holdout_metric, receipt_id FROM distill('SELECT f1,f2,pA,pB,"
+        "SELECT holdout_metric, receipt_id FROM distill_predict('SELECT f1,f2,pA,pB,"
         "pC,label FROM st', json_object('target','label','proba',"
         "json_array('pA','pB','pC'),'classes',json_array('A','B','C'),"
         "'student_id','s'))").fetchone()
@@ -419,13 +419,13 @@ def test_soft_distillation_sharper_than_hard(db):
     least as well as distilling its hard argmax, on a noisy confident teacher."""
     _soft_table(db)
     soft = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1,f2,pA,pB,pC,label FROM"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,pA,pB,pC,label FROM"
         " st', json_object('target','label','proba',json_array('pA','pB','pC'),"
         "'classes',json_array('A','B','C'),'student_id','soft'))").fetchone()[0]
     # hard: distill the argmax of the same teacher (the label column already is
     # the true class here, so train on it directly as the hard baseline)
     hard = db.execute(
-        "SELECT holdout_metric FROM distill('SELECT f1,f2,label FROM st',"
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,label FROM st',"
         " json_object('target','label','student_kind','gbt',"
         "'student_id','hard'))").fetchone()[0]
     assert soft >= hard - 0.05  # soft is competitive (usually better)
@@ -433,7 +433,7 @@ def test_soft_distillation_sharper_than_hard(db):
 
 def test_soft_distillation_errors(db):
     _soft_table(db)
-    base = "SELECT * FROM distill('SELECT f1,f2,pA,pB,pC,label FROM st',"
+    base = "SELECT * FROM distill_predict('SELECT f1,f2,pA,pB,pC,label FROM st',"
     # proba requires classes
     for opts, msg in [
         ("json_object('target','label','proba',json_array('pA','pB','pC'),"
@@ -461,7 +461,7 @@ def test_corrupt_student_blob_errors_not_crashes(db):
     db.execute("INSERT INTO a VALUES (0, 0.1, 0.2)")
     # a real distill first, so _predict_models exists to write the bad row into
     _train_table(db)
-    db.execute("SELECT * FROM distill('SELECT f1,f2,label FROM tab',"
+    db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                " json_object('target','label','student_id','good'))").fetchone()
     for blob in (b"", b"garbage", b"PSTREE01" + b"\xff" * 40,
                  b"PSTREE01" + b"\x00" * 4):
@@ -481,7 +481,7 @@ def test_distill_receipt_records_lineage(db):
     of a distill receipt is not supported (lineage only) and says so."""
     _train_table(db)
     rid = db.execute(
-        "SELECT receipt_id FROM distill('SELECT f1,f2,label FROM tab',"
+        "SELECT receipt_id FROM distill_predict('SELECT f1,f2,label FROM tab',"
         " json_object('target','label','student_id','s1'))").fetchone()[0]
     n = db.execute("SELECT count(*) FROM _predict_receipts WHERE"
                    " receipt_id=? AND operation='distill'", (rid,)).fetchone()[0]

@@ -40,7 +40,8 @@ read, so an agent can cite the number and an auditor can reproduce it.
 | `forecast(query, horizon [, options])` | Where is this metric going? | future rows with prediction intervals and per-series status |
 | `detect_anomalies(query [, options])` | Which points are abnormal? | anomaly-scored rows with expected value and probability |
 | `predict(train_query, apply_query [, options])` | Classify/regress unseen rows | a prediction and confidence per row, zero-shot from in-context examples |
-| `distill(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree or gradient-boosted forest), registered and ready for `predict()` |
+| `distill_predict(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree or gradient-boosted forest), registered and ready for `predict()` |
+| `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native forecast MLP, registered and ready for `forecast()` |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag by re-running the recorded call against its anchored data state |
 
 `query` is any read-only `SELECT`; results are ordinary rows you can join,
@@ -77,15 +78,16 @@ honest statistical models:
 
 Foundation models are treated as *teachers*, not serving paths: in
 benchmarking they were far too slow to call per query on CPU. The path to
-their accuracy is `distill()`, which trains a small native student and
-registers it as an inline model that runs in the zero-dependency core with no
-onnxruntime, serves in microseconds, and carries the same receipts. So far the
-tabular teacher we distill and benchmark is **TabFM** (see
-[`benchmarks/results/tabarena-full.md`](benchmarks/results/tabarena-full.md));
-on the time-series side **Chronos** is a reference comparison, and distilling a
-forecast foundation model is future work.
+their accuracy is distillation into a small native student that runs in the
+zero-dependency core with no onnxruntime, serves in microseconds, and carries
+the same receipts. `distill_predict()` does this for the tabular side (the
+teacher we benchmark is **TabFM**, see
+[`benchmarks/results/tabarena-full.md`](benchmarks/results/tabarena-full.md)),
+and `distill_forecast()` does it for time series: a **Chronos** teacher
+distilled into a native forecast student recovers most of the FM's edge (see
+[`benchmarks/results/forecast.md`](benchmarks/results/forecast.md)).
 
-By default `distill()` trains directly on the target column. That column can
+By default `distill_predict()` trains directly on the target column. That column can
 hold your labels, or a strong teacher's predictions computed offline: run
 TabFM once over your training rows on a GPU box, store what it predicts, and
 distill compresses it into a student that runs anywhere.
@@ -93,7 +95,7 @@ distill compresses it into a student that runs anywhere.
 ```sql
 -- distill whatever the target column holds (labels, or a teacher's
 -- precomputed predictions) into a fast native student, once
-SELECT model_id, holdout_metric FROM distill(
+SELECT model_id, holdout_metric FROM distill_predict(
   'SELECT tenure, spend, plan, churned FROM customers',
   '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
 
@@ -123,7 +125,7 @@ hard label throws away.
 ```sql
 -- distill TabFM's predicted probabilities (columns p_stay, p_churn), while the
 -- true `churned` label scores the holdout
-SELECT model_id, holdout_metric FROM distill(
+SELECT model_id, holdout_metric FROM distill_predict(
   'SELECT tenure, spend, plan, p_stay, p_churn, churned FROM scored',
   '{"target":"churned","proba":["p_stay","p_churn"],
     "classes":["stay","churn"],"student_id":"churn-soft"}');
