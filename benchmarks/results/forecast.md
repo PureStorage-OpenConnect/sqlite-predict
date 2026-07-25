@@ -106,12 +106,43 @@ foundation-model teacher would bring.
   disagree about where they win, which is what tells us *which* FM to distill in
   a given regime.
 
+- **Forecast distillation into a native student** (done, see below): distilling
+  Chronos into a native MLP forecast student recovers most of the FM's edge in
+  the zero-dependency build. It went through one instructive failure first.
+
+## Forecast distillation: what actually worked
+
+The obvious reduction, forecasting to tabular regression over lag features with
+a **tree** student (the forecast analog of `gbt<-tabfm`), does not work. A
+gradient-boosted tree distilled from Chronos on `m4_hourly` stalls at ~1.18
+MASE, barely past seasonal-naive and nowhere near the teacher's 0.79. Trees are
+axis-aligned; they cannot represent a temporal function, and no amount of
+feature engineering fixes that (a level-regression variant even blew up on
+trending daily series, MASE >10, because a tree cannot extrapolate a trend).
+
+The fix was the **student**, not the reduction. A one-hidden-layer MLP distilled
+from Chronos on instance-normalized context windows recovers most of the gap,
+and it runs in the zero-dependency core (`distill_forecast` + a `PSFCST` blob
+served by `forecast()`, benchmark `forecast_native.py`):
+
+| model | MASE mean | median | notes |
+| --- | --- | --- | --- |
+| chronos-full (teacher) | 0.794 | 0.714 | the ceiling |
+| **native MLP student** | **0.886** | **0.818** | zero-dep, deterministic, µs serving |
+| seasonal-naive (floor) | 1.007 | 0.945 | |
+| gbt tree student | ~1.18 | – | trees can't follow |
+
+This matches the current literature: TimeDistill (arXiv 2502.15016) and DistilTS
+(arXiv 2601.12785) both find an MLP is the SOTA student for compressing a
+forecast FM, and name the "architecture discrepancy" that sinks the tree. The
+training hyperparameters (`epochs`/`lr`, exposed as `distill_forecast` options)
+were chosen on the holdout RMSE, never the test MASE.
+
 Next:
 
-1. **Forecast distillation:** distill a forecast FM into a native student by
-   reducing forecasting to tabular regression over lag/calendar features
-   (point) and quantile regression (the probabilistic, CRPS-relevant part), the
-   forecast analog of `gbt<-tabfm`. Target the regime the benchmark flagged:
-   `m4_hourly` via Chronos, where an FM beats the stat floor by a wide margin and
-   there is a real win to compress. Choose the teacher per regime by held-out
-   fidelity, since the two FMs win in different places.
+1. **Probabilistic student:** the student is point-only today; the interval
+   comes from a backtest. A multi-quantile head (pinball loss) would let it be
+   scored on mwQL/CRPS against the FMs directly.
+2. **Serve the FM directly (ONNX):** for the last ~10% the student leaves on the
+   table, `chronos-bolt-small` exports cleanly to ONNX (`scripts/
+   export_chronos_onnx.py`) as an opt-in `forecast()` backend.

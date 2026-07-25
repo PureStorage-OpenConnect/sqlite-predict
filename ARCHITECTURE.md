@@ -15,13 +15,13 @@ Source layout:
 | File | Responsibility |
 | --- | --- |
 | `sqlite-predict.c` | entry point, function registration, shared helpers (timestamp parse/format, ULID, options parsing, normal-quantile) |
-| `predict-forecast.c` | `forecast()` and `detect_anomalies()` vtabs, the statistical models, and the shared `collect_series()` helper |
+| `predict-forecast.c` | `forecast()` and `detect_anomalies()` vtabs, the statistical models, the native forecast-student serving path, and the shared `collect_series()` helper |
 | `predict-tabular.c` | `predict()` vtab, the in-context k-NN model, and dispatch to a runtime backend for registered models |
 | `predict-receipts.c` | model registry, receipts, canonical hashing, the logical-digest anchor, and `predict_replay()` |
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
 | `predict-student.c` | the native student **serving** runtime: blob (de)serialization and tree / forest / MLP inference (`predict0_tree_run`). The serve side of the train/serve boundary |
 | `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on (RFC §4.1.6) |
-| `predict-distill.c` | the **training** side: the CART / gradient-boosting / MLP trainers and the `distill()` vtab. Builds student blobs that `predict-student.c` serves |
+| `predict-distill.c` | the **training** side: the CART / gradient-boosting / MLP trainers, the `distill()` vtab, and the `distill_forecast()` vtab that fits the forecast student. Builds student blobs that `predict-student.c` serves |
 | `predict-internal.h` | shared types, contract constants, error codes, internal prototypes |
 | `vendor/sha256.c` | a self-contained FIPS 180-4 SHA-256 |
 
@@ -120,6 +120,20 @@ because the registry is
 writable by any SQL caller (RFC §6.2) — a hand-crafted blob is rejected,
 never crashed on. Because the student is native and deterministic, its
 predictions carry the same exact-replay receipt as the stat models.
+
+Forecasting has its own student. `distill_forecast()` (`predict-distill.c`)
+fits a multi-output regression MLP that maps an instance-normalized context
+window of `nfeat` recent values to `nout` future ones, distilled from a
+teacher's forecasts over sliding windows. It is stored as a fourth student blob
+(`PSFCST`, RFC §4.1.6) and served not by `predict()` but by `forecast()`
+(`predict-forecast.c`), which extracts the most recent window, normalizes it by
+its own mean and standard deviation (so one student serves series of any
+magnitude), applies the net, de-normalizes, and estimates the interval from a
+refit-free backtest of the student over the series' own history. This is why a
+zero-dependency build can approach foundation-model forecast accuracy: a strong
+teacher's forecasts, distilled once offline, become a microsecond native
+student. A tree cannot represent that temporal function, so `distill_forecast`
+uses the MLP trainer specifically.
 
 ## Receipts, anchoring, and replay
 

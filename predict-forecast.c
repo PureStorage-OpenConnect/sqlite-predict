@@ -4,6 +4,7 @@
 /* forecast(query, horizon, options) — eponymous table-valued function.
  * RFC 0005 §4.2.1. Vtab shape follows SQLite's ext/misc/series.c. */
 #include "predict-internal.h"
+#include "predict-student.h"
 
 #ifndef SQLITE_CORE
 SQLITE_EXTENSION_INIT3
@@ -326,6 +327,108 @@ static const char *resolve_ts_model_id(const char *name) {
       return TS_MODELS[i].id;
   }
   return NULL;
+}
+
+/* ---- forecast student serving (PSFCST, §4.1.6) ---- */
+
+/* Forecast H steps from the length-L window `src` (raw units): instance-
+ * normalize by the window's own (mean, sd), apply the net, de-normalize. */
+static void fcst_infer(const MLP *m, const f64 *src, f32 *win, f32 *hid,
+                       f32 *out, f64 *mu_out, f64 *sd_out) {
+  int L = m->nfeat;
+  f64 mu = 0;
+  for (int i = 0; i < L; i++)
+    mu += src[i];
+  mu /= L;
+  f64 v = 0;
+  for (int i = 0; i < L; i++) {
+    f64 d = src[i] - mu;
+    v += d * d;
+  }
+  f64 sd = sqrt(v / L);
+  if (sd < 1e-9)
+    sd = 1e-9;
+  for (int i = 0; i < L; i++)
+    win[i] = (f32)((src[i] - mu) / sd);
+  mlp_forward(m, win, hid, out);
+  *mu_out = mu;
+  *sd_out = sd;
+}
+
+/* Serve a forecast student over series y[0..n-1]: point forecast from the most
+ * recent window (front-padded if n < L), and per-horizon sigma from a refit-
+ * free backtest of the student over the history. Fills fc[horizon]/sg[horizon];
+ * horizon MUST be <= m->nout (checked by the caller). Returns SQLITE_OK or
+ * SQLITE_NOMEM. */
+static int fcst_run(const MLP *m, const f64 *y, int n, int horizon, f64 *fc,
+                    f64 *sg) {
+  int L = m->nfeat, H = m->nout, rc = SQLITE_OK;
+  f32 *win = sqlite3_malloc(sizeof(f32) * L);
+  f32 *hid = sqlite3_malloc(sizeof(f32) * m->nhid);
+  f32 *out = sqlite3_malloc(sizeof(f32) * H);
+  f64 *wbuf = sqlite3_malloc(sizeof(f64) * L);
+  f64 *ss = sqlite3_malloc(sizeof(f64) * H);
+  int *cnt = sqlite3_malloc(sizeof(int) * H);
+  if (!win || !hid || !out || !wbuf || !ss || !cnt) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  /* most-recent window, front-padded with y[0] when the series is short */
+  for (int i = 0; i < L; i++) {
+    int idx = n - L + i;
+    wbuf[i] = idx >= 0 ? y[idx] : y[0];
+  }
+  f64 mu, sd;
+  fcst_infer(m, wbuf, win, hid, out, &mu, &sd);
+  for (int h = 0; h < horizon; h++)
+    fc[h] = (f64)out[h] * sd + mu;
+
+  /* per-horizon sigma: backtest the fixed student over its own history */
+  for (int k = 0; k < H; k++) {
+    ss[k] = 0;
+    cnt[k] = 0;
+  }
+  int stride = H > 1 ? H / 2 : 1;
+  for (int t = L; t + H <= n; t += stride) {
+    f64 bmu, bsd;
+    fcst_infer(m, y + t - L, win, hid, out, &bmu, &bsd);
+    for (int k = 0; k < H; k++) {
+      f64 e = y[t + k] - ((f64)out[k] * bsd + bmu);
+      ss[k] += e * e;
+      cnt[k]++;
+    }
+  }
+  for (int h = 0; h < horizon; h++)
+    sg[h] = cnt[h] ? sqrt(ss[h] / cnt[h]) : sd; /* fallback: window scale */
+done:
+  sqlite3_free(win);
+  sqlite3_free(hid);
+  sqlite3_free(out);
+  sqlite3_free(wbuf);
+  sqlite3_free(ss);
+  sqlite3_free(cnt);
+  return rc;
+}
+
+/* Load a forecast student registered under model_id, if the id names one.
+ * Returns 1 and fills *m on hit; 0 if the id is not a registered forecast
+ * student; a negative SQLITE_ code (and *errmsg) on a load error. */
+static int load_fcst_student(sqlite3 *db, const char *model_id, MLP *m,
+                             char **errmsg) {
+  static const char FCST_MAGIC8[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
+  predict0_model_row row;
+  int lr = predict0_registry_lookup(db, model_id, &row);
+  if (lr != 0)
+    return 0; /* absent or lookup error: treat as not-a-forecast-student */
+  int is_fcst = row.weights && row.weights_len >= (int)sizeof(FCST_MAGIC8) &&
+                memcmp(row.weights, FCST_MAGIC8, sizeof(FCST_MAGIC8)) == 0;
+  if (!is_fcst) {
+    predict0_model_row_free(&row);
+    return 0;
+  }
+  int rc = fcst_deserialize(row.weights, row.weights_len, m, errmsg);
+  predict0_model_row_free(&row);
+  return rc == SQLITE_OK ? 1 : -rc;
 }
 
 #pragma endregion
@@ -937,11 +1040,34 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   }
 
   predict0_ts_model model = resolve_ts_model(opts.model);
+  MLP fstudent;
+  int have_fstudent = 0;
   if (!model) {
-    int rc = fc_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
-                      opts.model);
-    forecast_opts_free(&opts);
-    return rc;
+    /* not a bundled model: maybe a registered forecast student (PSFCST) */
+    char *lerr = NULL;
+    int lr = load_fcst_student(db, opts.model, &fstudent, &lerr);
+    if (lr < 0) {
+      int rc = fc_error(cur, PREDICT_ERR_SCHEMA, "invalid forecast student: ",
+                        opts.model);
+      sqlite3_free(lerr);
+      forecast_opts_free(&opts);
+      return rc;
+    }
+    if (lr == 0) {
+      int rc = fc_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
+                        opts.model);
+      forecast_opts_free(&opts);
+      return rc;
+    }
+    have_fstudent = 1;
+    if (horizon > fstudent.nout) {
+      mlp_free(&fstudent);
+      int rc = fc_error(cur, PREDICT_ERR_HORIZON,
+                        "horizon exceeds the forecast student's trained horizon",
+                        NULL);
+      forecast_opts_free(&opts);
+      return rc;
+    }
   }
 
   /* prepare + collect the series (shared with detect_anomalies) */
@@ -1011,7 +1137,12 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       step_ms = span > 0 ? span / (n - 1) : PREDICT_MS_PER_HOUR;
     }
 
-    model(y, n, horizon, fc, sg);
+    if (have_fstudent) {
+      if (fcst_run(&fstudent, y, n, horizon, fc, sg) != SQLITE_OK)
+        rc = SQLITE_NOMEM;
+    } else {
+      model(y, n, horizon, fc, sg);
+    }
     for (int h = 1; h <= horizon; h++) {
       ForecastRow *r = &cur->rows[cur->n_rows++];
       memset(r, 0, sizeof(*r));
@@ -1029,6 +1160,8 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   sqlite3_free(fc);
   sqlite3_free(sg);
+  if (have_fstudent)
+    mlp_free(&fstudent); /* done serving; safe for every exit below */
   for (int i = 0; i < n_series; i++) {
     sqlite3_free(series[i].key);
     sqlite3_free(series[i].ts);
@@ -1047,7 +1180,8 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
    * json_object with alphabetical keys, resolved column names recorded */
   if (opts.receipt) {
     char *errmsg = NULL;
-    const char *model_id = resolve_ts_model_id(opts.model);
+    const char *model_id =
+        have_fstudent ? opts.model : resolve_ts_model_id(opts.model);
 
     /* result hash over rows sorted by (series_key, step) */
     ForecastRow **order =

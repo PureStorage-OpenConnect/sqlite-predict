@@ -1,0 +1,152 @@
+"""distill_forecast() and the native forecast student (PSFCST, RFC 0005 §4.1.6).
+
+distill_forecast fits a multi-output regression MLP that maps an instance-
+normalized context window to a horizon of future values, reproducing a
+teacher's forecast. It registers an inline-BLOB student that forecast() serves
+in the zero-dependency core, with no teacher and no onnxruntime at serve time.
+
+The tests train small and fast via the `epochs`/`hidden` options and use a
+clean, learnable multi-seasonal wave so the student's forecast is checkable.
+"""
+
+import math
+import sqlite3
+
+import pytest
+
+L, H, PERIOD = 32, 8, 16
+
+
+def _wave(t):
+    return (10.0 + 5.0 * math.sin(2 * math.pi * t / PERIOD)
+            + 2.0 * math.sin(2 * math.pi * t / (PERIOD * 2)))
+
+
+def _cols(ncol):
+    return ", ".join(f"c{i}" for i in range(ncol))
+
+
+def _load_windows(db, n_windows=300):
+    """A window table: first L columns a wave segment, next H its true
+    continuation (a perfect teacher, so the student has a learnable target)."""
+    ncol = L + H
+    db.execute(f"CREATE TABLE w({', '.join(f'c{i} REAL' for i in range(ncol))})")
+    rows = [[_wave(k + i) for i in range(L)] + [_wave(k + L + j) for j in range(H)]
+            for k in range(n_windows)]
+    db.executemany(f"INSERT INTO w VALUES ({','.join('?' * ncol)})", rows)
+    return ncol
+
+
+def _train(db, student_id="f", **over):
+    ncol = _load_windows(db)
+    opts = {"context": L, "horizon": H, "student_id": student_id,
+            "hidden": 32, "epochs": 250, **over}
+    import json
+    return db.execute(
+        f"SELECT model_id, content_hash, train_rows, train_rmse, receipt_id"
+        f" FROM distill_forecast('SELECT {_cols(ncol)} FROM w', json(?))",
+        (json.dumps(opts),)).fetchone()
+
+
+def _load_series(db, n=64, base=1000):
+    db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+    db.executemany("INSERT INTO s VALUES (?,?)",
+                   [(f"2020-01-01T{i // 60:02d}:{i % 60:02d}:00", _wave(base + i))
+                    for i in range(n)])
+
+
+def test_distill_forecast_registers_a_student(db):
+    model_id, chash, rows, rmse, receipt = _train(db)
+    assert model_id == "f"
+    assert len(chash) == 64
+    assert rows == 300
+    assert rmse >= 0.0
+    assert receipt
+    kind, runtime, wlen, rhash = db.execute(
+        "SELECT kind, runtime, length(weights), content_hash"
+        " FROM _predict_models WHERE model_id='f'").fetchone()
+    assert kind == "student" and runtime == "tree"
+    assert wlen > 0 and rhash == chash
+
+
+def test_forecast_student_serves_and_tracks_the_signal(db):
+    _train(db)
+    _load_series(db)
+    rows = db.execute(
+        "SELECT step, forecast, lower_bound, upper_bound, status FROM forecast("
+        "'SELECT ts, value FROM s', ?, json_object('model','f','receipt',0))"
+        " ORDER BY step", (H,)).fetchall()
+    assert len(rows) == H
+    fc = []
+    for step, f, lo, hi, status in rows:
+        assert status == "ok"
+        assert f == f and lo == lo and hi == hi  # finite, not NaN
+        assert lo <= f <= hi
+        fc.append(f)
+    truth = [_wave(1000 + 64 + j) for j in range(H)]
+    mf, mt = sum(fc) / H, sum(truth) / H
+    cov = sum((a - mf) * (b - mt) for a, b in zip(fc, truth))
+    va = sum((a - mf) ** 2 for a in fc)
+    vb = sum((b - mt) ** 2 for b in truth)
+    corr = cov / ((va * vb) ** 0.5 + 1e-9)
+    assert corr > 0.5  # a clean wave: the student follows the continuation
+
+
+def test_forecast_horizon_may_not_exceed_the_student(db):
+    _train(db)
+    _load_series(db)
+    with pytest.raises(sqlite3.OperationalError, match="horizon"):
+        db.execute(
+            "SELECT * FROM forecast('SELECT ts, value FROM s', ?,"
+            " json_object('model','f','receipt',0))", (H + 1,)).fetchall()
+
+
+def test_predict_rejects_a_forecast_student(db):
+    _train(db)
+    db.execute("CREATE TABLE q(id INTEGER, f0 REAL)")
+    db.execute("INSERT INTO q VALUES (1, 0.5)")
+    with pytest.raises(sqlite3.OperationalError):
+        db.execute("SELECT * FROM predict(NULL, 'SELECT id, f0 FROM q',"
+                   " json_object('model','f'))").fetchall()
+
+
+def test_distill_forecast_requires_student_id(db):
+    ncol = _load_windows(db)
+    with pytest.raises(sqlite3.OperationalError, match="student_id"):
+        db.execute(f"SELECT * FROM distill_forecast('SELECT {_cols(ncol)} FROM w',"
+                   f" json_object('context',{L},'horizon',{H}))").fetchall()
+
+
+def test_distill_forecast_rejects_column_mismatch(db):
+    ncol = _load_windows(db)
+    with pytest.raises(sqlite3.OperationalError, match="columns"):
+        db.execute("SELECT * FROM distill_forecast('SELECT c0, c1 FROM w',"
+                   f" json_object('context',{L},'horizon',{H},'student_id','f'))"
+                   ).fetchall()
+
+
+def test_forecast_rejects_a_malformed_student_blob(db):
+    # the registry is writable by any SQL caller (RFC §6.2): a truncated PSFCST
+    # blob (valid magic, nfeat present, nothing after) must be rejected cleanly,
+    # never crash the serving path.
+    _train(db)  # ensures _predict_models exists
+    _load_series(db)
+    db.execute(
+        "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+        " content_hash, license) VALUES ('bad','student','tree',?,'x',"
+        "'unspecified')", (b"PSFCST01\x05\x00\x00\x00",))
+    with pytest.raises(sqlite3.OperationalError):
+        db.execute("SELECT * FROM forecast('SELECT ts, value FROM s', ?,"
+                   " json_object('model','bad','receipt',0))", (H,)).fetchall()
+
+
+def test_forecast_student_replays(db):
+    _train(db)
+    _load_series(db)
+    r1 = db.execute("SELECT step, forecast FROM forecast('SELECT ts, value FROM"
+                    " s', ?, json_object('model','f','receipt',0)) ORDER BY step",
+                    (H,)).fetchall()
+    r2 = db.execute("SELECT step, forecast FROM forecast('SELECT ts, value FROM"
+                    " s', ?, json_object('model','f','receipt',0)) ORDER BY step",
+                    (H,)).fetchall()
+    assert r1 == r2  # deterministic serving

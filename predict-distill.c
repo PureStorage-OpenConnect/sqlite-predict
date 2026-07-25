@@ -68,7 +68,8 @@ static void mlp_adam(f32 *p, f64 *g, f64 *mm, f64 *vv, int sz, f64 lr,
  * student is fit. Deterministic full-batch Adam; the caller sets any
  * feat_names/labels. */
 static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
-                     const f32 *soft, int task, int nhid, MLP *m, char **errmsg) {
+                     const f32 *soft, int task, int nhid, int epochs, f32 lr,
+                     MLP *m, char **errmsg) {
   memset(m, 0, sizeof(*m));
   int nW1 = nhid * nfeat, nW2 = nout * nhid;
   m->task = task;
@@ -146,7 +147,7 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
     m->b2[k] = 0;
 
   f64 b1p = 1, b2p = 1;
-  for (int ep = 0; ep < MLP_EPOCHS; ep++) {
+  for (int ep = 0; ep < epochs; ep++) {
     b1p *= MLP_BETA1;
     b2p *= MLP_BETA2;
     for (int row = 0; row < n; row++) {
@@ -199,10 +200,10 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
       }
     }
     f64 scale = 1.0 / n, bc1 = 1 - b1p, bc2 = 1 - b2p;
-    mlp_adam(m->W1, gW1, mW1, vW1, nW1, MLP_LR, scale, bc1, bc2);
-    mlp_adam(m->b1, gb1, mb1, vb1, nhid, MLP_LR, scale, bc1, bc2);
-    mlp_adam(m->W2, gW2, mW2, vW2, nW2, MLP_LR, scale, bc1, bc2);
-    mlp_adam(m->b2, gb2, mb2, vb2, nout, MLP_LR, scale, bc1, bc2);
+    mlp_adam(m->W1, gW1, mW1, vW1, nW1, lr, scale, bc1, bc2);
+    mlp_adam(m->b1, gb1, mb1, vb1, nhid, lr, scale, bc1, bc2);
+    mlp_adam(m->W2, gW2, mW2, vW2, nW2, lr, scale, bc1, bc2);
+    mlp_adam(m->b2, gb2, mb2, vb2, nout, lr, scale, bc1, bc2);
   }
 
 done:
@@ -1138,7 +1139,8 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       goto done;
     }
     rc = train_mlp(X, n_fit, nfeat, nclass, y_teach, soft ? soft_P : NULL,
-                   0 /* classify */, MLP_HIDDEN, &mlp, errmsg);
+                   0 /* classify */, MLP_HIDDEN, MLP_EPOCHS, MLP_LR, &mlp,
+                   errmsg);
     if (rc != SQLITE_OK)
       goto done;
     mlp.feat_names = sqlite3_malloc(sizeof(char *) * nfeat);
@@ -1671,6 +1673,474 @@ static sqlite3_module distillModule = {
     /* xShadowName */ NULL,
     /* xIntegrity  */ NULL};
 
+/* ---- distill_forecast: train a native forecast student (PSFCST, §4.1.6) ----
+ *
+ * The train_query returns context + horizon columns per row: the first
+ * `context` columns are a raw history window, the next `horizon` are the
+ * teacher's forecast for that window (computed offline, e.g. by a foundation
+ * model). Each row is instance-normalized by its own window before a multi-
+ * output regression MLP is fit to reproduce the teacher. The student serves
+ * through forecast() with no teacher and no onnxruntime. */
+
+#define FCST_HIDDEN 128 /* forecast student hidden width (benchmark-chosen) */
+#define FCST_EPOCHS 1500 /* forecast regression trains longer at a gentler LR */
+#define FCST_LR 0.005f
+
+typedef struct {
+  char *model_id;
+  char content_hash[PREDICT_HEX_BUFSIZE];
+  int train_rows;
+  f64 metric; /* holdout RMSE in normalized space */
+  char receipt_id[PREDICT_ULID_BUFSIZE];
+} FcstResult;
+
+static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
+                          const char *student_id, int nhid, int epochs, f32 lr,
+                          int receipt, FcstResult *res, char **errmsg) {
+  int rc = SQLITE_OK, ncol = L + H, cap = 0, n = 0, blob_len = 0;
+  f32 *X = NULL, *Y = NULL; /* [n,L] and [n,H], instance-normalized */
+  f64 *wrow = NULL;
+  void *blob = NULL;
+  MLP mlp;
+  memset(&mlp, 0, sizeof(mlp));
+  sqlite3_stmt *q = NULL;
+
+  if (sqlite3_prepare_v2(db, tq, -1, &q, NULL) != SQLITE_OK) {
+    *errmsg = sqlite3_mprintf("%s: cannot prepare train_query: %s",
+                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
+    return SQLITE_ERROR;
+  }
+  if (sqlite3_column_count(q) != ncol) {
+    *errmsg = sqlite3_mprintf(
+        "%s: train_query must return context+horizon = %d columns, got %d",
+        PREDICT_ERR_SCHEMA, ncol, sqlite3_column_count(q));
+    rc = SQLITE_ERROR;
+    goto done;
+  }
+  wrow = sqlite3_malloc(sizeof(f64) * ncol);
+  if (!wrow) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  while (sqlite3_step(q) == SQLITE_ROW) {
+    for (int c = 0; c < ncol; c++)
+      wrow[c] = sqlite3_column_double(q, c);
+    f64 mu = 0;
+    for (int i = 0; i < L; i++)
+      mu += wrow[i];
+    mu /= L;
+    f64 v = 0;
+    for (int i = 0; i < L; i++) {
+      f64 d = wrow[i] - mu;
+      v += d * d;
+    }
+    f64 sd = sqrt(v / L);
+    if (sd < 1e-9)
+      sd = 1e-9;
+    if (n == cap) {
+      int nc = cap ? cap * 2 : 256;
+      f32 *nX = sqlite3_realloc(X, (int)(sizeof(f32) * (size_t)nc * L));
+      f32 *nY = sqlite3_realloc(Y, (int)(sizeof(f32) * (size_t)nc * H));
+      if (nX)
+        X = nX;
+      if (nY)
+        Y = nY;
+      if (!nX || !nY) {
+        rc = SQLITE_NOMEM;
+        goto done;
+      }
+      cap = nc;
+    }
+    for (int i = 0; i < L; i++)
+      X[(size_t)n * L + i] = (f32)((wrow[i] - mu) / sd);
+    for (int k = 0; k < H; k++)
+      Y[(size_t)n * H + k] = (f32)((wrow[L + k] - mu) / sd);
+    n++;
+  }
+  if (n < 2) {
+    *errmsg = sqlite3_mprintf("%s: need at least 2 training windows, got %d",
+                              PREDICT_ERR_SCHEMA, n);
+    rc = SQLITE_ERROR;
+    goto done;
+  }
+
+  int n_hold = n / 5;
+  if (n_hold < 1)
+    n_hold = 1;
+  int n_fit = n - n_hold;
+  rc = train_mlp(X, n_fit, L, H, NULL, Y, 1 /* regress */, nhid, epochs, lr,
+                 &mlp, errmsg);
+  if (rc != SQLITE_OK)
+    goto done;
+
+  { /* holdout RMSE (normalized space) as the reported metric */
+    f32 *hid = sqlite3_malloc(sizeof(f32) * nhid);
+    f32 *out = sqlite3_malloc(sizeof(f32) * H);
+    if (!hid || !out) {
+      sqlite3_free(hid);
+      sqlite3_free(out);
+      rc = SQLITE_NOMEM;
+      goto done;
+    }
+    f64 se = 0;
+    int m = 0;
+    for (int r = n_fit; r < n; r++) {
+      mlp_forward(&mlp, &X[(size_t)r * L], hid, out);
+      for (int k = 0; k < H; k++) {
+        f64 e = (f64)out[k] - Y[(size_t)r * H + k];
+        se += e * e;
+        m++;
+      }
+    }
+    res->metric = m ? sqrt(se / m) : 0;
+    sqlite3_free(hid);
+    sqlite3_free(out);
+  }
+
+  rc = fcst_serialize(&mlp, &blob, &blob_len);
+  if (rc != SQLITE_OK) {
+    *errmsg = sqlite3_mprintf("%s: student serialize failed", PREDICT_ERR_RESOURCE);
+    goto done;
+  }
+  {
+    predict0_hasher h;
+    predict0_hash_init(&h);
+    sha256_update(&h.sha, (const u8 *)blob, (usize)blob_len);
+    predict0_hash_hex(&h, res->content_hash);
+  }
+  {
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(
+            db,
+            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+            " io_spec, content_hash, license) VALUES (?1,'student','tree',?2,"
+            " NULL,?3,'unspecified')",
+            -1, &ins, NULL) != SQLITE_OK) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: cannot prepare student insert",
+                                PREDICT_ERR_RESOURCE);
+      goto done;
+    }
+    sqlite3_bind_text(ins, 1, student_id, -1, SQLITE_STATIC);
+    sqlite3_bind_blob(ins, 2, blob, blob_len, SQLITE_STATIC);
+    sqlite3_bind_text(ins, 3, res->content_hash, -1, SQLITE_STATIC);
+    int irc = sqlite3_step(ins);
+    sqlite3_finalize(ins);
+    if (irc == SQLITE_CONSTRAINT) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: student '%s' already exists",
+                                PREDICT_ERR_STUDENT_EXISTS, student_id);
+      goto done;
+    }
+    if (irc != SQLITE_DONE) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: student insert failed: %s",
+                                PREDICT_ERR_RESOURCE, sqlite3_errmsg(db));
+      goto done;
+    }
+  }
+  res->model_id = sqlite3_mprintf("%s", student_id);
+  res->train_rows = n;
+
+  if (receipt) { /* anchors the training window table */
+    predict0_hasher rh;
+    predict0_hash_init(&rh);
+    predict0_hash_text(&rh, res->model_id);
+    predict0_hash_text(&rh, res->content_hash);
+    predict0_hash_int(&rh, res->train_rows);
+    predict0_hash_real(&rh, res->metric);
+    predict0_hash_row_end(&rh);
+    char result_hash[PREDICT_HEX_BUFSIZE];
+    predict0_hash_hex(&rh, result_hash);
+    char *params = sqlite3_mprintf(
+        "{\"context\":%d,\"horizon\":%d,\"hidden\":%d,\"student_id\":\"%s\"}", L,
+        H, nhid, student_id);
+    char *rerr = NULL;
+    if (params &&
+        predict0_emit_receipt(db, "distill", res->model_id, params, tq,
+                              result_hash, res->receipt_id, &rerr) != SQLITE_OK) {
+      sqlite3_free(params);
+      *errmsg = rerr ? rerr
+                     : sqlite3_mprintf("%s: receipt write failed",
+                                       PREDICT_ERR_RESOURCE);
+      rc = SQLITE_ERROR;
+      goto done;
+    }
+    sqlite3_free(params);
+  }
+  rc = SQLITE_OK;
+
+done:
+  if (q)
+    sqlite3_finalize(q);
+  sqlite3_free(wrow);
+  sqlite3_free(X);
+  sqlite3_free(Y);
+  sqlite3_free(blob);
+  mlp_free(&mlp);
+  return rc;
+}
+
+/* ---- distill_forecast vtab ---- */
+
+#define FD_MODEL 0
+#define FD_HASH 1
+#define FD_ROWS 2
+#define FD_METRIC 3
+#define FD_RECEIPT 4
+#define FD_TRAINQ 5
+#define FD_OPTIONS 6
+
+typedef struct {
+  sqlite3_vtab base;
+  sqlite3 *db;
+} fd_vtab;
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  FcstResult res;
+  int done;
+} fd_cursor;
+
+static int fd_connect(sqlite3 *db, void *pAux, int argc,
+                      const char *const *argv, sqlite3_vtab **ppVtab,
+                      char **pzErr) {
+  UNUSED_PARAMETER(pAux);
+  UNUSED_PARAMETER(argc);
+  UNUSED_PARAMETER(argv);
+  UNUSED_PARAMETER(pzErr);
+  fd_vtab *v = sqlite3_malloc(sizeof(*v));
+  if (!v)
+    return SQLITE_NOMEM;
+  memset(v, 0, sizeof(*v));
+  v->db = db;
+  int rc = sqlite3_declare_vtab(
+      db, "CREATE TABLE x(model_id TEXT, content_hash TEXT, train_rows INTEGER,"
+          " train_rmse REAL, receipt_id TEXT, train_query HIDDEN,"
+          " options HIDDEN)");
+  if (rc != SQLITE_OK) {
+    sqlite3_free(v);
+    return rc;
+  }
+  *ppVtab = &v->base;
+  return SQLITE_OK;
+}
+
+static int fd_disconnect(sqlite3_vtab *p) {
+  sqlite3_free(p);
+  return SQLITE_OK;
+}
+
+static int fd_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdx) {
+  int seen_train = 0;
+  for (int i = 0; i < pIdx->nConstraint; i++) {
+    const struct sqlite3_index_constraint *c = &pIdx->aConstraint[i];
+    if (c->op != SQLITE_INDEX_CONSTRAINT_EQ)
+      continue;
+    int argv = c->iColumn == FD_TRAINQ ? 1 : c->iColumn == FD_OPTIONS ? 2 : 0;
+    if (!argv)
+      continue;
+    if (!c->usable)
+      return SQLITE_CONSTRAINT;
+    pIdx->aConstraintUsage[i].argvIndex = argv;
+    pIdx->aConstraintUsage[i].omit = 1;
+    if (argv == 1)
+      seen_train = 1;
+  }
+  if (!seen_train) {
+    pVtab->zErrMsg = sqlite3_mprintf(
+        "%s: distill_forecast(train_query, options) requires a train_query",
+        PREDICT_ERR_SCHEMA);
+    return SQLITE_ERROR;
+  }
+  pIdx->estimatedCost = 1e6;
+  return SQLITE_OK;
+}
+
+static int fd_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur) {
+  UNUSED_PARAMETER(pVtab);
+  fd_cursor *c = sqlite3_malloc(sizeof(*c));
+  if (!c)
+    return SQLITE_NOMEM;
+  memset(c, 0, sizeof(*c));
+  *ppCur = &c->base;
+  return SQLITE_OK;
+}
+
+static int fd_close(sqlite3_vtab_cursor *pCur) {
+  fd_cursor *c = (fd_cursor *)pCur;
+  sqlite3_free(c->res.model_id);
+  sqlite3_free(c);
+  return SQLITE_OK;
+}
+
+static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
+                     int argc, sqlite3_value **argv) {
+  UNUSED_PARAMETER(idxNum);
+  UNUSED_PARAMETER(idxStr);
+  fd_cursor *cur = (fd_cursor *)pCur;
+  fd_vtab *vtab = (fd_vtab *)cur->base.pVtab;
+  sqlite3 *db = vtab->db;
+  sqlite3_free(cur->res.model_id);
+  memset(&cur->res, 0, sizeof(cur->res));
+  cur->done = 0;
+
+  const char *tq = argc >= 1 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+  const char *options =
+      argc >= 2 ? (const char *)sqlite3_value_text(argv[1]) : NULL;
+
+#define FD_FAIL(...)                                                           \
+  do {                                                                         \
+    sqlite3_free(vtab->base.zErrMsg);                                          \
+    vtab->base.zErrMsg = sqlite3_mprintf(__VA_ARGS__);                         \
+    sqlite3_free(student_id);                                                  \
+    return SQLITE_ERROR;                                                       \
+  } while (0)
+
+  char *student_id = NULL;
+  int L = 0, H = 0, nhid = FCST_HIDDEN, epochs = FCST_EPOCHS, receipt = 1;
+  f32 lr = FCST_LR;
+  if (!tq)
+    FD_FAIL("%s: train_query is required", PREDICT_ERR_SCHEMA);
+  {
+    sqlite3_stmt *op = NULL;
+    if (sqlite3_prepare_v2(
+            db,
+            "SELECT json_extract(?1,'$.context'), json_extract(?1,'$.horizon'),"
+            " json_extract(?1,'$.student_id'), json_extract(?1,'$.hidden'),"
+            " json_extract(?1,'$.receipt'), json_extract(?1,'$.epochs'),"
+            " json_extract(?1,'$.lr')",
+            -1, &op, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(op, 1, options, -1, SQLITE_STATIC);
+      if (sqlite3_step(op) == SQLITE_ROW) {
+        L = sqlite3_column_int(op, 0);
+        H = sqlite3_column_int(op, 1);
+        const char *sid = (const char *)sqlite3_column_text(op, 2);
+        if (sid)
+          student_id = sqlite3_mprintf("%s", sid);
+        if (sqlite3_column_type(op, 3) != SQLITE_NULL)
+          nhid = sqlite3_column_int(op, 3);
+        if (sqlite3_column_type(op, 4) != SQLITE_NULL)
+          receipt = sqlite3_column_int(op, 4);
+        if (sqlite3_column_type(op, 5) != SQLITE_NULL)
+          epochs = sqlite3_column_int(op, 5);
+        if (sqlite3_column_type(op, 6) != SQLITE_NULL)
+          lr = (f32)sqlite3_column_double(op, 6);
+      }
+      sqlite3_finalize(op);
+    }
+  }
+  if (L <= 0 || H <= 0 || !student_id)
+    FD_FAIL("%s: distill_forecast requires context, horizon, and student_id",
+            PREDICT_ERR_OPTIONS);
+  if (L > FCST_MAX_CONTEXT)
+    FD_FAIL("%s: context %d exceeds the maximum %d", PREDICT_ERR_OPTIONS, L,
+            FCST_MAX_CONTEXT);
+  if (nhid <= 0 || nhid > 2048)
+    FD_FAIL("%s: hidden must be in 1..2048", PREDICT_ERR_OPTIONS);
+  if (epochs <= 0 || epochs > 100000)
+    FD_FAIL("%s: epochs must be in 1..100000", PREDICT_ERR_OPTIONS);
+  if (!(lr > 0.0f) || lr > 10.0f)
+    FD_FAIL("%s: lr must be in (0,10]", PREDICT_ERR_OPTIONS);
+
+  char *ensure_err = NULL;
+  if (predict0_receipts_ensure(db, &ensure_err) != SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = ensure_err;
+    sqlite3_free(student_id);
+    return SQLITE_ERROR;
+  }
+  char *existing = predict0_registry_model_hash(db, student_id);
+  if (existing) {
+    sqlite3_free(existing);
+    FD_FAIL("%s: student '%s' already exists", PREDICT_ERR_STUDENT_EXISTS,
+            student_id);
+  }
+#undef FD_FAIL
+
+  char *emsg = NULL;
+  int rc = fdistill_train(db, tq, L, H, student_id, nhid, epochs, lr, receipt,
+                          &cur->res, &emsg);
+  sqlite3_free(student_id);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = emsg;
+    return SQLITE_ERROR;
+  }
+  return SQLITE_OK;
+}
+
+static int fd_next(sqlite3_vtab_cursor *pCur) {
+  ((fd_cursor *)pCur)->done = 1;
+  return SQLITE_OK;
+}
+
+static int fd_eof(sqlite3_vtab_cursor *pCur) {
+  return ((fd_cursor *)pCur)->done;
+}
+
+static int fd_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col) {
+  fd_cursor *c = (fd_cursor *)pCur;
+  switch (col) {
+  case FD_MODEL:
+    sqlite3_result_text(ctx, c->res.model_id, -1, SQLITE_TRANSIENT);
+    break;
+  case FD_HASH:
+    sqlite3_result_text(ctx, c->res.content_hash, -1, SQLITE_TRANSIENT);
+    break;
+  case FD_ROWS:
+    sqlite3_result_int(ctx, c->res.train_rows);
+    break;
+  case FD_METRIC:
+    sqlite3_result_double(ctx, c->res.metric);
+    break;
+  case FD_RECEIPT:
+    if (c->res.receipt_id[0])
+      sqlite3_result_text(ctx, c->res.receipt_id, -1, SQLITE_TRANSIENT);
+    break;
+  default:
+    break;
+  }
+  return SQLITE_OK;
+}
+
+static int fd_rowid(sqlite3_vtab_cursor *pCur, sqlite3_int64 *pRowid) {
+  UNUSED_PARAMETER(pCur);
+  *pRowid = 1;
+  return SQLITE_OK;
+}
+
+static sqlite3_module forecastDistillModule = {
+    /* iVersion    */ 0,
+    /* xCreate     */ NULL,
+    /* xConnect    */ fd_connect,
+    /* xBestIndex  */ fd_best_index,
+    /* xDisconnect */ fd_disconnect,
+    /* xDestroy    */ NULL,
+    /* xOpen       */ fd_open,
+    /* xClose      */ fd_close,
+    /* xFilter     */ fd_filter,
+    /* xNext       */ fd_next,
+    /* xEof        */ fd_eof,
+    /* xColumn     */ fd_column,
+    /* xRowid      */ fd_rowid,
+    /* xUpdate     */ NULL,
+    /* xBegin      */ NULL,
+    /* xSync       */ NULL,
+    /* xCommit     */ NULL,
+    /* xRollback   */ NULL,
+    /* xFindMethod */ NULL,
+    /* xRename     */ NULL,
+    /* xSavepoint  */ NULL,
+    /* xRelease    */ NULL,
+    /* xRollbackTo */ NULL,
+    /* xShadowName */ NULL,
+    /* xIntegrity  */ NULL};
+
 int predict0_distill_init(sqlite3 *db) {
-  return sqlite3_create_module(db, "distill", &distillModule, NULL);
+  int rc = sqlite3_create_module(db, "distill", &distillModule, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  return sqlite3_create_module(db, "distill_forecast", &forecastDistillModule,
+                               NULL);
 }
