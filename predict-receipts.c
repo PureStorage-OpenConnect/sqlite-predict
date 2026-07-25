@@ -181,6 +181,8 @@ int predict0_receipts_ensure(sqlite3 *db, char **errmsg) {
   if (rc == SQLITE_OK)
     rc = bundled_model_row(db, "stub-seasonal-naive", "ts-stat");
   if (rc == SQLITE_OK)
+    rc = bundled_model_row(db, "sub-pca", "ts-stat");
+  if (rc == SQLITE_OK)
     rc = bundled_model_row(db, "knn5-incontext", "tabular-stat");
   if (rc != SQLITE_OK)
     *errmsg = sqlite3_mprintf("%s: cannot register bundled models",

@@ -1460,6 +1460,207 @@ static sqlite3_module forecastModule = {
 
 #pragma endregion
 
+#pragma region subpca
+
+/* Sub-PCA anomaly scorer (RFC §4.2.2, the `sub-pca` model). A subsequence
+ * detector, not a forecaster: it embeds the series into sliding windows of one
+ * period, standardizes each phase, fits PCA over the windows, and scores each
+ * window by its reconstruction error in the top-variance subspace -- a window
+ * that does not lie on the "normal" manifold reconstructs poorly. This is the
+ * method family that leads the TSB-AD-U benchmark (subsequence reconstruction /
+ * clustering), where one-step-residual detectors sit mid-pack. Deterministic:
+ * fixed window, fixed component fraction, a deterministic Jacobi eigensolver. */
+
+#define SUBPCA_DEFAULT_WIN 125 /* find_length_rank's fallback when no clear period */
+#define SUBPCA_MIN_WIN 6
+#define SUBPCA_MAX_WIN 303
+#define SUBPCA_KEEP 0.30 /* fraction of top components kept (benchmark-chosen) */
+
+/* Cyclic Jacobi eigensolver for a symmetric w x w matrix A (row-major, over-
+ * written). On return d[j] = eigenvalues and V (row-major) holds eigenvectors
+ * in columns: V[i*w + j] is coordinate i of eigenvector j. Deterministic (fixed
+ * sweep order and iteration cap), so the score replays exactly. */
+static void jacobi_eigen(f64 *A, int w, f64 *d, f64 *V) {
+  for (int i = 0; i < w; i++) {
+    for (int j = 0; j < w; j++)
+      V[i * w + j] = (i == j) ? 1.0 : 0.0;
+    d[i] = A[i * w + i];
+  }
+  for (int sweep = 0; sweep < 60; sweep++) {
+    f64 off = 0;
+    for (int p = 0; p < w; p++)
+      for (int q = p + 1; q < w; q++)
+        off += A[p * w + q] * A[p * w + q];
+    if (off < 1e-30)
+      break;
+    for (int p = 0; p < w; p++) {
+      for (int q = p + 1; q < w; q++) {
+        f64 apq = A[p * w + q];
+        if (fabs(apq) < 1e-300)
+          continue;
+        f64 app = A[p * w + p], aqq = A[q * w + q];
+        f64 phi = 0.5 * atan2(2.0 * apq, aqq - app);
+        f64 c = cos(phi), s = sin(phi);
+        for (int i = 0; i < w; i++) { /* rotate rows/cols p,q of A */
+          f64 aip = A[i * w + p], aiq = A[i * w + q];
+          A[i * w + p] = c * aip - s * aiq;
+          A[i * w + q] = s * aip + c * aiq;
+        }
+        for (int i = 0; i < w; i++) {
+          f64 api = A[p * w + i], aqi = A[q * w + i];
+          A[p * w + i] = c * api - s * aqi;
+          A[q * w + i] = s * api + c * aqi;
+        }
+        for (int i = 0; i < w; i++) { /* accumulate eigenvectors */
+          f64 vip = V[i * w + p], viq = V[i * w + q];
+          V[i * w + p] = c * vip - s * viq;
+          V[i * w + q] = s * vip + c * viq;
+        }
+      }
+    }
+  }
+  for (int j = 0; j < w; j++)
+    d[j] = A[j * w + j];
+}
+
+/* Fill score[0..n) with the Sub-PCA per-point anomaly score; *win_out gets the
+ * window used. Returns SQLITE_OK, or SQLITE_NOMEM / SQLITE_ERROR (too short).
+ * O(m*w^2) time, O(w^2) memory (the covariance and eigenvectors); the window
+ * matrix is never materialized -- each window is recomputed from y. */
+static int subpca_score(const f64 *y, int n, int *win_out, f64 *score,
+                        char **errmsg) {
+  int w = detect_period(y, n);
+  if (w < SUBPCA_MIN_WIN || w > SUBPCA_MAX_WIN)
+    w = SUBPCA_DEFAULT_WIN;
+  if (w > n / 2)
+    w = n / 2;
+  *win_out = w;
+  int m = n - w + 1;
+  if (w < 2 || m < w + 1) {
+    *errmsg = sqlite3_mprintf("%s: series too short for sub-pca (need > %d)",
+                              PREDICT_ERR_SCHEMA, 2 * w);
+    return SQLITE_ERROR;
+  }
+  int k = (int)(SUBPCA_KEEP * w + 0.5);
+  if (k < 1)
+    k = 1;
+  if (k > w)
+    k = w;
+  int rc = SQLITE_OK;
+  f64 *mu = sqlite3_malloc(sizeof(f64) * w);
+  f64 *sd = sqlite3_malloc(sizeof(f64) * w);
+  f64 *C = sqlite3_malloc(sizeof(f64) * (size_t)w * w);
+  f64 *V = sqlite3_malloc(sizeof(f64) * (size_t)w * w);
+  f64 *d = sqlite3_malloc(sizeof(f64) * w);
+  int *idx = sqlite3_malloc(sizeof(int) * w);
+  f64 *xs = sqlite3_malloc(sizeof(f64) * w);
+  f64 *sw = sqlite3_malloc(sizeof(f64) * m);
+  if (!mu || !sd || !C || !V || !d || !idx || !xs || !sw) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  for (int j = 0; j < w; j++) { /* per-phase (column) mean + std over windows */
+    f64 s = 0, s2 = 0;
+    for (int i = 0; i < m; i++) {
+      f64 v = y[i + j];
+      s += v;
+      s2 += v * v;
+    }
+    mu[j] = s / m;
+    f64 var = s2 / m - mu[j] * mu[j];
+    sd[j] = var > 1e-12 ? sqrt(var) : 1.0;
+  }
+  for (size_t i = 0; i < (size_t)w * w; i++)
+    C[i] = 0;
+  for (int i = 0; i < m; i++) { /* covariance of standardized windows */
+    for (int j = 0; j < w; j++)
+      xs[j] = (y[i + j] - mu[j]) / sd[j];
+    for (int a = 0; a < w; a++) {
+      f64 xa = xs[a];
+      f64 *Ca = C + (size_t)a * w;
+      for (int b = a; b < w; b++)
+        Ca[b] += xa * xs[b];
+    }
+  }
+  for (int a = 0; a < w; a++) /* symmetrize + normalize */
+    for (int b = a; b < w; b++) {
+      f64 v = C[(size_t)a * w + b] / (m - 1);
+      C[(size_t)a * w + b] = v;
+      C[(size_t)b * w + a] = v;
+    }
+  jacobi_eigen(C, w, d, V);
+  for (int j = 0; j < w; j++)
+    idx[j] = j;
+  for (int i = 1; i < w; i++) { /* insertion sort indices by eigenvalue desc */
+    int t = idx[i];
+    int jj = i - 1;
+    while (jj >= 0 && d[idx[jj]] < d[t]) {
+      idx[jj + 1] = idx[jj];
+      jj--;
+    }
+    idx[jj + 1] = t;
+  }
+  for (int i = 0; i < m; i++) { /* reconstruction error in the top-k subspace */
+    f64 norm2 = 0;
+    for (int j = 0; j < w; j++) {
+      xs[j] = (y[i + j] - mu[j]) / sd[j];
+      norm2 += xs[j] * xs[j];
+    }
+    f64 proj2 = 0;
+    for (int t = 0; t < k; t++) {
+      int e = idx[t];
+      f64 p = 0;
+      for (int a = 0; a < w; a++)
+        p += xs[a] * V[(size_t)a * w + e];
+      proj2 += p * p;
+    }
+    f64 r = norm2 - proj2;
+    sw[i] = r > 0 ? r : 0;
+  }
+  { /* center-pad the m window scores to n points (matches find_length_rank) */
+    int front = w / 2; /* ceil((w-1)/2) */
+    for (int t = 0; t < n; t++) {
+      int wi = t - front;
+      if (wi < 0)
+        wi = 0;
+      else if (wi >= m)
+        wi = m - 1;
+      score[t] = sw[wi];
+    }
+  }
+
+done:
+  sqlite3_free(mu);
+  sqlite3_free(sd);
+  sqlite3_free(C);
+  sqlite3_free(V);
+  sqlite3_free(d);
+  sqlite3_free(idx);
+  sqlite3_free(xs);
+  sqlite3_free(sw);
+  if (rc == SQLITE_NOMEM)
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+  return rc;
+}
+
+/* (score, index) pair for turning raw sub-pca scores into percentile ranks.
+ * Ties break by index so the ordering is total and the percentiles -- and thus
+ * the receipt -- replay exactly regardless of the qsort implementation. */
+typedef struct {
+  f64 s;
+  int i;
+} SubpcaRank;
+static int subpca_rank_cmp(const void *a, const void *b) {
+  const SubpcaRank *x = a, *y = b;
+  if (x->s < y->s)
+    return -1;
+  if (x->s > y->s)
+    return 1;
+  return x->i < y->i ? -1 : x->i > y->i ? 1 : 0;
+}
+
+#pragma endregion
+
 #pragma region detect_anomalies
 
 /* detect_anomalies(query, options) — RFC §4.2.2. Scoring is causal:
@@ -1711,15 +1912,18 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     forecast_opts_free(&opts);
     return SQLITE_ERROR;
   }
+  /* sub-pca is a subsequence detector, not a forecast model: it has its own
+   * scoring path below and bypasses the one-step-ahead forecaster resolution. */
+  int use_subpca = opts.model && strcmp(opts.model, "sub-pca") == 0;
   int theta_mode = 1; /* default-ts and theta-classic */
-  const char *model_id = resolve_ts_model_id(opts.model);
+  const char *model_id = use_subpca ? "sub-pca" : resolve_ts_model_id(opts.model);
   if (!model_id) {
     int rc = an_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
                       opts.model);
     forecast_opts_free(&opts);
     return rc;
   }
-  if (strcmp(model_id, "stub-seasonal-naive") == 0)
+  if (!use_subpca && strcmp(model_id, "stub-seasonal-naive") == 0)
     theta_mode = 0;
 
   /* prepare + collect the series (shared with forecast) */
@@ -1787,6 +1991,51 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       ts += n - opts.context_limit;
       n = opts.context_limit;
       truncated = 1;
+    }
+    if (use_subpca) { /* subsequence reconstruction detector (not a forecaster) */
+      f64 *score = sqlite3_malloc(sizeof(f64) * n);
+      SubpcaRank *rk = sqlite3_malloc(sizeof(SubpcaRank) * n);
+      if (!score || !rk) {
+        sqlite3_free(score);
+        sqlite3_free(rk);
+        break;
+      }
+      int win = 0;
+      char *serr = NULL;
+      if (subpca_score(y, n, &win, score, &serr) != SQLITE_OK) {
+        sqlite3_free(serr);
+        sqlite3_free(score);
+        sqlite3_free(rk);
+        AnomRow *r = &cur->rows[cur->n_rows++];
+        memset(r, 0, sizeof(*r));
+        r->series_key = sqlite3_mprintf("%s", s->key);
+        r->status = "insufficient_history";
+        continue;
+      }
+      for (int t = 0; t < n; t++) {
+        rk[t].s = score[t];
+        rk[t].i = t;
+      }
+      qsort(rk, n, sizeof(SubpcaRank), subpca_rank_cmp);
+      /* anomaly_probability = percentile rank: "more anomalous than this
+       * fraction of the series". Rank-preserving, so is_anomaly = rank >
+       * threshold flags the top (1 - threshold) fraction. */
+      for (int r0 = 0; r0 < n; r0++)
+        score[rk[r0].i] = n > 1 ? (f64)r0 / (n - 1) : 0.0;
+      for (int t = 0; t < n; t++) {
+        AnomRow *r = &cur->rows[cur->n_rows++];
+        memset(r, 0, sizeof(*r));
+        r->series_key = sqlite3_mprintf("%s", s->key);
+        predict0_format_timestamp(ts[t], r->ts, sizeof(r->ts));
+        r->value = y[t];
+        r->has_values = 1; /* has_pred stays 0: no forecast/interval */
+        r->status = truncated ? "truncated" : "ok";
+        r->prob = score[t];
+        r->is_anom = r->prob > opts.confidence;
+      }
+      sqlite3_free(score);
+      sqlite3_free(rk);
+      continue;
     }
     int p = detect_period(y, n);
     f64 *pred = sqlite3_malloc(sizeof(f64) * n);

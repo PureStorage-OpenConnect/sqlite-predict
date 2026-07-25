@@ -52,6 +52,34 @@ def test_long_series_scores_every_point(db):
     assert early and any(ts in flagged for ts in early)
 
 
+def test_sub_pca_flags_injected_anomalies(db):
+    """The sub-pca model is a subsequence-reconstruction detector (not a
+    forecaster): no forecast/interval, and injected anomalies land in the
+    high-percentile tail of the reconstruction score."""
+    rows, _ = syn.trend_season(n=600, noise=0.4, amplitude=5.0, seed=61)
+    noisy, indices = syn.with_anomalies(rows, k=3, magnitude=12.0, seed=62)
+    syn.load_into(db, noisy)
+    out = detect(db, "SELECT ts, value FROM series",
+                 '{"model":"sub-pca","receipt":0}')
+    assert len(out) == 600
+    assert all(r[3] is None for r in out)  # no forecast
+    assert all(r[7] is not None for r in out)  # every point scored
+    # each injected anomaly sits in a high-percentile neighbourhood (recall)
+    for i in indices:
+        peak = max(out[j][7] for j in range(max(0, i - 15), min(600, i + 15)))
+        assert peak > 0.9, f"anomaly at {i} not surfaced (peak {peak:.3f})"
+
+
+def test_sub_pca_replays_deterministically(db):
+    rows, _ = syn.trend_season(n=500, seed=63)
+    noisy, _ = syn.with_anomalies(rows, k=2, magnitude=10.0, seed=64)
+    syn.load_into(db, noisy)
+    rid = detect(db, "SELECT ts, value FROM series", '{"model":"sub-pca"}')[0][9]
+    match, detail = db.execute(
+        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
+    assert match == 1, detail
+
+
 def test_warmup_rows_have_no_prediction(db):
     rows, _ = syn.random_walk(n=50, seed=44)
     syn.load_into(db, rows)

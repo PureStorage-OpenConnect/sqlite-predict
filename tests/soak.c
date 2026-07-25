@@ -129,6 +129,11 @@ int main(void) {
                     "'SELECT ts, value FROM series', '{\"receipt\":0}')",
                     1) ||
         run_discard(db,
+                    "SELECT * FROM detect_anomalies("
+                    "'SELECT ts, value FROM series',"
+                    " '{\"model\":\"sub-pca\",\"receipt\":0}')",
+                    1) ||
+        run_discard(db,
                     "SELECT * FROM predict("
                     "'SELECT f1, f2, label FROM tab WHERE id < 100',"
                     "'SELECT id, f1, f2 FROM tab WHERE id >= 100',"

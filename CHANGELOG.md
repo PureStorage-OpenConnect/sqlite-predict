@@ -60,10 +60,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   labels sliding context windows in-DB, and the student is fit on them (the
   forecast analog of `distill_predict`'s `teacher=`). Its quantile levels come
   from the teacher's fan.
+- `detect_anomalies(model='sub-pca')`: a **subsequence-reconstruction** detector,
+  the method family that leads the TSB-AD-U benchmark (where one-step-residual
+  detectors sit mid-pack). It embeds the series into sliding windows of one
+  period, standardizes each phase, fits PCA over the windows with a deterministic
+  Jacobi eigensolver, and scores each window by its reconstruction error in the
+  top-variance subspace (the top 30% of components) -- a window off the "normal"
+  manifold reconstructs poorly. `anomaly_probability` is the score's percentile
+  rank; there is no forecast/interval. On TSB-AD-U it reaches ~0.5-0.6 VUS-PR,
+  at or above the published SOTA (~0.44) and 2x the default theta-residual
+  detector, all in zero-dependency C with exact-replay receipts. The forecast-
+  residual detectors do NOT close this gap: a stronger forecaster masks anomalies
+  by predicting them (verified against a Chronos one-step baseline on TSB-AD-U,
+  which only tied the theta z-score), so the win comes from the detector family,
+  not a better forecaster.
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
-- Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`
-  (time series) and `knn5-incontext` (tabular). Forecast prediction intervals
+- Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`,
+  `sub-pca` (time series) and `knn5-incontext` (tabular). Forecast prediction intervals
   are calibrated from a per-horizon in-sample backtest of each model, rather
   than a lag-1 residual grown as `sigma*sqrt(h)`; on real gluonts data this
   brings 95% coverage toward nominal and roughly halves the interval score.
