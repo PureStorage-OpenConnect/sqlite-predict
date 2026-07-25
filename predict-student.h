@@ -16,6 +16,7 @@
 #include "predict-internal.h"
 
 #define TREE_MAX_FEAT 64 /* apply-time feature cap; bounds a student's nfeat */
+#define FCST_MAX_CONTEXT 4096 /* forecast student: max context length (nfeat) */
 
 /* A decision-tree node (also the weak learner of a gbt forest). */
 typedef struct {
@@ -71,6 +72,13 @@ int tree_serialize(const Tree *t, void **blob_out, int *len_out);
 int forest_serialize(const Forest *f, void **blob_out, int *len_out);
 int mlp_serialize(const MLP *m, void **blob_out, int *len_out);
 
+/* Forecast student (PSFCST01): a multi-output regression MLP (nout = horizon)
+ * reusing the MLP struct with task=1, no class labels or feature names. The
+ * forecast() serving path instance-normalizes a context window of length nfeat,
+ * applies the net, and de-normalizes the nout outputs. */
+int fcst_serialize(const MLP *m, void **blob_out, int *len_out);
+int fcst_deserialize(const void *blob, int len, MLP *m, char **errmsg);
+
 /* Free a student's owned memory. */
 void tree_free(Tree *t);
 void forest_free(Forest *f);
@@ -83,5 +91,8 @@ int forest_predict_row(const Forest *f, const f32 *x, f64 *scbuf, char **pred,
                        f64 *conf, int *has_conf);
 int mlp_predict_row(const MLP *m, const f32 *x, f32 *hid, f32 *out, char **pred,
                     f64 *conf, int *has_conf);
+/* Raw forward pass: writes hid[nhid] and out[nout]. Used by forecast()
+ * serving, which supplies an instance-normalized window as x. */
+void mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out);
 
 #endif /* PREDICT_STUDENT_H */

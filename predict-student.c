@@ -448,7 +448,7 @@ void mlp_free(MLP *m) {
 }
 
 /* forward on RAW features x; writes hidden[nhid] and out[nout] logits. */
-static void mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out) {
+void mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out) {
   for (int j = 0; j < m->nhid; j++) {
     f64 s = m->b1[j];
     for (int i = 0; i < m->nfeat; i++)
@@ -593,6 +593,92 @@ static int mlp_deserialize(const void *blob, int len, MLP *m, char **errmsg) {
 bad:
   mlp_free(m);
   *errmsg = sqlite3_mprintf("%s: malformed mlp student blob", PREDICT_ERR_SCHEMA);
+  return SQLITE_ERROR;
+oom:
+  mlp_free(m);
+  *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+  return SQLITE_NOMEM;
+}
+
+/* ---- Forecast student (PSFCST01): multi-output regression MLP ---- */
+
+static const char FCST_MAGIC[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
+
+int fcst_serialize(const MLP *m, void **blob_out, int *len_out) {
+  size_t sz = sizeof(FCST_MAGIC) + 4 * 3;            /* nfeat, nhid, nout */
+  sz += 4 * (size_t)m->nfeat * 2;                    /* mean, sd */
+  sz += 4 * ((size_t)m->nhid * m->nfeat + m->nhid);  /* W1, b1 */
+  sz += 4 * ((size_t)m->nout * m->nhid + m->nout);   /* W2, b2 */
+  u8 *buf = sqlite3_malloc((int)sz);
+  if (!buf)
+    return SQLITE_NOMEM;
+  u8 *p = buf;
+  memcpy(p, FCST_MAGIC, sizeof(FCST_MAGIC));
+  p += sizeof(FCST_MAGIC);
+  put_u32(&p, (u32)m->nfeat);
+  put_u32(&p, (u32)m->nhid);
+  put_u32(&p, (u32)m->nout);
+  for (int i = 0; i < m->nfeat; i++)
+    put_f32(&p, m->mean[i]);
+  for (int i = 0; i < m->nfeat; i++)
+    put_f32(&p, m->sd[i]);
+  for (int i = 0; i < m->nhid * m->nfeat; i++)
+    put_f32(&p, m->W1[i]);
+  for (int i = 0; i < m->nhid; i++)
+    put_f32(&p, m->b1[i]);
+  for (int i = 0; i < m->nout * m->nhid; i++)
+    put_f32(&p, m->W2[i]);
+  for (int i = 0; i < m->nout; i++)
+    put_f32(&p, m->b2[i]);
+  *blob_out = buf;
+  *len_out = (int)sz;
+  return SQLITE_OK;
+}
+
+int fcst_deserialize(const void *blob, int len, MLP *m, char **errmsg) {
+  memset(m, 0, sizeof(*m));
+  Reader r = {.p = blob, .end = (const u8 *)blob + len, .err = 0};
+  if (!blob || len < (int)sizeof(FCST_MAGIC) ||
+      memcmp(blob, FCST_MAGIC, sizeof(FCST_MAGIC)) != 0) {
+    *errmsg =
+        sqlite3_mprintf("%s: not a forecast student blob", PREDICT_ERR_SCHEMA);
+    return SQLITE_ERROR;
+  }
+  r.p += sizeof(FCST_MAGIC);
+  m->task = 1; /* regression head; no classes or feature names */
+  m->nfeat = (int)rd_u32(&r);
+  m->nhid = (int)rd_u32(&r);
+  m->nout = (int)rd_u32(&r);
+  if (r.err || m->nfeat <= 0 || m->nfeat > FCST_MAX_CONTEXT || m->nhid <= 0 ||
+      m->nhid > 2048 || m->nout <= 0 || m->nout > 2048)
+    goto bad;
+  m->mean = sqlite3_malloc(sizeof(f32) * m->nfeat);
+  m->sd = sqlite3_malloc(sizeof(f32) * m->nfeat);
+  m->W1 = sqlite3_malloc(sizeof(f32) * (size_t)m->nhid * m->nfeat);
+  m->b1 = sqlite3_malloc(sizeof(f32) * m->nhid);
+  m->W2 = sqlite3_malloc(sizeof(f32) * (size_t)m->nout * m->nhid);
+  m->b2 = sqlite3_malloc(sizeof(f32) * m->nout);
+  if (!m->mean || !m->sd || !m->W1 || !m->b1 || !m->W2 || !m->b2)
+    goto oom;
+  for (int i = 0; i < m->nfeat; i++)
+    m->mean[i] = rd_f32(&r);
+  for (int i = 0; i < m->nfeat; i++)
+    m->sd[i] = rd_f32(&r);
+  for (int i = 0; i < m->nhid * m->nfeat; i++)
+    m->W1[i] = rd_f32(&r);
+  for (int i = 0; i < m->nhid; i++)
+    m->b1[i] = rd_f32(&r);
+  for (int i = 0; i < m->nout * m->nhid; i++)
+    m->W2[i] = rd_f32(&r);
+  for (int i = 0; i < m->nout; i++)
+    m->b2[i] = rd_f32(&r);
+  if (r.err)
+    goto bad;
+  return SQLITE_OK;
+bad:
+  mlp_free(m);
+  *errmsg =
+      sqlite3_mprintf("%s: malformed forecast student blob", PREDICT_ERR_SCHEMA);
   return SQLITE_ERROR;
 oom:
   mlp_free(m);

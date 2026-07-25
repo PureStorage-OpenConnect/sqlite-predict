@@ -60,19 +60,22 @@ static void mlp_adam(f32 *p, f64 *g, f64 *mm, f64 *vv, int sz, f64 lr,
   }
 }
 
-/* Train a one-hidden-layer softmax MLP (classification only). soft, when
- * non-NULL, is a row-major [n, nclass] teacher-probability matrix used as the
- * target; otherwise the hard class yc. Deterministic full-batch Adam; the
- * caller sets feat_names and labels. */
-static int train_mlp(const f32 *X, int n, int nfeat, int nclass,
-                     const i32 *yc, const f32 *soft, MLP *m, char **errmsg) {
+/* Train a one-hidden-layer MLP with a configurable width and task.
+ * task 0 (classify): softmax head over `nout` classes; the target is `soft`
+ * (a row-major [n, nout] teacher-probability matrix) when non-NULL, else the
+ * hard class yc. task 1 (regress): linear head, MSE against the [n, nout]
+ * target matrix `soft` (yc unused) -- this is how the multi-output forecast
+ * student is fit. Deterministic full-batch Adam; the caller sets any
+ * feat_names/labels. */
+static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
+                     const f32 *soft, int task, int nhid, MLP *m, char **errmsg) {
   memset(m, 0, sizeof(*m));
-  int nhid = MLP_HIDDEN, nout = nclass, nW1 = nhid * nfeat, nW2 = nout * nhid;
-  m->task = 0;
+  int nW1 = nhid * nfeat, nW2 = nout * nhid;
+  m->task = task;
   m->nfeat = nfeat;
   m->nhid = nhid;
   m->nout = nout;
-  m->nclass = nclass;
+  m->nclass = task == 0 ? nout : 0;
 
   int rc = SQLITE_OK;
   m->mean = sqlite3_malloc(sizeof(f32) * nfeat);
@@ -162,18 +165,23 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nclass,
           s += (f64)m->W2[k * nhid + j] * hid[j];
         out[k] = (f32)s;
       }
-      f64 mx = out[0];
-      for (int k = 1; k < nout; k++)
-        if (out[k] > mx)
-          mx = out[k];
-      f64 sm = 0;
-      for (int k = 0; k < nout; k++) {
-        dout[k] = exp((f64)out[k] - mx);
-        sm += dout[k];
-      }
-      for (int k = 0; k < nout; k++) {
-        f64 tgt = soft ? soft[(size_t)row * nout + k] : (yc[row] == k ? 1.0 : 0.0);
-        dout[k] = dout[k] / sm - tgt; /* softmax prob - target */
+      if (task == 0) { /* softmax cross-entropy: dL/dlogit = softmax - target */
+        f64 mx = out[0];
+        for (int k = 1; k < nout; k++)
+          if (out[k] > mx)
+            mx = out[k];
+        f64 sm = 0;
+        for (int k = 0; k < nout; k++) {
+          dout[k] = exp((f64)out[k] - mx);
+          sm += dout[k];
+        }
+        for (int k = 0; k < nout; k++) {
+          f64 tgt = soft ? soft[(size_t)row * nout + k] : (yc[row] == k ? 1.0 : 0.0);
+          dout[k] = dout[k] / sm - tgt;
+        }
+      } else { /* regression MSE on the linear head: dL/dout = out - target */
+        for (int k = 0; k < nout; k++)
+          dout[k] = (f64)out[k] - soft[(size_t)row * nout + k];
       }
       for (int k = 0; k < nout; k++) {
         gb2[k] += dout[k];
@@ -1129,8 +1137,8 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
                                 PREDICT_ERR_OPTIONS);
       goto done;
     }
-    rc = train_mlp(X, n_fit, nfeat, nclass, y_teach, soft ? soft_P : NULL, &mlp,
-                   errmsg);
+    rc = train_mlp(X, n_fit, nfeat, nclass, y_teach, soft ? soft_P : NULL,
+                   0 /* classify */, MLP_HIDDEN, &mlp, errmsg);
     if (rc != SQLITE_OK)
       goto done;
     mlp.feat_names = sqlite3_malloc(sizeof(char *) * nfeat);
