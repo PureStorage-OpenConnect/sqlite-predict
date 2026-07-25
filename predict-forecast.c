@@ -1694,7 +1694,11 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   ForecastOpts opts;
   memset(&opts, 0, sizeof(opts));
   opts.confidence = 0.99; /* anomaly_prob_threshold default */
-  opts.context_limit = FORECAST_DEFAULT_CONTEXT_LIMIT;
+  /* 0 = score every point. Unlike forecasting (which only needs recent
+   * context), anomaly detection must scan the whole series, so it does NOT
+   * default to FORECAST_DEFAULT_CONTEXT_LIMIT -- that would silently drop all
+   * but the last N points. An explicit context_limit still caps it. */
+  opts.context_limit = 0;
   opts.receipt = 1;
 
   const char *options_json =
@@ -1747,9 +1751,10 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   for (int i = 0; i < n_series; i++) {
     SeriesBuf *s = &series[i];
     int usable = !s->non_numeric && s->n >= FORECAST_MIN_HISTORY;
-    max_rows += usable ? (s->n > opts.context_limit ? opts.context_limit
-                                                    : s->n)
-                       : 1;
+    int scored = (opts.context_limit > 0 && s->n > opts.context_limit)
+                     ? opts.context_limit
+                     : s->n;
+    max_rows += usable ? scored : 1;
   }
   cur->rows = sqlite3_malloc(sizeof(AnomRow) * (max_rows ? max_rows : 1));
   if (!cur->rows) {
@@ -1777,7 +1782,7 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     f64 *y = s->val;
     i64 *ts = s->ts;
     int n = s->n;
-    if (n > opts.context_limit) {
+    if (opts.context_limit > 0 && n > opts.context_limit) {
       y += n - opts.context_limit;
       ts += n - opts.context_limit;
       n = opts.context_limit;
@@ -1884,7 +1889,12 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
             " 'model', ?4, 'receipt', 1, 'time_col', ?5, 'value_col', ?6)",
             -1, &pj, NULL) == SQLITE_OK) {
       sqlite3_bind_double(pj, 1, opts.confidence);
-      sqlite3_bind_int(pj, 2, opts.context_limit);
+      /* 0 = "score every point": record as null so replay re-defaults rather
+       * than failing the context_limit >= 1 check on the recorded params */
+      if (opts.context_limit > 0)
+        sqlite3_bind_int(pj, 2, opts.context_limit);
+      else
+        sqlite3_bind_null(pj, 2);
       sqlite3_bind_text(pj, 3, group_json, -1, SQLITE_STATIC);
       sqlite3_bind_text(pj, 4, model_id, -1, SQLITE_STATIC);
       if (resolved_time)

@@ -35,6 +35,23 @@ def test_clean_series_stays_clean(db):
     assert flags <= 2, f"clean series produced {flags} anomaly flags"
 
 
+def test_long_series_scores_every_point(db):
+    """Regression: detect_anomalies must score the whole series. It once
+    inherited the forecast path's 4096-point context cap and silently
+    truncated to the last 4096 points (status 'truncated'), dropping most of a
+    long series' anomalies."""
+    rows, _ = syn.trend_season(n=6000, noise=0.5, seed=71)
+    noisy, indices = syn.with_anomalies(rows, k=3, magnitude=12.0, seed=72)
+    syn.load_into(db, noisy)
+    out = detect(db, "SELECT ts, value FROM series")
+    assert len(out) == 6000  # every point returned, not just the last 4096
+    assert all(r[8] != "truncated" for r in out)
+    # an anomaly injected in the FIRST 4096 (dropped under the old cap) is found
+    early = [noisy[i][0] for i in indices if i < 4096]
+    flagged = {r[1] for r in out if r[6] == 1}
+    assert early and any(ts in flagged for ts in early)
+
+
 def test_warmup_rows_have_no_prediction(db):
     rows, _ = syn.random_walk(n=50, seed=44)
     syn.load_into(db, rows)
