@@ -721,10 +721,19 @@ out:
 
 /* ---- forecast backend (sequence layout: context window -> quantile fan) ---- */
 
-int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
-                           const predict0_backend_opts *opts,
-                           const f64 *context, int ctx_len, int horizon,
-                           f64 conf, f64 *fc, f64 *lo, f64 *hi, char **errmsg) {
+/* Run the sequence model and return its raw quantile fan for the horizon:
+ * *fan_out is malloc'd [horizon * nquant] step-major (fan[k*nquant + q]),
+ * *levels_out is malloc'd [nquant]; the caller frees both. Used by the
+ * forecast() point/interval reduction below and by distill_forecast's in-DB
+ * teacher labeling. */
+int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
+                               const predict0_backend_opts *opts,
+                               const f64 *context, int ctx_len, int horizon,
+                               f64 **fan_out, f32 **levels_out, int *nquant_out,
+                               char **errmsg) {
+  *fan_out = NULL;
+  *levels_out = NULL;
+  *nquant_out = 0;
   int rc = SQLITE_OK, nq = 0;
   char *input_name = json_str(db, model->io_spec, "$.input");
   char *output_name = json_str(db, model->io_spec, "$.output");
@@ -734,7 +743,7 @@ int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
   char **lvl_s = NULL;
   json_arr(db, model->io_spec, "$.quantiles", &lvl_s, &nq);
   f32 *levels = NULL;
-  f64 *val = NULL;
+  f64 *fan = NULL;
   f32 *inbuf = NULL;
   OrtMemoryInfo *mem = NULL;
   OrtValue *input = NULL, *output = NULL;
@@ -775,8 +784,8 @@ int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
   const f64 *ctx = context + (ctx_len - keep);
   inbuf = sqlite3_malloc(sizeof(f32) * keep);
   levels = sqlite3_malloc(sizeof(f32) * nq);
-  val = sqlite3_malloc(sizeof(f64) * nq);
-  if (!inbuf || !levels || !val) {
+  fan = sqlite3_malloc(sizeof(f64) * (size_t)horizon * nq);
+  if (!inbuf || !levels || !fan) {
     rc = SQLITE_NOMEM;
     goto done;
   }
@@ -852,22 +861,15 @@ int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
     rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "GetTensorMutableData", errmsg);
     goto done;
   }
-  /* odata[q*Hmax + k] = quantile q at step k. Per step: sort the fan and read
-   * the point (0.5) and the interval bounds at (1+-conf)/2 off the levels. */
-  f64 plo = (1 - conf) / 2, phi = (1 + conf) / 2;
-  for (int k = 0; k < horizon; k++) {
+  /* odata[q*Hmax + k] = quantile q at step k -> fan[k*nq + q] (step-major). */
+  for (int k = 0; k < horizon; k++)
     for (int q = 0; q < nq; q++)
-      val[q] = (f64)odata[(size_t)q * Hmax + k];
-    for (int i = 1; i < nq; i++)
-      for (int j = i; j > 0 && val[j] < val[j - 1]; j--) {
-        f64 t = val[j];
-        val[j] = val[j - 1];
-        val[j - 1] = t;
-      }
-    fc[k] = predict0_quantile_at(levels, val, nq, 0.5);
-    lo[k] = predict0_quantile_at(levels, val, nq, plo);
-    hi[k] = predict0_quantile_at(levels, val, nq, phi);
-  }
+      fan[(size_t)k * nq + q] = (f64)odata[(size_t)q * Hmax + k];
+  *fan_out = fan;
+  *levels_out = levels;
+  *nquant_out = nq;
+  fan = NULL; /* ownership transferred to the caller */
+  levels = NULL;
 
 done:
   if (ti)
@@ -880,7 +882,7 @@ done:
     g_ort->ReleaseMemoryInfo(mem);
   sqlite3_free(inbuf);
   sqlite3_free(levels);
-  sqlite3_free(val);
+  sqlite3_free(fan);
   sqlite3_free(input_name);
   sqlite3_free(output_name);
   sqlite3_free(patch_s);
@@ -889,6 +891,45 @@ done:
     sqlite3_free(lvl_s[q]);
   sqlite3_free(lvl_s);
   return rc;
+}
+
+/* Point + interval at `conf`, reduced from the model's quantile fan. */
+int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
+                           const predict0_backend_opts *opts,
+                           const f64 *context, int ctx_len, int horizon,
+                           f64 conf, f64 *fc, f64 *lo, f64 *hi, char **errmsg) {
+  f64 *fan = NULL;
+  f32 *levels = NULL;
+  int nq = 0;
+  int rc = predict0_onnx_forecast_fan(db, model, opts, context, ctx_len, horizon,
+                                      &fan, &levels, &nq, errmsg);
+  if (rc != SQLITE_OK)
+    return rc;
+  f64 *val = sqlite3_malloc(sizeof(f64) * nq);
+  if (!val) {
+    sqlite3_free(fan);
+    sqlite3_free(levels);
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+    return SQLITE_NOMEM;
+  }
+  f64 plo = (1 - conf) / 2, phi = (1 + conf) / 2;
+  for (int k = 0; k < horizon; k++) {
+    for (int q = 0; q < nq; q++)
+      val[q] = fan[(size_t)k * nq + q];
+    for (int i = 1; i < nq; i++)
+      for (int j = i; j > 0 && val[j] < val[j - 1]; j--) {
+        f64 t = val[j];
+        val[j] = val[j - 1];
+        val[j - 1] = t;
+      }
+    fc[k] = predict0_quantile_at(levels, val, nq, 0.5);
+    lo[k] = predict0_quantile_at(levels, val, nq, plo);
+    hi[k] = predict0_quantile_at(levels, val, nq, phi);
+  }
+  sqlite3_free(val);
+  sqlite3_free(fan);
+  sqlite3_free(levels);
+  return SQLITE_OK;
 }
 
 /* Hash results canonically (ref, prediction, confidence per row) and write

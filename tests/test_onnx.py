@@ -546,3 +546,46 @@ def test_onnx_forecast_horizon_exceeds_model(db):
     with pytest.raises(sqlite3.OperationalError, match="steps"):
         db.execute("SELECT * FROM forecast('SELECT ts, value FROM s', 99,"
                    " json_object('model','fcast','receipt',0))").fetchall()
+
+
+def test_onnx_teacher_distill_forecast(db):
+    """distill_forecast(teacher=<onnx model>): the onnx teacher labels the
+    series' windows in-DB (one SQL call, no external labels), and the student
+    it fits serves through forecast(). The fixture forecasts mean(context) +
+    per-quantile offset, so the student learns to track the recent mean."""
+    _register(db, "fteach", "forecast.onnx", FCAST_IO)
+    db.execute("CREATE TABLE s(series_key INTEGER, t INTEGER, value REAL)")
+    rows = []
+    for sk, base in enumerate([10.0, 50.0, 100.0]):  # distinct scales/levels
+        for t in range(60):
+            rows.append((sk, t, base + (t % 8)))
+    db.executemany("INSERT INTO s VALUES (?,?,?)", rows)
+    mid, trows = db.execute(
+        "SELECT model_id, train_rows FROM distill_forecast("
+        "'SELECT series_key, value FROM s ORDER BY series_key, t',"
+        " json_object('teacher','fteach','context',16,'horizon',4,"
+        "'student_id','qs','epochs',400))").fetchone()
+    assert mid == "qs" and trows > 0
+    kind, rt = db.execute("SELECT kind, runtime FROM _predict_models WHERE"
+                          " model_id='qs'").fetchone()
+    assert kind == "student" and rt == "tree"  # a native forecast student
+
+    db.execute("CREATE TABLE q(ts TEXT, value REAL)")
+    db.executemany("INSERT INTO q VALUES (?,?)",
+                   [(f"2020-01-01T00:{i:02d}:00", 30.0 + (i % 8)) for i in range(20)])
+    r = db.execute("SELECT forecast, lower_bound, upper_bound FROM forecast("
+                   "'SELECT ts, value FROM q', 4, json_object('model','qs',"
+                   "'confidence_level',0.6,'receipt',0)) ORDER BY step").fetchall()
+    assert len(r) == 4
+    for f, lo, hi in r:
+        assert f == f and lo <= f <= hi     # finite, ordered interval
+        assert 24.0 < f < 44.0              # near the recent mean (~33.5)
+
+
+def test_distill_forecast_teacher_must_be_onnx(db):
+    db.execute("CREATE TABLE s(k INTEGER, v REAL)")
+    db.executemany("INSERT INTO s VALUES (?,?)", [(0, float(i)) for i in range(40)])
+    with pytest.raises(sqlite3.OperationalError, match="teacher"):
+        db.execute("SELECT * FROM distill_forecast('SELECT k, v FROM s',"
+                   " json_object('teacher','nope','context',16,'horizon',4,"
+                   "'student_id','x'))").fetchall()

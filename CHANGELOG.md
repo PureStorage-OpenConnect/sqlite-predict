@@ -42,7 +42,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is a point forecaster whose interval comes from a refit-free backtest over the
   series' own history. `context`, `horizon`, `hidden`, `epochs`, and `lr` are
   also options. Distilling the well-calibrated teacher fan beat native pinball
-  quantile regression, which under-covers on limited data.
+  quantile regression, which under-covers on limited data. With a `teacher`
+  option naming a registered onnx forecast model (the `loadable-onnx` build),
+  the whole loop runs in one SQL call with no Python: the train_query returns a
+  raw series (`value`, or `series_key, value` for several), the onnx teacher
+  labels sliding context windows in-DB, and the student is fit on them (the
+  forecast analog of `distill_predict`'s `teacher=`). Its quantile levels come
+  from the teacher's fan.
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`

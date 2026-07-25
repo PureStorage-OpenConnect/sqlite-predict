@@ -210,6 +210,16 @@ int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
                            const f64 *context, int ctx_len, int horizon,
                            f64 conf, f64 *fc, f64 *lo, f64 *hi, char **errmsg);
 
+/* As above but returns the raw quantile fan: *fan_out is malloc'd
+ * [horizon*nquant] step-major (fan[k*nquant+q]), *levels_out is malloc'd
+ * [nquant] (both freed by the caller). Used by distill_forecast(teacher=...)
+ * to label windows with an in-DB onnx teacher. */
+int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
+                               const predict0_backend_opts *opts,
+                               const f64 *context, int ctx_len, int horizon,
+                               f64 **fan_out, f32 **levels_out, int *nquant_out,
+                               char **errmsg);
+
 /* ONNX inference for predict(). Dispatches on the model's io_spec layout:
  * 'vector' (a self-contained model mapping features -> prediction, train_sql
  * unused) or 'in_context' (a teacher that ingests the train rows as context
