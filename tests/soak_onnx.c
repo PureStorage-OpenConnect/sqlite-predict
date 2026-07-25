@@ -23,9 +23,12 @@ static int run(sqlite3 *db, const char *sql, int expect_ok) {
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "usage: %s <vector.onnx> <incontext.onnx>\n", argv[0]);
+    fprintf(stderr,
+            "usage: %s <vector.onnx> <incontext.onnx> [two_head.onnx]\n",
+            argv[0]);
     return 2;
   }
+  const char *two_head = argc >= 4 ? argv[3] : NULL;
   sqlite3 *db = NULL;
   if (sqlite3_open(":memory:", &db))
     return 1;
@@ -61,6 +64,42 @@ int main(int argc, char **argv) {
   sqlite3_free(reg);
   sqlite3_free(regic);
   sqlite3_free(regauto);
+
+  /* two-head sequence core: exercises the reconstruction path (two runs,
+   * flip-invariance, continuous head, crossing repair, instance denorm) and
+   * its fail-loud branch. Optional so older callers still work. */
+  if (two_head) {
+    char *regth = sqlite3_mprintf(
+        "SELECT predict_register('th', json_object('runtime','onnx','kind',"
+        "'ts-fm','license','MIT','weights_uri',%Q,'io_spec',json_object("
+        "'layout','sequence','input','context','outputs',json_object('point',"
+        "'point_fan','quantile','quant_fan'),'quantiles',json_array(0.1,0.3,"
+        "0.5,0.7,0.9),'patch',8,'fixed_context',json('true'),'flip_invariance',"
+        "json('true'),'continuous_head',json('true'),'quantile_crossing_repair',"
+        "json('true'),'denormalize','instance')))",
+        two_head);
+    /* single-output model that wrongly declares flip_invariance -> fail loud */
+    char *regbad = sqlite3_mprintf(
+        "SELECT predict_register('badf', json_object('runtime','onnx','kind',"
+        "'ts-fm','license','MIT','weights_uri',%Q,'io_spec',json_object("
+        "'layout','sequence','input','context','output','quant_fan','quantiles',"
+        "json_array(0.1,0.3,0.5,0.7,0.9),'patch',8,'flip_invariance',"
+        "json('true'))))",
+        two_head);
+    int bad = run(db, regth, 1) || run(db, regbad, 1);
+    sqlite3_free(regth);
+    sqlite3_free(regbad);
+    if (bad) {
+      fprintf(stderr, "two-head register failed\n");
+      sqlite3_close(db);
+      return 1;
+    }
+    run(db, "CREATE TABLE ser(ts TEXT, value REAL)", 1);
+    run(db, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
+            " i < 40) INSERT INTO ser SELECT printf('2020-01-01T%02d:00:00', i),"
+            " 10.0 + (i%9) FROM n",
+        1);
+  }
 
   run(db, "CREATE TABLE apply(id INTEGER, f1 REAL, f2 REAL)", 1);
   run(db,
@@ -105,6 +144,16 @@ int main(int argc, char **argv) {
             "json_object('model','knn1'))", 0);
     run(db, "SELECT * FROM predict('SELECT f1, f2 FROM tr',"
             "'SELECT id, f1, f2 FROM apply',json_object('model','knn1'))", 0);
+    /* two-head forecast: reconstruction success + point/interval, then the
+     * fail-loud single-output flip declaration */
+    if (two_head) {
+      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
+              "json_object('model','th','confidence_level',0.8))", 1);
+      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
+              "json_object('model','th','receipt',0))", 1);
+      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
+              "json_object('model','badf','receipt',0))", 0);
+    }
   }
 
   sqlite3_close(db);

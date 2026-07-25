@@ -178,3 +178,35 @@ The small gap (0.802 vs 0.794) is the context truncation to a multiple of the
 patch size; otherwise it is the same model. So the extension spans the whole
 range: a zero-dependency native student at ~0.89, and the exact FM at ~0.80 for
 those who opt into onnxruntime. Reproduce with `benchmarks/forecast_onnx.py`.
+
+## TimesFM as a teacher, reconstructed in full
+
+TimesFM 2.5 does not export cleanly: two of its refinements (flip-invariance and
+the continuous quantile head) introduce data-dependent symints / in-place
+mutation that `torch.export` rejects. Rather than ship the weaker single-decode
+model, the export emits the raw two-head core (point + quantile fans) and the
+extension rebuilds the full model outside the graph, driven by io_spec flags
+(`flip_invariance`, `continuous_head`, `quantile_crossing_repair`, `denormalize`,
+`fixed_context`). The in-DB reconstruction matches the reference
+`timesfm.forecast` pipeline to float32 precision. Then
+`distill_forecast(teacher='timesfm-onnx')` distills it into a native student in
+one SQL call. On m4_hourly (40 series, context 512, 1500 epochs, 640 windows):
+
+| model | MASE | notes |
+| --- | --- | --- |
+| chronos teacher (served in-DB) | 0.802 | best FM on this stationary data |
+| chronos-distilled student | 1.032 | zero-dependency serve |
+| TimesFM teacher (served in-DB) | 1.049 | full reconstruction, not single-decode |
+| TimesFM-distilled student | 1.065 | zero-dependency serve |
+| seasonal-naive floor | 1.109 | — |
+
+Two honest reads. First, the reconstruction works: the TimesFM teacher (1.049) is
+the full model, and its student (1.065) tracks it within ~1.5%, closing 74% of
+the naive->teacher gap, a real jump from the single-decode stub's ~1.17. Second,
+the student is the bottleneck, not the teacher: chronos is far the better teacher
+here (0.802 vs 1.049), yet its student (1.032) barely beats TimesFM's (1.065),
+because the native PSFCST student caps out near ~1.03 on hourly regardless of
+teacher. m4_hourly is stationary, exactly the regime where TimesFM's dropped
+refinements matter least and Chronos wins; TimesFM's edge is non-stationary data,
+which this benchmark does not exercise. Reproduce with
+`benchmarks/timesfm_teacher.py` (needs `TIMESFM_ONNX`).

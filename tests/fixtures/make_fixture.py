@@ -257,6 +257,94 @@ def build_forecast_cases():
     return {"quantiles": FQ, "horizon": FH, "conf": 0.8, "cases": cases}
 
 
+FQ2 = [0.1, 0.3, 0.5, 0.7, 0.9]  # two-head fixture quantile levels
+FH2 = 3                          # two-head fixture horizon
+TL = 8                           # two-head fixture fixed context length (patch)
+# constant point/quantile fans, asymmetric across columns so the flip step is
+# actually exercised (col 0 is the point slot, cols 1..5 the deciles).
+PP = [0.0, -2.0, -1.0, 0.5, 1.0, 2.5]
+QQ = [0.0, -4.0, -1.5, 0.3, 1.4, 4.0]
+
+
+def build_two_head():
+    """A two-head sequence core exercising the declarative reconstruction path:
+    the ONNX graph emits a raw (point, quantile) fan and the extension rebuilds
+    flip-invariance + continuous head + crossing repair + instance denorm, all
+    declared in the io_spec (this is how a TimesFM-style core, whose refinements
+    do not survive torch.export, is served in-DB). The fans here are constant, so
+    the reconstruction depends on the series only through its mean/std (denorm).
+
+    input   'context'    [1, TL]        float32  (fixed length)
+    outputs 'point_fan'  [1, FH2, ncol] float32  (col 0 point, 1..nq quantiles)
+            'quant_fan'   [1, FH2, ncol] float32
+    """
+    ncol = len(FQ2) + 1
+    PT = helper.make_tensor("PT", TensorProto.FLOAT, [1, FH2, ncol], PP * FH2)
+    QT = helper.make_tensor("QT", TensorProto.FLOAT, [1, FH2, ncol], QQ * FH2)
+    nodes = [helper.make_node("Identity", ["PT"], ["point_fan"]),
+             helper.make_node("Identity", ["QT"], ["quant_fan"])]
+    graph = helper.make_graph(
+        nodes, "two_head",
+        [helper.make_tensor_value_info("context", TensorProto.FLOAT, [1, TL])],
+        [helper.make_tensor_value_info("point_fan", TensorProto.FLOAT,
+                                       [1, FH2, ncol]),
+         helper.make_tensor_value_info("quant_fan", TensorProto.FLOAT,
+                                       [1, FH2, ncol])],
+        initializer=[PT, QT])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 9
+    onnx.checker.check_model(model)
+    return model
+
+
+def build_two_head_cases():
+    """Oracle for the two-head reconstruction, computed with onnxruntime + numpy
+    (the same reconstruction the extension does in C), so the pure-Python test
+    asserts the extension reproduces point/lower/upper without either at test
+    time. conf 0.8 -> the 0.1 and 0.9 deciles, which are exact fixture levels."""
+    import numpy as np
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(build_two_head().SerializeToString(),
+                                providers=["CPUExecutionProvider"])
+    levels = np.array(FQ2)
+    nq = len(FQ2)
+    med = 1 + int(np.argmin(np.abs(levels - 0.5)))  # column of the 0.5 quantile
+
+    def flip(fan):  # keep col 0, reverse deciles 1..nq
+        return np.concatenate([fan[..., :1], fan[..., 1:][..., ::-1]], axis=-1)
+
+    def reconstruct(series):
+        c = np.array(series[-TL:], dtype=np.float32)[None]
+        mu = float(c.mean())
+        sd = float(np.std(c, ddof=1)) or 1.0
+        refl = (2 * mu - c).astype(np.float32)
+        a1, b1 = sess.run(None, {"context": c})
+        a2, b2 = sess.run(None, {"context": refl})
+        ff = (a1 - flip(a2)) / 2
+        qs = (b1 - flip(b2)) / 2
+        out = qs.copy()
+        for cc in range(1, nq + 1):  # continuous head
+            out[..., cc] = qs[..., cc] - qs[..., med] + ff[..., med]
+        for cc in range(med - 1, 0, -1):  # crossing repair
+            out[..., cc] = np.minimum(out[..., cc], out[..., cc + 1])
+        for cc in range(med + 1, nq + 1):
+            out[..., cc] = np.maximum(out[..., cc], out[..., cc - 1])
+        out = out * sd + mu  # instance denorm
+        step0 = out[0, 0]  # constant over steps
+        return float(step0[med]), float(step0[1]), float(step0[nq])
+
+    series = [[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0],
+              [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+              [-3.0, -1.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0]]
+    cases = []
+    for sv in series:
+        p, lo, hi = reconstruct(sv)
+        cases.append({"series": sv, "point": p, "lower": lo, "upper": hi})
+    return {"quantiles": FQ2, "horizon": FH2, "patch": TL, "conf": 0.8,
+            "cases": cases}
+
+
 def main():
     model = build_model()
     onnx.save(model, os.path.join(HERE, "logreg.onnx"))
@@ -281,11 +369,16 @@ def main():
     with open(os.path.join(HERE, "forecast_cases.json"), "w") as f:
         json.dump(build_forecast_cases(), f, indent=2)
 
+    th = build_two_head()
+    onnx.save(th, os.path.join(HERE, "two_head.onnx"))
+    with open(os.path.join(HERE, "two_head_cases.json"), "w") as f:
+        json.dump(build_two_head_cases(), f, indent=2)
+
     print(f"wrote logreg.onnx ({model.ByteSize()} B, {len(cases)} cases),"
           f" linreg.onnx ({reg.ByteSize()} B, {len(rcases)} cases),"
           f" knn_incontext.onnx ({ic.ByteSize()} B,"
-          f" {len(iccases['apply'])} queries), and forecast.onnx"
-          f" ({fm.ByteSize()} B)")
+          f" {len(iccases['apply'])} queries), forecast.onnx"
+          f" ({fm.ByteSize()} B), and two_head.onnx ({th.ByteSize()} B)")
 
 
 if __name__ == "__main__":

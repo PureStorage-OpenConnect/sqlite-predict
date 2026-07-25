@@ -64,12 +64,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   distilled student or classifier/regressor) for `predict()`; the `in_context`
   layout serves a teacher that ingests the `train_query` rows as context
   each call (TabFM-shaped), anchoring those rows in the receipt. The `sequence`
-  layout serves a **forecast foundation model** for `forecast()`: it feeds a
-  context window as a tensor and reads the point + interval off the model's
-  quantile fan (chronos-bolt exports cleanly this way, see
-  `scripts/export_chronos_onnx.py`; on m4_hourly the onnx-served Chronos
-  reproduces its ~0.80 MASE, versus the native distilled student's ~0.89 in the
-  zero-dependency build). A GPU build
+  layout serves a **forecast foundation model** for `forecast()` and as an in-DB
+  `distill_forecast` teacher: it feeds a context window as a tensor and reads the
+  point + interval off the model's quantile fan. Two exporters ship:
+  `scripts/export_chronos_onnx.py` (chronos-bolt, a clean single-graph export;
+  on m4_hourly the onnx-served Chronos reproduces its ~0.80 MASE) and
+  `scripts/export_timesfm_onnx.py` (timesfm-2.5-200m). TimesFM is a much harder
+  export: two of its refinements (flip-invariance and the continuous quantile
+  head) will not survive torch.export, because a second decode introduces data-
+  dependent symints and the head mutates the output in place. Neither is a
+  property of the weights, so instead of shipping a weaker single-decode model,
+  the export emits the raw two-head core (point + quantile fans) and the
+  extension **reconstructs the full model** outside the graph: a second run on
+  the reflected context (flip-invariance), the continuous-head blend, crossing
+  repair, and instance denorm. These are declared as independent io_spec flags
+  (`flip_invariance`, `continuous_head`, `quantile_crossing_repair`,
+  `denormalize`, `fixed_context`, `outputs.point`/`outputs.quantile`), not keyed
+  on a model name, so any two-head quantile core exported the same way is served.
+  The in-DB reconstruction matches the reference `timesfm.forecast` pipeline to
+  float32 precision. Its context is fixed at 512. Both register as teachers, so
+  `distill_forecast(teacher='chronos-onnx')` or `teacher='timesfm-onnx'` runs the
+  whole distillation in one SQL call. A GPU build
   (`make loadable-onnx-gpu`) adds the CUDA and TensorRT execution providers
   and fp16/int8 precision, compile-checked in CI and validated on a
   dedicated GPU job. The default build stays zero-dependency.

@@ -538,6 +538,71 @@ def test_onnx_forecast_sequence(db):
             assert abs(hi - case["upper"]) < 1e-3
 
 
+THEAD_IO = {"layout": "sequence", "input": "context",
+            "outputs": {"point": "point_fan", "quantile": "quant_fan"},
+            "quantiles": [0.1, 0.3, 0.5, 0.7, 0.9], "patch": 8,
+            "fixed_context": True, "flip_invariance": True,
+            "continuous_head": True, "quantile_crossing_repair": True,
+            "denormalize": "instance"}
+
+
+def test_onnx_forecast_two_head_reconstruction(db):
+    """A two-head core whose refinements (flip-invariance, continuous head)
+    cannot survive torch.export: the io_spec declares them and the extension
+    rebuilds the fan in C (second run on the reflected context, flip, head,
+    crossing repair, instance denorm). The oracle in two_head_cases.json is the
+    same reconstruction computed with onnxruntime, so this asserts the C path
+    reproduces it. Nothing is keyed on a model name; the flags drive it."""
+    _register(db, "th", "two_head.onnx", THEAD_IO)
+    spec = json.load(open(_abs("two_head_cases.json")))
+    H, conf = spec["horizon"], spec["conf"]
+    for case in spec["cases"]:
+        db.execute("DROP TABLE IF EXISTS s")
+        db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+        db.executemany(
+            "INSERT INTO s VALUES (?,?)",
+            [(f"2020-01-01T{i // 24:02d}:{i % 24:02d}:00", v)
+             for i, v in enumerate(case["series"])])
+        rows = db.execute(
+            "SELECT step, forecast, lower_bound, upper_bound FROM forecast("
+            "'SELECT ts, value FROM s', ?, json_object('model','th',"
+            "'confidence_level',?,'receipt',0)) ORDER BY step",
+            (H, conf)).fetchall()
+        assert len(rows) == H
+        for _step, fc, lo, hi in rows:
+            assert abs(fc - case["point"]) < 1e-3
+            assert abs(lo - case["lower"]) < 1e-3
+            assert abs(hi - case["upper"]) < 1e-3
+
+
+def test_onnx_forecast_two_head_short_series_status(db):
+    """A series too short for a fixed_context core is reported per-series as
+    insufficient_history, not padded and not a hard query failure."""
+    _register(db, "th", "two_head.onnx", THEAD_IO)
+    db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+    db.executemany("INSERT INTO s VALUES (?,?)",
+                   [(f"2020-01-01T00:{i:02d}:00", float(i)) for i in range(5)])
+    rows = db.execute(
+        "SELECT step, forecast, status FROM forecast('SELECT ts, value FROM s',"
+        " 3, json_object('model','th','receipt',0))").fetchall()
+    assert rows == [(None, None, "insufficient_history")]
+
+
+def test_onnx_forecast_flip_requires_two_head(db):
+    """Declaring flip_invariance/continuous_head on a single-output model is
+    rejected loudly rather than silently ignored."""
+    bad = {"layout": "sequence", "input": "context", "output": "quantiles",
+           "quantiles": [0.1, 0.3, 0.5, 0.7, 0.9], "patch": 1,
+           "flip_invariance": True}
+    _register(db, "badf", "forecast.onnx", bad)
+    db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+    db.executemany("INSERT INTO s VALUES (?,?)",
+                   [(f"2020-01-01T00:{i:02d}:00", float(i)) for i in range(10)])
+    with pytest.raises(sqlite3.OperationalError, match="two-head core"):
+        db.execute("SELECT * FROM forecast('SELECT ts, value FROM s', 3,"
+                   " json_object('model','badf','receipt',0))").fetchall()
+
+
 def test_onnx_forecast_horizon_exceeds_model(db):
     _register(db, "fcast", "forecast.onnx", FCAST_IO)
     db.execute("CREATE TABLE s(ts TEXT, value REAL)")

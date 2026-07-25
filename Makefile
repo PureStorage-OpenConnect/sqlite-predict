@@ -129,7 +129,7 @@ test-asan-onnx: vendor/sqlite3ext.h sqlite-predict.h
 	LSAN_OPTIONS=suppressions=tests/onnx.supp \
 	  UBSAN_OPTIONS=print_stacktrace=1 \
 	  ./$(prefix)/soak-onnx-asan tests/fixtures/logreg.onnx \
-	  tests/fixtures/knn_incontext.onnx
+	  tests/fixtures/knn_incontext.onnx tests/fixtures/two_head.onnx
 
 # libFuzzer harness (statically links sqlite3.c; SQLITE_CORE build)
 fuzz-build: vendor/sqlite3ext.h sqlite-predict.h

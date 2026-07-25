@@ -320,6 +320,14 @@ static char *json_str(sqlite3 *db, const char *json, const char *path) {
   return out;
 }
 
+/* json boolean at path -> 1 if true, else 0 (JSON true extracts as integer 1). */
+static int json_flag(sqlite3 *db, const char *json, const char *path) {
+  char *v = json_str(db, json, path);
+  int on = v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0);
+  sqlite3_free(v);
+  return on;
+}
+
 /* json array at path -> sqlite3_malloc'd char*[]; *n set. 0 on success. */
 static int json_arr(sqlite3 *db, const char *json, const char *path,
                     char ***out, int *n) {
@@ -721,6 +729,234 @@ out:
 
 /* ---- forecast backend (sequence layout: context window -> quantile fan) ---- */
 
+/* Run a two-head "core" sequence model once: input [1, L] -> two fans, each
+ * [1, Hg, ncol] where column 0 is the point head and columns 1..nq are the
+ * quantiles. Copies both into caller buffers pt_out and qs_out (each malloc'd
+ * Hg*ncol, caller frees) and reports Hg. Called once or twice (flip-invariance)
+ * by seq_reconstruct. Nothing here is model-specific; the shape (ncol) and how
+ * the two fans combine are all declared in the io_spec. */
+static int seq_core_decode(OrtSession *session, OrtMemoryInfo *mem,
+                           const char *in_name, const char *pt_name,
+                           const char *qs_name, const f32 *ctx, int L, int ncol,
+                           int need_h, float **pt_out, float **qs_out,
+                           int *hg_out, char **errmsg) {
+  *pt_out = NULL;
+  *qs_out = NULL;
+  int rc = SQLITE_OK;
+  OrtValue *input = NULL, *outs[2] = {NULL, NULL};
+  OrtTensorTypeAndShapeInfo *ti = NULL;
+  int64_t shape[2] = {1, L};
+  OrtStatus *st = g_ort->CreateTensorWithDataAsOrtValue(
+      mem, (void *)ctx, sizeof(f32) * (size_t)L, shape, 2,
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateTensor", errmsg);
+    goto done;
+  }
+  const char *in_names[1] = {in_name};
+  const char *out_names[2] = {pt_name, qs_name};
+  st = g_ort->Run(session, NULL, in_names, (const OrtValue *const *)&input, 1,
+                  out_names, 2, outs);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "Run", errmsg);
+    goto done;
+  }
+  int hg = 0;
+  for (int o = 0; o < 2; o++) {
+    size_t ndim = 0;
+    int64_t od[8];
+    if (ti) {
+      g_ort->ReleaseTensorTypeAndShapeInfo(ti);
+      ti = NULL;
+    }
+    st = g_ort->GetTensorTypeAndShape(outs[o], &ti);
+    if (!st)
+      st = g_ort->GetDimensionsCount(ti, &ndim);
+    if (!st && ndim == 3)
+      st = g_ort->GetDimensions(ti, od, ndim);
+    if (st) {
+      rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "GetShape", errmsg);
+      goto done;
+    }
+    if (ndim != 3 || od[0] != 1 || (int)od[2] != ncol) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf(
+          "%s: two-head core output must be [1, horizon, 1+quantiles=%d]",
+          PREDICT_ERR_INFERENCE, ncol);
+      goto done;
+    }
+    if (o == 0)
+      hg = (int)od[1];
+    else if ((int)od[1] != hg) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: two-head core outputs disagree on horizon",
+                                PREDICT_ERR_INFERENCE);
+      goto done;
+    }
+  }
+  if (hg < need_h) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: model forecasts at most %d steps, %d asked",
+                              PREDICT_ERR_HORIZON, hg, need_h);
+    goto done;
+  }
+  float *pd = NULL, *qd = NULL;
+  st = g_ort->GetTensorMutableData(outs[0], (void **)&pd);
+  if (!st)
+    st = g_ort->GetTensorMutableData(outs[1], (void **)&qd);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "GetData", errmsg);
+    goto done;
+  }
+  *pt_out = sqlite3_malloc(sizeof(float) * (size_t)hg * ncol);
+  *qs_out = sqlite3_malloc(sizeof(float) * (size_t)hg * ncol);
+  if (!*pt_out || !*qs_out) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  memcpy(*pt_out, pd, sizeof(float) * (size_t)hg * ncol);
+  memcpy(*qs_out, qd, sizeof(float) * (size_t)hg * ncol);
+  *hg_out = hg;
+
+done:
+  if (rc != SQLITE_OK) {
+    sqlite3_free(*pt_out);
+    sqlite3_free(*qs_out);
+    *pt_out = NULL;
+    *qs_out = NULL;
+  }
+  if (ti)
+    g_ort->ReleaseTensorTypeAndShapeInfo(ti);
+  if (outs[0])
+    g_ort->ReleaseValue(outs[0]);
+  if (outs[1])
+    g_ort->ReleaseValue(outs[1]);
+  if (input)
+    g_ort->ReleaseValue(input);
+  return rc;
+}
+
+/* Steps a two-head sequence core needs applied outside the ONNX graph, each
+ * declared independently in the io_spec (none are model-specific). */
+typedef struct {
+  int flip_invariance;  /* average forward with reflected+flipped (TTA) */
+  int continuous_head;  /* blend: quantile spread recentered on point median */
+  int crossing_repair;  /* enforce non-decreasing quantiles per step */
+  int denorm_instance;  /* graph emits normalized; denorm with context mean/std */
+} seq_post;
+
+/* col c of a reflected fan under flip-invariance: keep the point head (col 0),
+ * reverse the quantile columns 1..nq (col c <-> ncol-c). */
+#define FAN_FLIP(arr, h, c, ncol)                                              \
+  ((c) == 0 ? (arr)[(size_t)(h) * (ncol)]                                      \
+            : (arr)[(size_t)(h) * (ncol) + ((ncol) - (c))])
+
+/* Reconstruct a quantile fan from a two-head sequence core by applying the
+ * post-processing the ONNX graph could not carry (a second decode for flip-
+ * invariance, the continuous-head blend, crossing repair, instance denorm) as
+ * declared in `post`. Fills fan[horizon*nq] step-major. Column layout: col 0 is
+ * the point head, cols 1..nq the quantiles in io_spec order. This mirrors
+ * scripts/export_timesfm_onnx.py reconstruct() but is driven entirely by flags,
+ * so any two-head quantile core exported the same way is served, not just one. */
+static int seq_reconstruct(OrtSession *session, const char *in_name,
+                           const char *pt_name, const char *qs_name,
+                           const f64 *ctx, int L, int horizon, int nq,
+                           const f32 *levels, const seq_post *post, f64 *fan,
+                           char **errmsg) {
+  int ncol = nq + 1;
+  int med = 0; /* column of the 0.5 quantile, for the continuous-head recenter */
+  if (post->continuous_head) {
+    f32 best = 2.0f;
+    for (int q = 0; q < nq; q++) {
+      f32 d = levels[q] < 0.5f ? 0.5f - levels[q] : levels[q] - 0.5f;
+      if (d < best) {
+        best = d;
+        med = q + 1;
+      }
+    }
+  }
+  int rc = SQLITE_OK, hg = 0, hg2 = 0;
+  f32 *cf = sqlite3_malloc(sizeof(f32) * (size_t)L);
+  f32 *rf = sqlite3_malloc(sizeof(f32) * (size_t)L);
+  f64 *ff = sqlite3_malloc(sizeof(f64) * (size_t)ncol);
+  f64 *qs = sqlite3_malloc(sizeof(f64) * (size_t)ncol);
+  f64 *out = sqlite3_malloc(sizeof(f64) * (size_t)ncol);
+  float *a1 = NULL, *b1 = NULL, *a2 = NULL, *b2 = NULL;
+  OrtMemoryInfo *mem = NULL;
+  if (!cf || !rf || !ff || !qs || !out) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  f64 mu = 0;
+  for (int i = 0; i < L; i++)
+    mu += ctx[i];
+  mu /= L;
+  f64 var = 0;
+  for (int i = 0; i < L; i++)
+    var += (ctx[i] - mu) * (ctx[i] - mu);
+  f64 sigma = L > 1 ? sqrt(var / (L - 1)) : 0.0; /* unbiased std, matches torch */
+  if (sigma < 1e-6)
+    sigma = 1.0;
+  for (int i = 0; i < L; i++) {
+    cf[i] = (f32)ctx[i];
+    rf[i] = (f32)(2.0 * mu - ctx[i]); /* reflection -> internal -x */
+  }
+  OrtStatus *st =
+      g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateCpuMemoryInfo", errmsg);
+    goto done;
+  }
+  if ((rc = seq_core_decode(session, mem, in_name, pt_name, qs_name, cf, L, ncol,
+                            horizon, &a1, &b1, &hg, errmsg)) != SQLITE_OK)
+    goto done;
+  if (post->flip_invariance &&
+      (rc = seq_core_decode(session, mem, in_name, pt_name, qs_name, rf, L, ncol,
+                            horizon, &a2, &b2, &hg2, errmsg)) != SQLITE_OK)
+    goto done;
+  for (int h = 0; h < horizon; h++) {
+    for (int c = 0; c < ncol; c++) {
+      if (post->flip_invariance) {
+        ff[c] = ((f64)a1[(size_t)h * ncol + c] - (f64)FAN_FLIP(a2, h, c, ncol)) / 2.0;
+        qs[c] = ((f64)b1[(size_t)h * ncol + c] - (f64)FAN_FLIP(b2, h, c, ncol)) / 2.0;
+      } else {
+        ff[c] = a1[(size_t)h * ncol + c];
+        qs[c] = b1[(size_t)h * ncol + c];
+      }
+    }
+    for (int c = 0; c < ncol; c++) /* default: serve the quantile head as-is */
+      out[c] = qs[c];
+    if (post->continuous_head)
+      for (int c = 1; c <= nq; c++) /* recenter the spread on the point median */
+        out[c] = qs[c] - qs[med] + ff[med];
+    if (post->crossing_repair) {
+      for (int c = med - 1; c >= 1; c--)
+        if (out[c] > out[c + 1])
+          out[c] = out[c + 1];
+      for (int c = med + 1; c <= nq; c++)
+        if (out[c] < out[c - 1])
+          out[c] = out[c - 1];
+    }
+    for (int q = 0; q < nq; q++)
+      fan[(size_t)h * nq + q] =
+          post->denorm_instance ? out[q + 1] * sigma + mu : out[q + 1];
+  }
+
+done:
+  sqlite3_free(cf);
+  sqlite3_free(rf);
+  sqlite3_free(ff);
+  sqlite3_free(qs);
+  sqlite3_free(out);
+  sqlite3_free(a1);
+  sqlite3_free(b1);
+  sqlite3_free(a2);
+  sqlite3_free(b2);
+  if (mem)
+    g_ort->ReleaseMemoryInfo(mem);
+  return rc;
+}
+
 /* Run the sequence model and return its raw quantile fan for the horizon:
  * *fan_out is malloc'd [horizon * nquant] step-major (fan[k*nquant + q]),
  * *levels_out is malloc'd [nquant]; the caller frees both. Used by the
@@ -737,9 +973,22 @@ int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
   int rc = SQLITE_OK, nq = 0;
   char *input_name = json_str(db, model->io_spec, "$.input");
   char *output_name = json_str(db, model->io_spec, "$.output");
+  char *point_name = json_str(db, model->io_spec, "$.outputs.point");
+  char *quant_name = json_str(db, model->io_spec, "$.outputs.quantile");
   char *patch_s = json_str(db, model->io_spec, "$.patch");
   char *layout = json_str(db, model->io_spec, "$.layout");
+  char *denorm_s = json_str(db, model->io_spec, "$.denormalize");
   int patch = patch_s ? atoi(patch_s) : 1;
+  /* A two-head core (point + quantile outputs) needs the post-processing the
+   * ONNX graph could not carry, applied here as declared. Nothing is keyed on a
+   * model name. */
+  seq_post post = {
+      .flip_invariance = json_flag(db, model->io_spec, "$.flip_invariance"),
+      .continuous_head = json_flag(db, model->io_spec, "$.continuous_head"),
+      .crossing_repair = json_flag(db, model->io_spec, "$.quantile_crossing_repair"),
+      .denorm_instance = denorm_s && strcmp(denorm_s, "instance") == 0};
+  int fixed_context = json_flag(db, model->io_spec, "$.fixed_context");
+  int two_head = point_name && quant_name;
   char **lvl_s = NULL;
   json_arr(db, model->io_spec, "$.quantiles", &lvl_s, &nq);
   f32 *levels = NULL;
@@ -750,11 +999,23 @@ int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
   OrtTensorTypeAndShapeInfo *ti = NULL;
   OrtSession *session = NULL;
 
-  if (!layout || strcmp(layout, "sequence") != 0 || !input_name ||
-      !output_name || nq <= 0 || patch < 1) {
+  int outputs_ok = two_head ? (point_name && quant_name) : (output_name != NULL);
+  if (!layout || strcmp(layout, "sequence") != 0 || !input_name || !outputs_ok ||
+      nq <= 0 || patch < 1) {
     *errmsg = sqlite3_mprintf(
         "%s: forecast onnx model needs io_spec layout 'sequence' with input,"
-        " output, and quantiles[]",
+        " output (or outputs.point + outputs.quantile), and quantiles[]",
+        PREDICT_ERR_IO_SPEC);
+    rc = SQLITE_ERROR;
+    goto done;
+  }
+  /* Fail loud, never silently: these transforms are only implemented for a
+   * two-head core, so reject them on a single-output model rather than ignore. */
+  if (!two_head &&
+      (post.flip_invariance || post.continuous_head || post.denorm_instance)) {
+    *errmsg = sqlite3_mprintf(
+        "%s: flip_invariance/continuous_head/denormalize require a two-head core"
+        " (io_spec outputs.point + outputs.quantile)",
         PREDICT_ERR_IO_SPEC);
     rc = SQLITE_ERROR;
     goto done;
@@ -772,9 +1033,10 @@ int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
     goto done;
 
   /* truncate the context to the most recent multiple of the patch size, so the
-   * model never pads (see scripts/export_chronos_onnx.py). */
-  int keep = ctx_len - (ctx_len % patch);
-  if (keep < patch) {
+   * model never pads (see scripts/export_chronos_onnx.py). A fixed_context core
+   * (e.g. TimesFM's 512-length input) takes exactly the last `patch` values. */
+  int keep = fixed_context ? patch : ctx_len - (ctx_len % patch);
+  if (ctx_len < patch || keep < patch) {
     *errmsg = sqlite3_mprintf("%s: context of %d is shorter than the model's"
                               " patch size %d",
                               PREDICT_ERR_SCHEMA, ctx_len, patch);
@@ -782,17 +1044,35 @@ int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
     goto done;
   }
   const f64 *ctx = context + (ctx_len - keep);
-  inbuf = sqlite3_malloc(sizeof(f32) * keep);
   levels = sqlite3_malloc(sizeof(f32) * nq);
   fan = sqlite3_malloc(sizeof(f64) * (size_t)horizon * nq);
-  if (!inbuf || !levels || !fan) {
+  if (!levels || !fan) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  for (int q = 0; q < nq; q++)
+    levels[q] = (f32)atof(lvl_s[q]);
+
+  if (two_head) { /* two-head core: reconstruct the fan per the declared post */
+    if ((rc = seq_reconstruct(session, input_name, point_name, quant_name, ctx,
+                              keep, horizon, nq, levels, &post, fan, errmsg)) !=
+        SQLITE_OK)
+      goto done;
+    *fan_out = fan;
+    *levels_out = levels;
+    *nquant_out = nq;
+    fan = NULL;
+    levels = NULL;
+    goto done;
+  }
+
+  inbuf = sqlite3_malloc(sizeof(f32) * keep);
+  if (!inbuf) {
     rc = SQLITE_NOMEM;
     goto done;
   }
   for (int i = 0; i < keep; i++)
     inbuf[i] = (f32)ctx[i];
-  for (int q = 0; q < nq; q++)
-    levels[q] = (f32)atof(lvl_s[q]);
 
   OrtStatus *st = g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
                                              &mem);
@@ -885,8 +1165,11 @@ done:
   sqlite3_free(fan);
   sqlite3_free(input_name);
   sqlite3_free(output_name);
+  sqlite3_free(point_name);
+  sqlite3_free(quant_name);
   sqlite3_free(patch_s);
   sqlite3_free(layout);
+  sqlite3_free(denorm_s);
   for (int q = 0; q < nq; q++)
     sqlite3_free(lvl_s[q]);
   sqlite3_free(lvl_s);
