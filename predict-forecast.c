@@ -357,7 +357,7 @@ static void fcst_infer(const MLP *m, const f64 *src, f32 *win, f32 *hid,
 
 /* Value of the quantile at level p by linear interpolation over the student's
  * (ascending) levels, extrapolating the tails (e.g. deciles to a 95% band). */
-static f64 quantile_at(const f32 *lev, const f64 *val, int Q, f64 p) {
+f64 predict0_quantile_at(const f32 *lev, const f64 *val, int Q, f64 p) {
   if (Q == 1)
     return val[0];
   if (p <= lev[0])
@@ -409,10 +409,10 @@ static int fcst_run(const ForecastStudent *fs, const f64 *y, int n, int horizon,
         val[j] = val[j - 1];
         val[j - 1] = t;
       }
-    fc[h] = quantile_at(fs->levels, val, Q, 0.5);
+    fc[h] = predict0_quantile_at(fs->levels, val, Q, 0.5);
     if (Q > 1) {
-      lo[h] = quantile_at(fs->levels, val, Q, plo);
-      hi[h] = quantile_at(fs->levels, val, Q, phi);
+      lo[h] = predict0_quantile_at(fs->levels, val, Q, plo);
+      hi[h] = predict0_quantile_at(fs->levels, val, Q, phi);
     }
   }
   if (Q == 1) { /* point student: interval from a refit-free backtest */
@@ -1079,7 +1079,11 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   predict0_ts_model model = resolve_ts_model(opts.model);
   ForecastStudent fstudent;
-  int have_fstudent = 0;
+  int have_fstudent = 0, have_onnx = 0;
+  char *serve_err = NULL; /* an error surfaced from serving a registered model */
+#ifdef SQLITE_PREDICT_ONNX
+  predict0_model_row onnx_row;
+#endif
   if (!model) {
     /* not a bundled model: maybe a registered forecast student (PSFCST) */
     char *lerr = NULL;
@@ -1091,20 +1095,39 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       forecast_opts_free(&opts);
       return rc;
     }
-    if (lr == 0) {
-      int rc = fc_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
-                        opts.model);
+    if (lr == 1) {
+      have_fstudent = 1;
+      if (horizon > fstudent.horizon) {
+        fcst_student_free(&fstudent);
+        int rc =
+            fc_error(cur, PREDICT_ERR_HORIZON,
+                     "horizon exceeds the forecast student's trained horizon",
+                     NULL);
+        forecast_opts_free(&opts);
+        return rc;
+      }
+    } else { /* not a native student: maybe a registered onnx forecast model */
+      predict0_model_row row;
+      int rl = predict0_registry_lookup(db, opts.model, &row);
+      int is_onnx = rl == 0 && row.runtime && strcmp(row.runtime, "onnx") == 0;
+      if (!is_onnx) {
+        if (rl == 0)
+          predict0_model_row_free(&row);
+        int rc = fc_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
+                          opts.model);
+        forecast_opts_free(&opts);
+        return rc;
+      }
+#ifdef SQLITE_PREDICT_ONNX
+      onnx_row = row; /* ownership; freed after the serving loop */
+      have_onnx = 1;
+#else
+      predict0_model_row_free(&row);
+      int rc = fc_error(cur, PREDICT_ERR_RUNTIME_UNAVAILABLE,
+                        "onnx runtime is not in this build: ", opts.model);
       forecast_opts_free(&opts);
       return rc;
-    }
-    have_fstudent = 1;
-    if (horizon > fstudent.horizon) {
-      fcst_student_free(&fstudent);
-      int rc = fc_error(cur, PREDICT_ERR_HORIZON,
-                        "horizon exceeds the forecast student's trained horizon",
-                        NULL);
-      forecast_opts_free(&opts);
-      return rc;
+#endif
     }
   }
 
@@ -1181,6 +1204,16 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       if (fcst_run(&fstudent, y, n, horizon, opts.confidence, fc, lo, hi) !=
           SQLITE_OK)
         rc = SQLITE_NOMEM;
+    } else if (have_onnx) {
+#ifdef SQLITE_PREDICT_ONNX
+      predict0_backend_opts bopts = {NULL, NULL, NULL, 0};
+      int orc = predict0_onnx_forecast(db, &onnx_row, &bopts, y, n, horizon,
+                                       opts.confidence, fc, lo, hi, &serve_err);
+      if (orc != SQLITE_OK) {
+        rc = orc;
+        break; /* serve_err carries the message; surfaced after cleanup */
+      }
+#endif
     } else {
       model(y, n, horizon, fc, sg);
       for (int h = 0; h < horizon; h++) { /* symmetric Gaussian interval */
@@ -1209,6 +1242,10 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   sqlite3_free(hi);
   if (have_fstudent)
     fcst_student_free(&fstudent); /* done serving; safe for every exit below */
+#ifdef SQLITE_PREDICT_ONNX
+  if (have_onnx)
+    predict0_model_row_free(&onnx_row);
+#endif
   for (int i = 0; i < n_series; i++) {
     sqlite3_free(series[i].key);
     sqlite3_free(series[i].ts);
@@ -1216,6 +1253,14 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   }
   sqlite3_free(series);
 
+  if (serve_err) { /* a registered model failed mid-serve */
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = serve_err;
+    sqlite3_free(resolved_time);
+    sqlite3_free(resolved_value);
+    forecast_opts_free(&opts);
+    return rc == SQLITE_OK ? SQLITE_ERROR : rc;
+  }
   if (rc == SQLITE_NOMEM) {
     sqlite3_free(resolved_time);
     sqlite3_free(resolved_value);
@@ -1227,8 +1272,9 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
    * json_object with alphabetical keys, resolved column names recorded */
   if (opts.receipt) {
     char *errmsg = NULL;
-    const char *model_id =
-        have_fstudent ? opts.model : resolve_ts_model_id(opts.model);
+    const char *model_id = (have_fstudent || have_onnx)
+                               ? opts.model
+                               : resolve_ts_model_id(opts.model);
 
     /* result hash over rows sorted by (series_key, step) */
     ForecastRow **order =

@@ -193,7 +193,23 @@ int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
                       predict0_result **rows, int *n,
                       char receipt_id_out[PREDICT_ULID_BUFSIZE], char **errmsg);
 
+/* Interpolate the quantile at level p over ascending levels lev[Q] with the
+ * (ascending) values val[Q], extrapolating the tails (e.g. deciles to a 95%
+ * band). Shared by the native forecast student and the onnx forecast backend. */
+f64 predict0_quantile_at(const f32 *lev, const f64 *val, int Q, f64 p);
+
 #ifdef SQLITE_PREDICT_ONNX
+/* ONNX forecast backend: run a sequence model (a context window -> a quantile
+ * fan) and fill fc/lo/hi[horizon] (the point and the interval at `conf`), read
+ * off the fan by interpolating over the model's quantile levels. The io_spec
+ * (layout 'sequence') names the input/output tensors, the levels, and the patch
+ * size the context length is truncated to. Returns SQLITE_OK or an SQLITE_ code
+ * with *errmsg set (PREDICT_ERR_* lead). */
+int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
+                           const predict0_backend_opts *opts,
+                           const f64 *context, int ctx_len, int horizon,
+                           f64 conf, f64 *fc, f64 *lo, f64 *hi, char **errmsg);
+
 /* ONNX inference for predict(). Dispatches on the model's io_spec layout:
  * 'vector' (a self-contained model mapping features -> prediction, train_sql
  * unused) or 'in_context' (a teacher that ingests the train rows as context

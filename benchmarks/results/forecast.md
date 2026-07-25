@@ -159,8 +159,22 @@ calibration: 78% coverage of an 80% band, matching the teacher, CRPS-competitive
 is the right tool only when there is *no* calibrated teacher fan to distill.
 This shipped as the `quantiles` option to `distill_forecast`.
 
-Next:
+## Serving the FM directly (ONNX)
 
-1. **Serve the FM directly (ONNX):** for the last ~10% the student leaves on the
-   table, `chronos-bolt-small` exports cleanly to ONNX (`scripts/
-   export_chronos_onnx.py`) as an opt-in `forecast()` backend.
+For the last ~10% the native student leaves on the table, the opt-in
+`loadable-onnx` build now serves `chronos-bolt-small` as a `forecast()` backend
+(the `sequence` io_spec layout). Register the exported model
+(`scripts/export_chronos_onnx.py`) and call `forecast()` as usual; the point and
+interval come off the model's decile fan. On m4_hourly (40 series), the
+onnx-served Chronos reproduces the Python model:
+
+| path | MASE | build |
+| --- | --- | --- |
+| chronos via onnx `forecast()` | 0.802 | opt-in (`loadable-onnx`) |
+| chronos, Python reference | 0.794 | — |
+| native distilled student | 0.89 | **zero-dependency** |
+
+The small gap (0.802 vs 0.794) is the context truncation to a multiple of the
+patch size; otherwise it is the same model. So the extension spans the whole
+range: a zero-dependency native student at ~0.89, and the exact FM at ~0.80 for
+those who opt into onnxruntime. Reproduce with `benchmarks/forecast_onnx.py`.

@@ -719,6 +719,178 @@ out:
   return rc;
 }
 
+/* ---- forecast backend (sequence layout: context window -> quantile fan) ---- */
+
+int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
+                           const predict0_backend_opts *opts,
+                           const f64 *context, int ctx_len, int horizon,
+                           f64 conf, f64 *fc, f64 *lo, f64 *hi, char **errmsg) {
+  int rc = SQLITE_OK, nq = 0;
+  char *input_name = json_str(db, model->io_spec, "$.input");
+  char *output_name = json_str(db, model->io_spec, "$.output");
+  char *patch_s = json_str(db, model->io_spec, "$.patch");
+  char *layout = json_str(db, model->io_spec, "$.layout");
+  int patch = patch_s ? atoi(patch_s) : 1;
+  char **lvl_s = NULL;
+  json_arr(db, model->io_spec, "$.quantiles", &lvl_s, &nq);
+  f32 *levels = NULL;
+  f64 *val = NULL;
+  f32 *inbuf = NULL;
+  OrtMemoryInfo *mem = NULL;
+  OrtValue *input = NULL, *output = NULL;
+  OrtTensorTypeAndShapeInfo *ti = NULL;
+  OrtSession *session = NULL;
+
+  if (!layout || strcmp(layout, "sequence") != 0 || !input_name ||
+      !output_name || nq <= 0 || patch < 1) {
+    *errmsg = sqlite3_mprintf(
+        "%s: forecast onnx model needs io_spec layout 'sequence' with input,"
+        " output, and quantiles[]",
+        PREDICT_ERR_IO_SPEC);
+    rc = SQLITE_ERROR;
+    goto done;
+  }
+  if (!license_ok(model->license, opts->accept_license)) {
+    *errmsg = sqlite3_mprintf(
+        "%s: model license '%s' requires a matching accept_license",
+        PREDICT_ERR_LICENSE, model->license ? model->license : "(none)");
+    rc = SQLITE_ERROR;
+    goto done;
+  }
+  if ((rc = onnx_init(errmsg)) != SQLITE_OK)
+    goto done;
+  if ((rc = onnx_get_session(model, opts, &session, errmsg)) != SQLITE_OK)
+    goto done;
+
+  /* truncate the context to the most recent multiple of the patch size, so the
+   * model never pads (see scripts/export_chronos_onnx.py). */
+  int keep = ctx_len - (ctx_len % patch);
+  if (keep < patch) {
+    *errmsg = sqlite3_mprintf("%s: context of %d is shorter than the model's"
+                              " patch size %d",
+                              PREDICT_ERR_SCHEMA, ctx_len, patch);
+    rc = SQLITE_ERROR;
+    goto done;
+  }
+  const f64 *ctx = context + (ctx_len - keep);
+  inbuf = sqlite3_malloc(sizeof(f32) * keep);
+  levels = sqlite3_malloc(sizeof(f32) * nq);
+  val = sqlite3_malloc(sizeof(f64) * nq);
+  if (!inbuf || !levels || !val) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  for (int i = 0; i < keep; i++)
+    inbuf[i] = (f32)ctx[i];
+  for (int q = 0; q < nq; q++)
+    levels[q] = (f32)atof(lvl_s[q]);
+
+  OrtStatus *st = g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
+                                             &mem);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateCpuMemoryInfo", errmsg);
+    goto done;
+  }
+  int64_t shape[2] = {1, keep};
+  st = g_ort->CreateTensorWithDataAsOrtValue(
+      mem, inbuf, sizeof(f32) * (size_t)keep, shape, 2,
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "CreateTensor", errmsg);
+    goto done;
+  }
+  const char *in_names[1] = {input_name};
+  const char *out_names[1] = {output_name};
+  st = g_ort->Run(session, NULL, in_names, (const OrtValue *const *)&input, 1,
+                  out_names, 1, &output);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "Run", errmsg);
+    goto done;
+  }
+
+  size_t ndim = 0;
+  int64_t od[8];
+  float *odata = NULL;
+  st = g_ort->GetTensorTypeAndShape(output, &ti);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "GetTensorTypeAndShape", errmsg);
+    goto done;
+  }
+  st = g_ort->GetDimensionsCount(ti, &ndim);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "GetDimensionsCount", errmsg);
+    goto done;
+  }
+  if (ndim != 3) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: forecast output has %zu dims (expected 3:"
+                              " [1, quantiles, horizon])",
+                              PREDICT_ERR_INFERENCE, ndim);
+    goto done;
+  }
+  st = g_ort->GetDimensions(ti, od, ndim);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "GetDimensions", errmsg);
+    goto done;
+  }
+  int Qd = (int)od[1], Hmax = (int)od[2];
+  if (od[0] != 1 || Qd != nq) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: forecast output quantile dim %d does not"
+                              " match %d io_spec levels",
+                              PREDICT_ERR_INFERENCE, Qd, nq);
+    goto done;
+  }
+  if (Hmax < horizon) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: model forecasts at most %d steps, %d asked",
+                              PREDICT_ERR_HORIZON, Hmax, horizon);
+    goto done;
+  }
+  st = g_ort->GetTensorMutableData(output, (void **)&odata);
+  if (st) {
+    rc = onnx_fail(st, PREDICT_ERR_INFERENCE, "GetTensorMutableData", errmsg);
+    goto done;
+  }
+  /* odata[q*Hmax + k] = quantile q at step k. Per step: sort the fan and read
+   * the point (0.5) and the interval bounds at (1+-conf)/2 off the levels. */
+  f64 plo = (1 - conf) / 2, phi = (1 + conf) / 2;
+  for (int k = 0; k < horizon; k++) {
+    for (int q = 0; q < nq; q++)
+      val[q] = (f64)odata[(size_t)q * Hmax + k];
+    for (int i = 1; i < nq; i++)
+      for (int j = i; j > 0 && val[j] < val[j - 1]; j--) {
+        f64 t = val[j];
+        val[j] = val[j - 1];
+        val[j - 1] = t;
+      }
+    fc[k] = predict0_quantile_at(levels, val, nq, 0.5);
+    lo[k] = predict0_quantile_at(levels, val, nq, plo);
+    hi[k] = predict0_quantile_at(levels, val, nq, phi);
+  }
+
+done:
+  if (ti)
+    g_ort->ReleaseTensorTypeAndShapeInfo(ti);
+  if (output)
+    g_ort->ReleaseValue(output);
+  if (input)
+    g_ort->ReleaseValue(input);
+  if (mem)
+    g_ort->ReleaseMemoryInfo(mem);
+  sqlite3_free(inbuf);
+  sqlite3_free(levels);
+  sqlite3_free(val);
+  sqlite3_free(input_name);
+  sqlite3_free(output_name);
+  sqlite3_free(patch_s);
+  sqlite3_free(layout);
+  for (int q = 0; q < nq; q++)
+    sqlite3_free(lvl_s[q]);
+  sqlite3_free(lvl_s);
+  return rc;
+}
+
 /* Hash results canonically (ref, prediction, confidence per row) and write
  * a receipt. input_json is {"train","apply"} when train_sql is given, else
  * {"apply"}; params pin the model, device, and precision. Shared by the

@@ -47,11 +47,17 @@ the registry (so it still works read-only), while a named `onnx` model
 routes through the backend in `predict-onnx.c`.
 
 That backend (compiled only into `make loadable-onnx`, `-DSQLITE_PREDICT_ONNX`)
-serves two `io_spec` layouts. The **vector** layout is a self-contained model
+serves three `io_spec` layouts. The **vector** layout is a self-contained model
 mapping a feature vector to a prediction. The **in_context** layout is a
 teacher (TabFM-shaped): it ingests the `train_query` rows as three tensors
 (`x_train`, `y_train`, `x_query`) each call and labels the query rows against
-that context.
+that context. The **sequence** layout is a forecast foundation model served by
+`forecast()` (not `predict()`): `predict0_onnx_forecast` feeds a context window
+as a `[1, ctx]` tensor (truncated to a multiple of the model's patch size) and
+reads a `[1, Q, H]` quantile fan back, from which the point and the interval at
+the requested confidence are interpolated over the io_spec's quantile levels.
+Chronos-Bolt exports cleanly to this shape (`scripts/export_chronos_onnx.py`);
+the receipt anchors the series, and the served MASE matches the Python model.
 
 The `io_spec` is usually derived, not written. `predict_register` reads the
 model's input/output tensors (`predict0_onnx_introspect`) to fill in the

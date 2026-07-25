@@ -210,6 +210,53 @@ def build_incontext_cases():
     return {"train": train, "apply": apply}
 
 
+FQ = [0.1, 0.3, 0.5, 0.7, 0.9]  # forecast fixture quantile levels
+FOFF = [-2.0, -1.0, 0.0, 1.0, 2.0]  # per-quantile offset off the context mean
+FH = 4  # forecast fixture horizon
+
+
+def build_forecast():
+    """A trivial sequence forecaster exercising the 'sequence' io_spec: it
+    forecasts every step as the context mean plus a fixed per-quantile offset.
+
+    input  'context'   [1, ctx] float32   (a context window)
+    output 'quantiles' [1, Q, H] float32  (Q quantiles x H steps)
+    quantiles[0,q,k] = mean(context) + FOFF[q]
+    """
+    Q = len(FQ)
+    vals = [FOFF[q] for q in range(Q) for _ in range(FH)]  # [1,Q,H], flat in k
+    fan = helper.make_tensor("fan", TensorProto.FLOAT, [1, Q, FH], vals)
+    nodes = [
+        helper.make_node("ReduceMean", ["context"], ["mean"], axes=[1],
+                         keepdims=1),                      # [1,1]
+        helper.make_node("Add", ["mean", "fan"], ["quantiles"]),  # -> [1,Q,H]
+    ]
+    graph = helper.make_graph(
+        nodes, "forecast",
+        [helper.make_tensor_value_info("context", TensorProto.FLOAT, [1, None])],
+        [helper.make_tensor_value_info("quantiles", TensorProto.FLOAT,
+                                       [1, Q, FH])],
+        initializer=[fan])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 9
+    onnx.checker.check_model(model)
+    return model
+
+
+def build_forecast_cases():
+    # forecast() feeds the whole series as context (patch=1, no truncation), so
+    # the point is the series mean and the 0.1/0.9 band (conf 0.8) is mean +- 2.
+    series = [[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0],  # >= FORECAST_MIN_HISTORY
+              [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+              [-3.0, -1.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0]]
+    cases = []
+    for sv in series:
+        m = sum(sv) / len(sv)
+        cases.append({"series": sv, "point": m, "lower": m - 2.0,
+                      "upper": m + 2.0})
+    return {"quantiles": FQ, "horizon": FH, "conf": 0.8, "cases": cases}
+
+
 def main():
     model = build_model()
     onnx.save(model, os.path.join(HERE, "logreg.onnx"))
@@ -229,10 +276,16 @@ def main():
     with open(os.path.join(HERE, "knn_incontext_cases.json"), "w") as f:
         json.dump(iccases, f, indent=2)
 
+    fm = build_forecast()
+    onnx.save(fm, os.path.join(HERE, "forecast.onnx"))
+    with open(os.path.join(HERE, "forecast_cases.json"), "w") as f:
+        json.dump(build_forecast_cases(), f, indent=2)
+
     print(f"wrote logreg.onnx ({model.ByteSize()} B, {len(cases)} cases),"
-          f" linreg.onnx ({reg.ByteSize()} B, {len(rcases)} cases), and"
+          f" linreg.onnx ({reg.ByteSize()} B, {len(rcases)} cases),"
           f" knn_incontext.onnx ({ic.ByteSize()} B,"
-          f" {len(iccases['apply'])} queries)")
+          f" {len(iccases['apply'])} queries), and forecast.onnx"
+          f" ({fm.ByteSize()} B)")
 
 
 if __name__ == "__main__":

@@ -51,13 +51,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   than a lag-1 residual grown as `sigma*sqrt(h)`; on real gluonts data this
   brings 95% coverage toward nominal and roughly halves the interval score.
 - `predict_ulid()` and `predict_version()` utility functions.
-- Opt-in ONNX runtime serving path for `predict()` (`make loadable-onnx`):
-  runs exported models through onnxruntime in two `io_spec` layouts, with a
-  process-global session cache, batched inference, and explicit fail-loud
-  execution-provider selection. The `vector` layout serves a self-contained
-  model (a distilled student or classifier/regressor); the `in_context`
+- Opt-in ONNX runtime serving path (`make loadable-onnx`): runs exported
+  models through onnxruntime, with a process-global session cache, batched
+  inference, and explicit fail-loud execution-provider selection. Three
+  `io_spec` layouts. The `vector` layout serves a self-contained model (a
+  distilled student or classifier/regressor) for `predict()`; the `in_context`
   layout serves a teacher that ingests the `train_query` rows as context
-  each call (TabFM-shaped), anchoring those rows in the receipt. A GPU build
+  each call (TabFM-shaped), anchoring those rows in the receipt. The `sequence`
+  layout serves a **forecast foundation model** for `forecast()`: it feeds a
+  context window as a tensor and reads the point + interval off the model's
+  quantile fan (chronos-bolt exports cleanly this way, see
+  `scripts/export_chronos_onnx.py`; on m4_hourly the onnx-served Chronos
+  reproduces its ~0.80 MASE, versus the native distilled student's ~0.89 in the
+  zero-dependency build). A GPU build
   (`make loadable-onnx-gpu`) adds the CUDA and TensorRT execution providers
   and fp16/int8 precision, compile-checked in CI and validated on a
   dedicated GPU job. The default build stays zero-dependency.

@@ -504,3 +504,45 @@ def test_session_cache_reuse_is_fast(db):
     first = db.execute(q).fetchall()
     second = db.execute(q).fetchall()
     assert first == second
+
+
+FCAST_IO = {"layout": "sequence", "input": "context", "output": "quantiles",
+            "quantiles": [0.1, 0.3, 0.5, 0.7, 0.9], "patch": 1}
+
+
+def test_onnx_forecast_sequence(db):
+    """The 'sequence' io_spec: forecast() feeds a context window to an onnx
+    model and reads the point + interval off its quantile fan. The fixture
+    forecasts mean(context) + per-quantile offset, so the point is the series
+    mean and the 0.1/0.9 band (conf 0.8) is mean +- 2, computed in pure Python."""
+    _register(db, "fcast", "forecast.onnx", FCAST_IO)
+    spec = json.load(open(_abs("forecast_cases.json")))
+    H, conf = spec["horizon"], spec["conf"]
+    for case in spec["cases"]:
+        sv = case["series"]
+        db.execute("DROP TABLE IF EXISTS s")
+        db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+        db.executemany(
+            "INSERT INTO s VALUES (?,?)",
+            [(f"2020-01-01T{i // 24:02d}:{i % 24:02d}:00", v)
+             for i, v in enumerate(sv)])
+        rows = db.execute(
+            "SELECT step, forecast, lower_bound, upper_bound FROM forecast("
+            "'SELECT ts, value FROM s', ?, json_object('model','fcast',"
+            "'confidence_level',?,'receipt',0)) ORDER BY step",
+            (H, conf)).fetchall()
+        assert len(rows) == H
+        for _step, fc, lo, hi in rows:
+            assert abs(fc - case["point"]) < 1e-3
+            assert abs(lo - case["lower"]) < 1e-3
+            assert abs(hi - case["upper"]) < 1e-3
+
+
+def test_onnx_forecast_horizon_exceeds_model(db):
+    _register(db, "fcast", "forecast.onnx", FCAST_IO)
+    db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+    db.executemany("INSERT INTO s VALUES (?,?)",
+                   [(f"2020-01-01T00:{i:02d}:00", float(i)) for i in range(10)])
+    with pytest.raises(sqlite3.OperationalError, match="steps"):
+        db.execute("SELECT * FROM forecast('SELECT ts, value FROM s', 99,"
+                   " json_object('model','fcast','receipt',0))").fetchall()
