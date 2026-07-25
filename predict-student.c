@@ -604,11 +604,20 @@ oom:
 
 static const char FCST_MAGIC[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
 
-int fcst_serialize(const MLP *m, void **blob_out, int *len_out) {
-  size_t sz = sizeof(FCST_MAGIC) + 4 * 3;            /* nfeat, nhid, nout */
-  sz += 4 * (size_t)m->nfeat * 2;                    /* mean, sd */
-  sz += 4 * ((size_t)m->nhid * m->nfeat + m->nhid);  /* W1, b1 */
-  sz += 4 * ((size_t)m->nout * m->nhid + m->nout);   /* W2, b2 */
+void fcst_student_free(ForecastStudent *fs) {
+  sqlite3_free(fs->levels);
+  fs->levels = NULL;
+  fs->horizon = fs->nquant = 0;
+  mlp_free(&fs->mlp); /* memsets the embedded MLP */
+}
+
+int fcst_serialize(const ForecastStudent *fs, void **blob_out, int *len_out) {
+  const MLP *m = &fs->mlp;
+  size_t sz = sizeof(FCST_MAGIC) + 4 * 4; /* nfeat, nhid, horizon, nquant */
+  sz += 4 * (size_t)fs->nquant;           /* quantile levels */
+  sz += 4 * (size_t)m->nfeat * 2;         /* mean, sd */
+  sz += 4 * ((size_t)m->nhid * m->nfeat + m->nhid);
+  sz += 4 * ((size_t)m->nout * m->nhid + m->nout);
   u8 *buf = sqlite3_malloc((int)sz);
   if (!buf)
     return SQLITE_NOMEM;
@@ -617,7 +626,10 @@ int fcst_serialize(const MLP *m, void **blob_out, int *len_out) {
   p += sizeof(FCST_MAGIC);
   put_u32(&p, (u32)m->nfeat);
   put_u32(&p, (u32)m->nhid);
-  put_u32(&p, (u32)m->nout);
+  put_u32(&p, (u32)fs->horizon);
+  put_u32(&p, (u32)fs->nquant);
+  for (int i = 0; i < fs->nquant; i++)
+    put_f32(&p, fs->levels[i]);
   for (int i = 0; i < m->nfeat; i++)
     put_f32(&p, m->mean[i]);
   for (int i = 0; i < m->nfeat; i++)
@@ -635,8 +647,11 @@ int fcst_serialize(const MLP *m, void **blob_out, int *len_out) {
   return SQLITE_OK;
 }
 
-int fcst_deserialize(const void *blob, int len, MLP *m, char **errmsg) {
-  memset(m, 0, sizeof(*m));
+int fcst_deserialize(const void *blob, int len, ForecastStudent *fs,
+                     char **errmsg) {
+  memset(fs, 0, sizeof(*fs));
+  MLP *m = &fs->mlp;
+  m->task = 1; /* regression head; no classes or feature names */
   Reader r = {.p = blob, .end = (const u8 *)blob + len, .err = 0};
   if (!blob || len < (int)sizeof(FCST_MAGIC) ||
       memcmp(blob, FCST_MAGIC, sizeof(FCST_MAGIC)) != 0) {
@@ -645,21 +660,34 @@ int fcst_deserialize(const void *blob, int len, MLP *m, char **errmsg) {
     return SQLITE_ERROR;
   }
   r.p += sizeof(FCST_MAGIC);
-  m->task = 1; /* regression head; no classes or feature names */
   m->nfeat = (int)rd_u32(&r);
   m->nhid = (int)rd_u32(&r);
-  m->nout = (int)rd_u32(&r);
+  fs->horizon = (int)rd_u32(&r);
+  fs->nquant = (int)rd_u32(&r);
   if (r.err || m->nfeat <= 0 || m->nfeat > FCST_MAX_CONTEXT || m->nhid <= 0 ||
-      m->nhid > 2048 || m->nout <= 0 || m->nout > 2048)
+      m->nhid > 2048 || fs->horizon <= 0 || fs->horizon > 2048 ||
+      fs->nquant <= 0 || fs->nquant > FCST_MAX_QUANT)
     goto bad;
+  m->nout = fs->horizon * fs->nquant;
+  if (m->nout > 8192) /* bound the largest allocation (W2 = nout*nhid) */
+    goto bad;
+  fs->levels = sqlite3_malloc(sizeof(f32) * fs->nquant);
   m->mean = sqlite3_malloc(sizeof(f32) * m->nfeat);
   m->sd = sqlite3_malloc(sizeof(f32) * m->nfeat);
   m->W1 = sqlite3_malloc(sizeof(f32) * (size_t)m->nhid * m->nfeat);
   m->b1 = sqlite3_malloc(sizeof(f32) * m->nhid);
   m->W2 = sqlite3_malloc(sizeof(f32) * (size_t)m->nout * m->nhid);
   m->b2 = sqlite3_malloc(sizeof(f32) * m->nout);
-  if (!m->mean || !m->sd || !m->W1 || !m->b1 || !m->W2 || !m->b2)
+  if (!fs->levels || !m->mean || !m->sd || !m->W1 || !m->b1 || !m->W2 || !m->b2)
     goto oom;
+  for (int i = 0; i < fs->nquant; i++)
+    fs->levels[i] = rd_f32(&r);
+  /* levels MUST be strictly ascending within (0,1) for the serving-time
+   * quantile interpolation (the registry is caller-writable). */
+  for (int i = 0; i < fs->nquant; i++)
+    if (!(fs->levels[i] > 0.0f && fs->levels[i] < 1.0f) ||
+        (i > 0 && fs->levels[i] <= fs->levels[i - 1]))
+      goto bad;
   for (int i = 0; i < m->nfeat; i++)
     m->mean[i] = rd_f32(&r);
   for (int i = 0; i < m->nfeat; i++)
@@ -676,12 +704,12 @@ int fcst_deserialize(const void *blob, int len, MLP *m, char **errmsg) {
     goto bad;
   return SQLITE_OK;
 bad:
-  mlp_free(m);
+  fcst_student_free(fs);
   *errmsg =
       sqlite3_mprintf("%s: malformed forecast student blob", PREDICT_ERR_SCHEMA);
   return SQLITE_ERROR;
 oom:
-  mlp_free(m);
+  fcst_student_free(fs);
   *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
   return SQLITE_NOMEM;
 }

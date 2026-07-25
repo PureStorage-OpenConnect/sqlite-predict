@@ -1695,11 +1695,13 @@ typedef struct {
   char receipt_id[PREDICT_ULID_BUFSIZE];
 } FcstResult;
 
-static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
-                          const char *student_id, int nhid, int epochs, f32 lr,
-                          int receipt, FcstResult *res, char **errmsg) {
-  int rc = SQLITE_OK, ncol = L + H, cap = 0, n = 0, blob_len = 0;
-  f32 *X = NULL, *Y = NULL; /* [n,L] and [n,H], instance-normalized */
+static int fdistill_train(sqlite3 *db, const char *tq, int L, int H, int Q,
+                          const f32 *levels, const char *student_id, int nhid,
+                          int epochs, f32 lr, int receipt, FcstResult *res,
+                          char **errmsg) {
+  int nout = H * Q; /* Q quantiles per horizon step */
+  int rc = SQLITE_OK, ncol = L + nout, cap = 0, n = 0, blob_len = 0;
+  f32 *X = NULL, *Y = NULL; /* [n,L] and [n,nout], instance-normalized */
   f64 *wrow = NULL;
   void *blob = NULL;
   MLP mlp;
@@ -1713,7 +1715,8 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
   }
   if (sqlite3_column_count(q) != ncol) {
     *errmsg = sqlite3_mprintf(
-        "%s: train_query must return context+horizon = %d columns, got %d",
+        "%s: train_query must return context + horizon*nquant = %d columns,"
+        " got %d",
         PREDICT_ERR_SCHEMA, ncol, sqlite3_column_count(q));
     rc = SQLITE_ERROR;
     goto done;
@@ -1741,7 +1744,7 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
     if (n == cap) {
       int nc = cap ? cap * 2 : 256;
       f32 *nX = sqlite3_realloc(X, (int)(sizeof(f32) * (size_t)nc * L));
-      f32 *nY = sqlite3_realloc(Y, (int)(sizeof(f32) * (size_t)nc * H));
+      f32 *nY = sqlite3_realloc(Y, (int)(sizeof(f32) * (size_t)nc * nout));
       if (nX)
         X = nX;
       if (nY)
@@ -1754,8 +1757,8 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
     }
     for (int i = 0; i < L; i++)
       X[(size_t)n * L + i] = (f32)((wrow[i] - mu) / sd);
-    for (int k = 0; k < H; k++)
-      Y[(size_t)n * H + k] = (f32)((wrow[L + k] - mu) / sd);
+    for (int k = 0; k < nout; k++) /* teacher's Q quantiles per horizon step */
+      Y[(size_t)n * nout + k] = (f32)((wrow[L + k] - mu) / sd);
     n++;
   }
   if (n < 2) {
@@ -1769,14 +1772,14 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
   if (n_hold < 1)
     n_hold = 1;
   int n_fit = n - n_hold;
-  rc = train_mlp(X, n_fit, L, H, NULL, Y, 1 /* regress */, nhid, epochs, lr,
+  rc = train_mlp(X, n_fit, L, nout, NULL, Y, 1 /* regress */, nhid, epochs, lr,
                  &mlp, errmsg);
   if (rc != SQLITE_OK)
     goto done;
 
   { /* holdout RMSE (normalized space) as the reported metric */
     f32 *hid = sqlite3_malloc(sizeof(f32) * nhid);
-    f32 *out = sqlite3_malloc(sizeof(f32) * H);
+    f32 *out = sqlite3_malloc(sizeof(f32) * nout);
     if (!hid || !out) {
       sqlite3_free(hid);
       sqlite3_free(out);
@@ -1787,8 +1790,8 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
     int m = 0;
     for (int r = n_fit; r < n; r++) {
       mlp_forward(&mlp, &X[(size_t)r * L], hid, out);
-      for (int k = 0; k < H; k++) {
-        f64 e = (f64)out[k] - Y[(size_t)r * H + k];
+      for (int k = 0; k < nout; k++) {
+        f64 e = (f64)out[k] - Y[(size_t)r * nout + k];
         se += e * e;
         m++;
       }
@@ -1798,7 +1801,9 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
     sqlite3_free(out);
   }
 
-  rc = fcst_serialize(&mlp, &blob, &blob_len);
+  ForecastStudent fs = {
+      .mlp = mlp, .horizon = H, .nquant = Q, .levels = (f32 *)levels};
+  rc = fcst_serialize(&fs, &blob, &blob_len);
   if (rc != SQLITE_OK) {
     *errmsg = sqlite3_mprintf("%s: student serialize failed", PREDICT_ERR_RESOURCE);
     goto done;
@@ -1854,8 +1859,9 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H,
     char result_hash[PREDICT_HEX_BUFSIZE];
     predict0_hash_hex(&rh, result_hash);
     char *params = sqlite3_mprintf(
-        "{\"context\":%d,\"horizon\":%d,\"hidden\":%d,\"student_id\":\"%s\"}", L,
-        H, nhid, student_id);
+        "{\"context\":%d,\"horizon\":%d,\"nquant\":%d,\"hidden\":%d,"
+        "\"student_id\":\"%s\"}",
+        L, H, Q, nhid, student_id);
     char *rerr = NULL;
     if (params &&
         predict0_emit_receipt(db, "distill", res->model_id, params, tq,
@@ -1995,11 +2001,13 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
     sqlite3_free(vtab->base.zErrMsg);                                          \
     vtab->base.zErrMsg = sqlite3_mprintf(__VA_ARGS__);                         \
     sqlite3_free(student_id);                                                  \
+    sqlite3_free(levels);                                                      \
     return SQLITE_ERROR;                                                       \
   } while (0)
 
   char *student_id = NULL;
-  int L = 0, H = 0, nhid = FCST_HIDDEN, epochs = FCST_EPOCHS, receipt = 1;
+  f32 *levels = NULL;
+  int L = 0, H = 0, Q = 1, nhid = FCST_HIDDEN, epochs = FCST_EPOCHS, receipt = 1;
   f32 lr = FCST_LR;
   if (!tq)
     FD_FAIL("%s: train_query is required", PREDICT_ERR_SCHEMA);
@@ -2044,11 +2052,58 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (!(lr > 0.0f) || lr > 10.0f)
     FD_FAIL("%s: lr must be in (0,10]", PREDICT_ERR_OPTIONS);
 
+  { /* optional quantile fan (a JSON array of levels); default = point student */
+    sqlite3_stmt *qs = NULL;
+    int cap = 0, cnt = 0;
+    if (sqlite3_prepare_v2(db, "SELECT value FROM json_each(?1,'$.quantiles')",
+                           -1, &qs, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(qs, 1, options, -1, SQLITE_STATIC);
+      while (sqlite3_step(qs) == SQLITE_ROW) {
+        if (cnt == cap) {
+          int nc = cap ? cap * 2 : 8;
+          f32 *nl = sqlite3_realloc(levels, (int)(sizeof(f32) * nc));
+          if (!nl) {
+            sqlite3_finalize(qs);
+            FD_FAIL("%s: out of memory", PREDICT_ERR_RESOURCE);
+          }
+          levels = nl;
+          cap = nc;
+        }
+        levels[cnt++] = (f32)sqlite3_column_double(qs, 0);
+      }
+      sqlite3_finalize(qs);
+    }
+    if (cnt > 0)
+      Q = cnt;
+    else { /* no quantiles key: point student (median only) */
+      levels = sqlite3_malloc(sizeof(f32));
+      if (!levels)
+        FD_FAIL("%s: out of memory", PREDICT_ERR_RESOURCE);
+      levels[0] = 0.5f;
+      Q = 1;
+    }
+  }
+  if (Q > FCST_MAX_QUANT)
+    FD_FAIL("%s: at most %d quantile levels", PREDICT_ERR_OPTIONS,
+            FCST_MAX_QUANT);
+  for (int i = 1; i < Q; i++) /* insertion sort ascending (Q is small) */
+    for (int j = i; j > 0 && levels[j] < levels[j - 1]; j--) {
+      f32 t = levels[j];
+      levels[j] = levels[j - 1];
+      levels[j - 1] = t;
+    }
+  for (int i = 0; i < Q; i++)
+    if (!(levels[i] > 0.0f && levels[i] < 1.0f) ||
+        (i > 0 && levels[i] == levels[i - 1]))
+      FD_FAIL("%s: quantile levels must be distinct values in (0,1)",
+              PREDICT_ERR_OPTIONS);
+
   char *ensure_err = NULL;
   if (predict0_receipts_ensure(db, &ensure_err) != SQLITE_OK) {
     sqlite3_free(vtab->base.zErrMsg);
     vtab->base.zErrMsg = ensure_err;
     sqlite3_free(student_id);
+    sqlite3_free(levels);
     return SQLITE_ERROR;
   }
   char *existing = predict0_registry_model_hash(db, student_id);
@@ -2060,9 +2115,10 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
 #undef FD_FAIL
 
   char *emsg = NULL;
-  int rc = fdistill_train(db, tq, L, H, student_id, nhid, epochs, lr, receipt,
-                          &cur->res, &emsg);
+  int rc = fdistill_train(db, tq, L, H, Q, levels, student_id, nhid, epochs, lr,
+                          receipt, &cur->res, &emsg);
   sqlite3_free(student_id);
+  sqlite3_free(levels);
   if (rc != SQLITE_OK) {
     sqlite3_free(vtab->base.zErrMsg);
     vtab->base.zErrMsg = emsg;

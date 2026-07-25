@@ -138,11 +138,29 @@ forecast FM, and name the "architecture discrepancy" that sinks the tree. The
 training hyperparameters (`epochs`/`lr`, exposed as `distill_forecast` options)
 were chosen on the holdout RMSE, never the test MASE.
 
+## Probabilistic student: distill the fan, not pinball
+
+The point student's interval came from a backtest. A quantile head fixes that,
+but the loss choice is not the obvious one. Three options, on m4_hourly (80%
+band, `quantiles=[0.1..0.9]`, `forecast_quantile.py`):
+
+| student | MASE | 80% cov | mwQL |
+| --- | --- | --- | --- |
+| chronos (teacher) | 0.794 | 79% | 0.0162 |
+| **distill the teacher's fan (MSE)** | **0.89** | **78%** | **0.018** |
+| hybrid (distill median + pinball spread) | 0.88 | 65% | 0.019 |
+| pinball on actuals only | 0.99 | 52% | 0.022 |
+
+Pinball has to *estimate* quantiles from limited samples, so it collapses the
+spread and under-covers (52–65%). Chronos's fan is already calibrated, so
+distilling it directly (MSE over `nquant` outputs per step) inherits that
+calibration: 78% coverage of an 80% band, matching the teacher, CRPS-competitive
+(mwQL 0.018 vs 0.016), and served straight off the fan with no backtest. Pinball
+is the right tool only when there is *no* calibrated teacher fan to distill.
+This shipped as the `quantiles` option to `distill_forecast`.
+
 Next:
 
-1. **Probabilistic student:** the student is point-only today; the interval
-   comes from a backtest. A multi-quantile head (pinball loss) would let it be
-   scored on mwQL/CRPS against the FMs directly.
-2. **Serve the FM directly (ONNX):** for the last ~10% the student leaves on the
+1. **Serve the FM directly (ONNX):** for the last ~10% the student leaves on the
    table, `chronos-bolt-small` exports cleanly to ONNX (`scripts/
    export_chronos_onnx.py`) as an opt-in `forecast()` backend.

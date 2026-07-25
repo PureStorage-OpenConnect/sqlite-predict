@@ -17,6 +17,7 @@
 
 #define TREE_MAX_FEAT 64 /* apply-time feature cap; bounds a student's nfeat */
 #define FCST_MAX_CONTEXT 4096 /* forecast student: max context length (nfeat) */
+#define FCST_MAX_QUANT 64 /* forecast student: max quantile levels */
 
 /* A decision-tree node (also the weak learner of a gbt forest). */
 typedef struct {
@@ -72,12 +73,22 @@ int tree_serialize(const Tree *t, void **blob_out, int *len_out);
 int forest_serialize(const Forest *f, void **blob_out, int *len_out);
 int mlp_serialize(const MLP *m, void **blob_out, int *len_out);
 
-/* Forecast student (PSFCST01): a multi-output regression MLP (nout = horizon)
- * reusing the MLP struct with task=1, no class labels or feature names. The
+/* Forecast student (PSFCST01): a multi-output regression MLP whose outputs are
+ * `nquant` quantiles per horizon step (nout = horizon * nquant), distilled from
+ * a teacher's quantile fan. A point student is nquant=1 with level {0.5}. The
  * forecast() serving path instance-normalizes a context window of length nfeat,
- * applies the net, and de-normalizes the nout outputs. */
-int fcst_serialize(const MLP *m, void **blob_out, int *len_out);
-int fcst_deserialize(const void *blob, int len, MLP *m, char **errmsg);
+ * applies the net, de-normalizes, and reads the point + interval off the fan. */
+typedef struct {
+  MLP mlp;     /* task=1 regression net; nout = horizon * nquant */
+  int horizon; /* H forecast steps */
+  int nquant;  /* Q quantile levels (1 = point student) */
+  f32 *levels; /* [nquant] ascending; {0.5} for a point student */
+} ForecastStudent;
+
+int fcst_serialize(const ForecastStudent *fs, void **blob_out, int *len_out);
+int fcst_deserialize(const void *blob, int len, ForecastStudent *fs,
+                     char **errmsg);
+void fcst_student_free(ForecastStudent *fs);
 
 /* Free a student's owned memory. */
 void tree_free(Tree *t);

@@ -355,21 +355,40 @@ static void fcst_infer(const MLP *m, const f64 *src, f32 *win, f32 *hid,
   *sd_out = sd;
 }
 
-/* Serve a forecast student over series y[0..n-1]: point forecast from the most
- * recent window (front-padded if n < L), and per-horizon sigma from a refit-
- * free backtest of the student over the history. Fills fc[horizon]/sg[horizon];
- * horizon MUST be <= m->nout (checked by the caller). Returns SQLITE_OK or
- * SQLITE_NOMEM. */
-static int fcst_run(const MLP *m, const f64 *y, int n, int horizon, f64 *fc,
-                    f64 *sg) {
-  int L = m->nfeat, H = m->nout, rc = SQLITE_OK;
+/* Value of the quantile at level p by linear interpolation over the student's
+ * (ascending) levels, extrapolating the tails (e.g. deciles to a 95% band). */
+static f64 quantile_at(const f32 *lev, const f64 *val, int Q, f64 p) {
+  if (Q == 1)
+    return val[0];
+  if (p <= lev[0])
+    return val[0] + (val[1] - val[0]) / (lev[1] - lev[0]) * (p - lev[0]);
+  if (p >= lev[Q - 1])
+    return val[Q - 1] +
+           (val[Q - 1] - val[Q - 2]) / (lev[Q - 1] - lev[Q - 2]) * (p - lev[Q - 1]);
+  for (int i = 1; i < Q; i++)
+    if (p <= lev[i])
+      return val[i - 1] +
+             (p - lev[i - 1]) / (lev[i] - lev[i - 1]) * (val[i] - val[i - 1]);
+  return val[Q - 1];
+}
+
+/* Serve a forecast student over series y[0..n-1]. Fills fc/lo/hi[horizon] (the
+ * point and the interval at `conf`). For a quantile student (nquant>1) the
+ * point and bounds come straight off the emitted fan; for a point student the
+ * bound comes from a refit-free backtest of the student over its own history.
+ * horizon MUST be <= fs->horizon (checked by the caller). */
+static int fcst_run(const ForecastStudent *fs, const f64 *y, int n, int horizon,
+                    f64 conf, f64 *fc, f64 *lo, f64 *hi) {
+  const MLP *m = &fs->mlp;
+  int L = m->nfeat, H = fs->horizon, Q = fs->nquant, rc = SQLITE_OK;
   f32 *win = sqlite3_malloc(sizeof(f32) * L);
   f32 *hid = sqlite3_malloc(sizeof(f32) * m->nhid);
-  f32 *out = sqlite3_malloc(sizeof(f32) * H);
+  f32 *out = sqlite3_malloc(sizeof(f32) * m->nout);
   f64 *wbuf = sqlite3_malloc(sizeof(f64) * L);
+  f64 *val = sqlite3_malloc(sizeof(f64) * Q);
   f64 *ss = sqlite3_malloc(sizeof(f64) * H);
   int *cnt = sqlite3_malloc(sizeof(int) * H);
-  if (!win || !hid || !out || !wbuf || !ss || !cnt) {
+  if (!win || !hid || !out || !wbuf || !val || !ss || !cnt) {
     rc = SQLITE_NOMEM;
     goto done;
   }
@@ -380,41 +399,60 @@ static int fcst_run(const MLP *m, const f64 *y, int n, int horizon, f64 *fc,
   }
   f64 mu, sd;
   fcst_infer(m, wbuf, win, hid, out, &mu, &sd);
-  for (int h = 0; h < horizon; h++)
-    fc[h] = (f64)out[h] * sd + mu;
-
-  /* per-horizon sigma: backtest the fixed student over its own history */
-  for (int k = 0; k < H; k++) {
-    ss[k] = 0;
-    cnt[k] = 0;
-  }
-  int stride = H > 1 ? H / 2 : 1;
-  for (int t = L; t + H <= n; t += stride) {
-    f64 bmu, bsd;
-    fcst_infer(m, y + t - L, win, hid, out, &bmu, &bsd);
-    for (int k = 0; k < H; k++) {
-      f64 e = y[t + k] - ((f64)out[k] * bsd + bmu);
-      ss[k] += e * e;
-      cnt[k]++;
+  f64 plo = (1 - conf) / 2, phi = (1 + conf) / 2;
+  for (int h = 0; h < horizon; h++) {
+    for (int qq = 0; qq < Q; qq++) /* de-normalize this step's fan */
+      val[qq] = (f64)out[h * Q + qq] * sd + mu;
+    for (int i = 1; i < Q; i++) /* sort for monotone quantiles */
+      for (int j = i; j > 0 && val[j] < val[j - 1]; j--) {
+        f64 t = val[j];
+        val[j] = val[j - 1];
+        val[j - 1] = t;
+      }
+    fc[h] = quantile_at(fs->levels, val, Q, 0.5);
+    if (Q > 1) {
+      lo[h] = quantile_at(fs->levels, val, Q, plo);
+      hi[h] = quantile_at(fs->levels, val, Q, phi);
     }
   }
-  for (int h = 0; h < horizon; h++)
-    sg[h] = cnt[h] ? sqrt(ss[h] / cnt[h]) : sd; /* fallback: window scale */
+  if (Q == 1) { /* point student: interval from a refit-free backtest */
+    f64 z = predict0_norm_quantile(0.5 + conf / 2);
+    for (int k = 0; k < H; k++) {
+      ss[k] = 0;
+      cnt[k] = 0;
+    }
+    int stride = H > 1 ? H / 2 : 1;
+    for (int t = L; t + H <= n; t += stride) {
+      f64 bmu, bsd;
+      fcst_infer(m, y + t - L, win, hid, out, &bmu, &bsd);
+      for (int k = 0; k < H; k++) {
+        f64 e = y[t + k] - ((f64)out[k] * bsd + bmu);
+        ss[k] += e * e;
+        cnt[k]++;
+      }
+    }
+    for (int h = 0; h < horizon; h++) {
+      f64 sg = cnt[h] ? sqrt(ss[h] / cnt[h]) : sd; /* fallback: window scale */
+      lo[h] = fc[h] - z * sg;
+      hi[h] = fc[h] + z * sg;
+    }
+  }
 done:
   sqlite3_free(win);
   sqlite3_free(hid);
   sqlite3_free(out);
   sqlite3_free(wbuf);
+  sqlite3_free(val);
   sqlite3_free(ss);
   sqlite3_free(cnt);
   return rc;
 }
 
 /* Load a forecast student registered under model_id, if the id names one.
- * Returns 1 and fills *m on hit; 0 if the id is not a registered forecast
+ * Returns 1 and fills *fs on hit; 0 if the id is not a registered forecast
  * student; a negative SQLITE_ code (and *errmsg) on a load error. */
-static int load_fcst_student(sqlite3 *db, const char *model_id, MLP *m,
-                             char **errmsg) {
+static int load_fcst_student(sqlite3 *db, const char *model_id,
+                             ForecastStudent *fs, char **errmsg) {
   static const char FCST_MAGIC8[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
   predict0_model_row row;
   int lr = predict0_registry_lookup(db, model_id, &row);
@@ -426,7 +464,7 @@ static int load_fcst_student(sqlite3 *db, const char *model_id, MLP *m,
     predict0_model_row_free(&row);
     return 0;
   }
-  int rc = fcst_deserialize(row.weights, row.weights_len, m, errmsg);
+  int rc = fcst_deserialize(row.weights, row.weights_len, fs, errmsg);
   predict0_model_row_free(&row);
   return rc == SQLITE_OK ? 1 : -rc;
 }
@@ -1040,7 +1078,7 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   }
 
   predict0_ts_model model = resolve_ts_model(opts.model);
-  MLP fstudent;
+  ForecastStudent fstudent;
   int have_fstudent = 0;
   if (!model) {
     /* not a bundled model: maybe a registered forecast student (PSFCST) */
@@ -1060,8 +1098,8 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       return rc;
     }
     have_fstudent = 1;
-    if (horizon > fstudent.nout) {
-      mlp_free(&fstudent);
+    if (horizon > fstudent.horizon) {
+      fcst_student_free(&fstudent);
       int rc = fc_error(cur, PREDICT_ERR_HORIZON,
                         "horizon exceeds the forecast student's trained horizon",
                         NULL);
@@ -1101,8 +1139,10 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   f64 *fc = sqlite3_malloc(sizeof(f64) * horizon);
   f64 *sg = sqlite3_malloc(sizeof(f64) * horizon);
+  f64 *lo = sqlite3_malloc(sizeof(f64) * horizon);
+  f64 *hi = sqlite3_malloc(sizeof(f64) * horizon);
 
-  for (int i = 0; cur->rows && fc && sg && i < n_series; i++) {
+  for (int i = 0; cur->rows && fc && sg && lo && hi && i < n_series; i++) {
     SeriesBuf *s = &series[i];
     const char *status = NULL;
     if (s->non_numeric)
@@ -1138,10 +1178,15 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     }
 
     if (have_fstudent) {
-      if (fcst_run(&fstudent, y, n, horizon, fc, sg) != SQLITE_OK)
+      if (fcst_run(&fstudent, y, n, horizon, opts.confidence, fc, lo, hi) !=
+          SQLITE_OK)
         rc = SQLITE_NOMEM;
     } else {
       model(y, n, horizon, fc, sg);
+      for (int h = 0; h < horizon; h++) { /* symmetric Gaussian interval */
+        lo[h] = fc[h] - z * sg[h];
+        hi[h] = fc[h] + z * sg[h];
+      }
     }
     for (int h = 1; h <= horizon; h++) {
       ForecastRow *r = &cur->rows[cur->n_rows++];
@@ -1151,8 +1196,8 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       predict0_format_timestamp(ts[n - 1] + step_ms * h, r->ts,
                                 sizeof(r->ts));
       r->forecast = fc[h - 1];
-      r->lower = fc[h - 1] - z * sg[h - 1];
-      r->upper = fc[h - 1] + z * sg[h - 1];
+      r->lower = lo[h - 1];
+      r->upper = hi[h - 1];
       r->status = truncated ? "truncated" : "ok";
       r->has_values = 1;
     }
@@ -1160,8 +1205,10 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   sqlite3_free(fc);
   sqlite3_free(sg);
+  sqlite3_free(lo);
+  sqlite3_free(hi);
   if (have_fstudent)
-    mlp_free(&fstudent); /* done serving; safe for every exit below */
+    fcst_student_free(&fstudent); /* done serving; safe for every exit below */
   for (int i = 0; i < n_series; i++) {
     sqlite3_free(series[i].key);
     sqlite3_free(series[i].ts);

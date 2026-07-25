@@ -125,6 +125,82 @@ def test_distill_forecast_rejects_column_mismatch(db):
                    ).fetchall()
 
 
+QL3 = [0.25, 0.5, 0.75]  # a small quantile fan
+
+
+def _load_qwindows(db, n_windows=300):
+    """context + H*Q columns (horizon-major): each horizon's three teacher
+    quantiles are the wave continuation with a fixed +-2 spread."""
+    ncol = L + H * len(QL3)
+    db.execute(f"CREATE TABLE qw({', '.join(f'c{i} REAL' for i in range(ncol))})")
+    rows = []
+    for k in range(n_windows):
+        win = [_wave(k + i) for i in range(L)]
+        fan = []
+        for j in range(H):
+            b = _wave(k + L + j)
+            fan += [b - 2.0, b, b + 2.0]  # q0.25, q0.5, q0.75
+        rows.append(win + fan)
+    db.executemany(f"INSERT INTO qw VALUES ({','.join('?' * ncol)})", rows)
+    return ncol
+
+
+def _train_q(db, sid="qf"):
+    import json
+    ncol = _load_qwindows(db)
+    opts = {"context": L, "horizon": H, "student_id": sid, "hidden": 32,
+            "epochs": 300, "quantiles": QL3}
+    return db.execute(
+        f"SELECT model_id, train_rows FROM distill_forecast("
+        f"'SELECT {_cols(ncol)} FROM qw', json(?))", (json.dumps(opts),)).fetchone()
+
+
+def _serve(db, sid, conf):
+    return db.execute(
+        "SELECT forecast, lower_bound, upper_bound FROM forecast("
+        "'SELECT ts, value FROM s', ?, json_object('model',?,'confidence_level',"
+        "?,'receipt',0)) ORDER BY step", (H, sid, conf)).fetchall()
+
+
+def test_quantile_student_serves_a_calibrated_fan(db):
+    mid, rows = _train_q(db)
+    assert mid == "qf" and rows == 300
+    _load_series(db)
+    r = _serve(db, "qf", 0.5)  # 50% band = q0.25..q0.75
+    assert len(r) == H
+    fc = []
+    for f, lo, hi in r:
+        assert lo <= f <= hi
+        assert 0.5 < (hi - lo) < 12  # learned ~+-2 spread, band width ~4
+        fc.append(f)
+    truth = [_wave(1000 + 64 + j) for j in range(H)]
+    mf, mt = sum(fc) / H, sum(truth) / H
+    cov = sum((a - mf) * (b - mt) for a, b in zip(fc, truth))
+    va = sum((a - mf) ** 2 for a in fc) ** 0.5
+    vb = sum((b - mt) ** 2 for b in truth) ** 0.5
+    assert cov / (va * vb + 1e-9) > 0.5  # the median tracks the signal
+
+
+def test_quantile_interval_widens_with_confidence(db):
+    _train_q(db)
+    _load_series(db)
+    w50 = [hi - lo for _, lo, hi in _serve(db, "qf", 0.5)]
+    w90 = [hi - lo for _, lo, hi in _serve(db, "qf", 0.9)]  # extrapolated tails
+    assert sum(w90) > sum(w50)  # a wider confidence -> a wider band
+
+
+def test_quantile_bad_levels_rejected(db):
+    import json
+    ncol = L + H * len(QL3)
+    db.execute(f"CREATE TABLE qw({', '.join(f'c{i} REAL' for i in range(ncol))})")
+    db.execute(f"INSERT INTO qw VALUES ({','.join('0' for _ in range(ncol))})")
+    for bad in ([0.5, 1.5], [0.5, 0.5], [0.0, 0.9]):
+        opts = {"context": L, "horizon": H, "student_id": "x", "quantiles": bad}
+        with pytest.raises(sqlite3.OperationalError, match="quantile"):
+            db.execute(f"SELECT * FROM distill_forecast('SELECT {_cols(ncol)} FROM"
+                       f" qw', json(?))", (json.dumps(opts),)).fetchall()
+
+
 def test_forecast_rejects_a_malformed_student_blob(db):
     # the registry is writable by any SQL caller (RFC §6.2): a truncated PSFCST
     # blob (valid magic, nfeat present, nothing after) must be rejected cleanly,

@@ -27,18 +27,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are deterministic, and carry the same exact-replay receipts as the stat
   models. The student blob is bounds-checked on read (caller-writable
   registry).
-- `distill_forecast()` trains a native **forecast student**: a multi-output
-  regression MLP that maps an instance-normalized context window to a horizon of
-  future values, distilled from a teacher's forecasts (a foundation model run
-  offline, or any per-window teacher) over sliding windows. It registers a
-  `PSFCST` inline BLOB (RFC 0005 §4.1.6) that `forecast()` serves natively, with
-  no teacher and no onnxruntime, deterministically and in microseconds. On
-  m4_hourly it reaches ~0.89 MASE versus the Chronos teacher's ~0.79 and the
-  seasonal-naive floor of ~1.0, where a gradient-boosted tree student stalls at
-  ~1.18: the gap trees left was an architecture-capacity gap, not a
-  distillation failure. `context`, `horizon`, `hidden`, `epochs`, and `lr` are
-  options; the prediction interval comes from a refit-free backtest of the
-  student over the series' own history.
+- `distill_forecast()` trains a native **forecast student**: a regression MLP
+  that maps an instance-normalized context window to future values, distilled
+  from a teacher's forecasts (a foundation model run offline, or any per-window
+  teacher) over sliding windows. It registers a `PSFCST` inline BLOB (RFC 0005
+  §4.1.6) that `forecast()` serves natively, with no teacher and no onnxruntime,
+  deterministically and in microseconds. On m4_hourly it reaches ~0.89 MASE
+  versus the Chronos teacher's ~0.79 and the seasonal-naive floor of ~1.0, where
+  a gradient-boosted tree student stalls at ~1.18: the gap trees left was an
+  architecture-capacity gap, not a distillation failure. With a `quantiles`
+  option the student distills the teacher's full quantile fan and `forecast()`
+  reads a **calibrated** interval straight off it (78% coverage of an 80% band
+  on m4_hourly, matching Chronos, and CRPS-competitive); with no `quantiles` it
+  is a point forecaster whose interval comes from a refit-free backtest over the
+  series' own history. `context`, `horizon`, `hidden`, `epochs`, and `lr` are
+  also options. Distilling the well-calibrated teacher fan beat native pinball
+  quantile regression, which under-covers on limited data.
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`
