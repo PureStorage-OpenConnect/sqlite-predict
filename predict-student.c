@@ -444,11 +444,15 @@ void mlp_free(MLP *m) {
   sqlite3_free(m->b1);
   sqlite3_free(m->W2);
   sqlite3_free(m->b2);
+  sqlite3_free(m->Wskip);
   memset(m, 0, sizeof(*m));
 }
 
-/* forward on RAW features x; writes hidden[nhid] and out[nout] logits. */
+/* forward on RAW features x; writes hidden[nhid] and out[nout] logits. With a
+ * linear skip (Wskip, forecast student) the hidden path is scaled down and the
+ * skip term added; nhid=0 makes it a pure linear map. Must match train_mlp. */
 void mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out) {
+  f64 rs = m->Wskip ? FCST_RES_SCALE : 1.0;
   for (int j = 0; j < m->nhid; j++) {
     f64 s = m->b1[j];
     for (int i = 0; i < m->nfeat; i++)
@@ -458,7 +462,10 @@ void mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out) {
   for (int k = 0; k < m->nout; k++) {
     f64 s = m->b2[k];
     for (int j = 0; j < m->nhid; j++)
-      s += (f64)m->W2[k * m->nhid + j] * hid[j];
+      s += rs * (f64)m->W2[k * m->nhid + j] * hid[j];
+    if (m->Wskip)
+      for (int i = 0; i < m->nfeat; i++)
+        s += (f64)m->Wskip[k * m->nfeat + i] * ((x[i] - m->mean[i]) / m->sd[i]);
     out[k] = (f32)s;
   }
 }
@@ -600,9 +607,13 @@ oom:
   return SQLITE_NOMEM;
 }
 
-/* ---- Forecast student (PSFCST01): multi-output regression MLP ---- */
+/* ---- Forecast student (PSFCST): multi-output regression net ---- */
 
-static const char FCST_MAGIC[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
+/* v01: plain MLP (nhid>0, no skip). v02: adds a linear skip Wskip[nout*nfeat]
+ * and allows nhid=0 (pure linear). The writer emits v02; the reader accepts
+ * both, so v01 blobs stay servable (RFC 0005 §4.1.6 back-compat). */
+static const char FCST_MAGIC_V1[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
+static const char FCST_MAGIC[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '2'};
 
 void fcst_student_free(ForecastStudent *fs) {
   sqlite3_free(fs->levels);
@@ -613,16 +624,18 @@ void fcst_student_free(ForecastStudent *fs) {
 
 int fcst_serialize(const ForecastStudent *fs, void **blob_out, int *len_out) {
   const MLP *m = &fs->mlp;
+  int has_skip = m->Wskip != NULL;
   size_t sz = sizeof(FCST_MAGIC) + 4 * 4; /* nfeat, nhid, horizon, nquant */
   sz += 4 * (size_t)fs->nquant;           /* quantile levels */
   sz += 4 * (size_t)m->nfeat * 2;         /* mean, sd */
-  sz += 4 * ((size_t)m->nhid * m->nfeat + m->nhid);
-  sz += 4 * ((size_t)m->nout * m->nhid + m->nout);
+  sz += 4 * ((size_t)m->nhid * m->nfeat + m->nhid); /* W1, b1 (0 if nhid=0) */
+  sz += 4 * ((size_t)m->nout * m->nhid + m->nout);  /* W2 (0 if nhid=0), b2 */
+  sz += 4 * (has_skip ? (size_t)m->nout * m->nfeat : 0); /* Wskip */
   u8 *buf = sqlite3_malloc((int)sz);
   if (!buf)
     return SQLITE_NOMEM;
   u8 *p = buf;
-  memcpy(p, FCST_MAGIC, sizeof(FCST_MAGIC));
+  memcpy(p, FCST_MAGIC, sizeof(FCST_MAGIC)); /* v02 */
   p += sizeof(FCST_MAGIC);
   put_u32(&p, (u32)m->nfeat);
   put_u32(&p, (u32)m->nhid);
@@ -642,6 +655,9 @@ int fcst_serialize(const ForecastStudent *fs, void **blob_out, int *len_out) {
     put_f32(&p, m->W2[i]);
   for (int i = 0; i < m->nout; i++)
     put_f32(&p, m->b2[i]);
+  if (has_skip)
+    for (int i = 0; i < m->nout * m->nfeat; i++)
+      put_f32(&p, m->Wskip[i]);
   *blob_out = buf;
   *len_out = (int)sz;
   return SQLITE_OK;
@@ -653,8 +669,11 @@ int fcst_deserialize(const void *blob, int len, ForecastStudent *fs,
   MLP *m = &fs->mlp;
   m->task = 1; /* regression head; no classes or feature names */
   Reader r = {.p = blob, .end = (const u8 *)blob + len, .err = 0};
-  if (!blob || len < (int)sizeof(FCST_MAGIC) ||
-      memcmp(blob, FCST_MAGIC, sizeof(FCST_MAGIC)) != 0) {
+  int v2 = blob && len >= (int)sizeof(FCST_MAGIC) &&
+           memcmp(blob, FCST_MAGIC, sizeof(FCST_MAGIC)) == 0;
+  int v1 = blob && len >= (int)sizeof(FCST_MAGIC_V1) &&
+           memcmp(blob, FCST_MAGIC_V1, sizeof(FCST_MAGIC_V1)) == 0;
+  if (!v1 && !v2) {
     *errmsg =
         sqlite3_mprintf("%s: not a forecast student blob", PREDICT_ERR_SCHEMA);
     return SQLITE_ERROR;
@@ -664,21 +683,27 @@ int fcst_deserialize(const void *blob, int len, ForecastStudent *fs,
   m->nhid = (int)rd_u32(&r);
   fs->horizon = (int)rd_u32(&r);
   fs->nquant = (int)rd_u32(&r);
-  if (r.err || m->nfeat <= 0 || m->nfeat > FCST_MAX_CONTEXT || m->nhid <= 0 ||
-      m->nhid > 2048 || fs->horizon <= 0 || fs->horizon > 2048 ||
-      fs->nquant <= 0 || fs->nquant > FCST_MAX_QUANT)
+  /* v2 allows nhid=0 (pure linear); v1 always has a hidden layer. */
+  if (r.err || m->nfeat <= 0 || m->nfeat > FCST_MAX_CONTEXT || m->nhid < 0 ||
+      (v1 && m->nhid == 0) || m->nhid > 2048 || fs->horizon <= 0 ||
+      fs->horizon > 2048 || fs->nquant <= 0 || fs->nquant > FCST_MAX_QUANT)
     goto bad;
   m->nout = fs->horizon * fs->nquant;
-  if (m->nout > 8192) /* bound the largest allocation (W2 = nout*nhid) */
+  if (m->nout > 8192) /* bound the largest allocations (W2, Wskip) */
     goto bad;
   fs->levels = sqlite3_malloc(sizeof(f32) * fs->nquant);
   m->mean = sqlite3_malloc(sizeof(f32) * m->nfeat);
   m->sd = sqlite3_malloc(sizeof(f32) * m->nfeat);
-  m->W1 = sqlite3_malloc(sizeof(f32) * (size_t)m->nhid * m->nfeat);
-  m->b1 = sqlite3_malloc(sizeof(f32) * m->nhid);
-  m->W2 = sqlite3_malloc(sizeof(f32) * (size_t)m->nout * m->nhid);
   m->b2 = sqlite3_malloc(sizeof(f32) * m->nout);
-  if (!fs->levels || !m->mean || !m->sd || !m->W1 || !m->b1 || !m->W2 || !m->b2)
+  if (m->nhid > 0) {
+    m->W1 = sqlite3_malloc(sizeof(f32) * (size_t)m->nhid * m->nfeat);
+    m->b1 = sqlite3_malloc(sizeof(f32) * m->nhid);
+    m->W2 = sqlite3_malloc(sizeof(f32) * (size_t)m->nout * m->nhid);
+  }
+  if (v2)
+    m->Wskip = sqlite3_malloc(sizeof(f32) * (size_t)m->nout * m->nfeat);
+  if (!fs->levels || !m->mean || !m->sd || !m->b2 ||
+      (m->nhid > 0 && (!m->W1 || !m->b1 || !m->W2)) || (v2 && !m->Wskip))
     goto oom;
   for (int i = 0; i < fs->nquant; i++)
     fs->levels[i] = rd_f32(&r);
@@ -700,6 +725,9 @@ int fcst_deserialize(const void *blob, int len, ForecastStudent *fs,
     m->W2[i] = rd_f32(&r);
   for (int i = 0; i < m->nout; i++)
     m->b2[i] = rd_f32(&r);
+  if (v2)
+    for (int i = 0; i < m->nout * m->nfeat; i++)
+      m->Wskip[i] = rd_f32(&r);
   if (r.err)
     goto bad;
   return SQLITE_OK;

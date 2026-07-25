@@ -37,6 +37,8 @@ SQLITE_EXTENSION_INIT3
 #define MLP_L2 1e-4
 #define MLP_BETA1 0.9
 #define MLP_BETA2 0.999
+/* FCST_RES_SCALE (the linear-skip hidden-path scale) is in predict-student.h,
+ * shared with the serving forward. */
 
 /* deterministic xorshift32 -> f32 in [-1, 1) */
 static f32 mlp_rng(u32 *s) {
@@ -60,18 +62,21 @@ static void mlp_adam(f32 *p, f64 *g, f64 *mm, f64 *vv, int sz, f64 lr,
   }
 }
 
-/* Train a one-hidden-layer MLP with a configurable width and task.
+/* Train an MLP with a configurable width and task.
  * task 0 (classify): softmax head over `nout` classes; the target is `soft`
  * (a row-major [n, nout] teacher-probability matrix) when non-NULL, else the
  * hard class yc. task 1 (regress): linear head, MSE against the [n, nout]
  * target matrix `soft` (yc unused) -- this is how the multi-output forecast
- * student is fit. Deterministic full-batch Adam; the caller sets any
- * feat_names/labels. */
+ * student is fit. `use_skip` adds a direct linear map Wskip*x to the output (a
+ * DLinear/TiDE skip: the linear part carries seasonal-naive + trend, the hidden
+ * path a scaled nonlinear correction); with nhid=0 the model is purely linear.
+ * Deterministic full-batch Adam; the caller sets any feat_names/labels. */
 static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
                      const f32 *soft, int task, int nhid, int epochs, f32 lr,
-                     MLP *m, char **errmsg) {
+                     int use_skip, MLP *m, char **errmsg) {
   memset(m, 0, sizeof(*m));
-  int nW1 = nhid * nfeat, nW2 = nout * nhid;
+  int nW1 = nhid * nfeat, nW2 = nout * nhid, nWs = use_skip ? nout * nfeat : 0;
+  f64 rs = use_skip ? FCST_RES_SCALE : 1.0; /* hidden-path scale (see #define) */
   m->task = task;
   m->nfeat = nfeat;
   m->nhid = nhid;
@@ -81,30 +86,39 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
   int rc = SQLITE_OK;
   m->mean = sqlite3_malloc(sizeof(f32) * nfeat);
   m->sd = sqlite3_malloc(sizeof(f32) * nfeat);
-  m->W1 = sqlite3_malloc(sizeof(f32) * nW1);
-  m->b1 = sqlite3_malloc(sizeof(f32) * nhid);
-  m->W2 = sqlite3_malloc(sizeof(f32) * nW2);
   m->b2 = sqlite3_malloc(sizeof(f32) * nout);
-  /* moments (m,v) + grads (g) for each parameter block, plus scratch */
-  f64 *mW1 = sqlite3_malloc(sizeof(f64) * nW1),
-      *vW1 = sqlite3_malloc(sizeof(f64) * nW1),
-      *gW1 = sqlite3_malloc(sizeof(f64) * nW1);
-  f64 *mW2 = sqlite3_malloc(sizeof(f64) * nW2),
-      *vW2 = sqlite3_malloc(sizeof(f64) * nW2),
-      *gW2 = sqlite3_malloc(sizeof(f64) * nW2);
-  f64 *mb1 = sqlite3_malloc(sizeof(f64) * nhid),
-      *vb1 = sqlite3_malloc(sizeof(f64) * nhid),
-      *gb1 = sqlite3_malloc(sizeof(f64) * nhid);
+  /* hidden-layer blocks exist only when nhid>0; skip block only when use_skip */
+  if (nhid > 0) {
+    m->W1 = sqlite3_malloc(sizeof(f32) * nW1);
+    m->b1 = sqlite3_malloc(sizeof(f32) * nhid);
+    m->W2 = sqlite3_malloc(sizeof(f32) * nW2);
+  }
+  if (use_skip)
+    m->Wskip = sqlite3_malloc(sizeof(f32) * nWs);
+  f64 *mW1 = nhid ? sqlite3_malloc(sizeof(f64) * nW1) : NULL,
+      *vW1 = nhid ? sqlite3_malloc(sizeof(f64) * nW1) : NULL,
+      *gW1 = nhid ? sqlite3_malloc(sizeof(f64) * nW1) : NULL;
+  f64 *mW2 = nhid ? sqlite3_malloc(sizeof(f64) * nW2) : NULL,
+      *vW2 = nhid ? sqlite3_malloc(sizeof(f64) * nW2) : NULL,
+      *gW2 = nhid ? sqlite3_malloc(sizeof(f64) * nW2) : NULL;
+  f64 *mb1 = nhid ? sqlite3_malloc(sizeof(f64) * nhid) : NULL,
+      *vb1 = nhid ? sqlite3_malloc(sizeof(f64) * nhid) : NULL,
+      *gb1 = nhid ? sqlite3_malloc(sizeof(f64) * nhid) : NULL;
+  f64 *mWs = use_skip ? sqlite3_malloc(sizeof(f64) * nWs) : NULL,
+      *vWs = use_skip ? sqlite3_malloc(sizeof(f64) * nWs) : NULL,
+      *gWs = use_skip ? sqlite3_malloc(sizeof(f64) * nWs) : NULL;
   f64 *mb2 = sqlite3_malloc(sizeof(f64) * nout),
       *vb2 = sqlite3_malloc(sizeof(f64) * nout),
       *gb2 = sqlite3_malloc(sizeof(f64) * nout);
-  f32 *hid = sqlite3_malloc(sizeof(f32) * nhid),
+  f32 *hid = nhid ? sqlite3_malloc(sizeof(f32) * nhid) : NULL,
       *out = sqlite3_malloc(sizeof(f32) * nout),
       *xs = sqlite3_malloc(sizeof(f32) * nfeat);
   f64 *dout = sqlite3_malloc(sizeof(f64) * nout);
-  if (!m->mean || !m->sd || !m->W1 || !m->b1 || !m->W2 || !m->b2 || !mW1 ||
-      !vW1 || !gW1 || !mW2 || !vW2 || !gW2 || !mb1 || !vb1 || !gb1 || !mb2 ||
-      !vb2 || !gb2 || !hid || !out || !xs || !dout) {
+  int hid_ok = nhid == 0 || (m->W1 && m->b1 && m->W2 && mW1 && vW1 && gW1 &&
+                             mW2 && vW2 && gW2 && mb1 && vb1 && gb1 && hid);
+  int skip_ok = !use_skip || (m->Wskip && mWs && vWs && gWs);
+  if (!m->mean || !m->sd || !m->b2 || !mb2 || !vb2 || !gb2 || !out || !xs ||
+      !dout || !hid_ok || !skip_ok) {
     rc = SQLITE_NOMEM;
     *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
     goto done;
@@ -115,6 +129,8 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
     mW2[i] = vW2[i] = gW2[i] = 0;
   for (int i = 0; i < nhid; i++)
     mb1[i] = vb1[i] = gb1[i] = 0;
+  for (int i = 0; i < nWs; i++)
+    mWs[i] = vWs[i] = gWs[i] = 0;
   for (int i = 0; i < nout; i++)
     mb2[i] = vb2[i] = gb2[i] = 0;
 
@@ -135,14 +151,17 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
   }
 
   u32 seed = 0x243f6a88u; /* Xavier-uniform init, deterministic */
-  f32 a1 = (f32)sqrt(6.0 / (nfeat + nhid));
+  f32 a1 = (f32)sqrt(6.0 / (nfeat + (nhid ? nhid : 1)));
   for (int i = 0; i < nW1; i++)
     m->W1[i] = a1 * mlp_rng(&seed);
   for (int j = 0; j < nhid; j++)
     m->b1[j] = 0;
-  f32 a2 = (f32)sqrt(6.0 / (nhid + nout));
+  f32 a2 = (f32)sqrt(6.0 / ((nhid ? nhid : 1) + nout));
   for (int i = 0; i < nW2; i++)
     m->W2[i] = a2 * mlp_rng(&seed);
+  f32 as = (f32)sqrt(6.0 / (nfeat + nout));
+  for (int i = 0; i < nWs; i++)
+    m->Wskip[i] = as * mlp_rng(&seed);
   for (int k = 0; k < nout; k++)
     m->b2[k] = 0;
 
@@ -163,7 +182,10 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
       for (int k = 0; k < nout; k++) {
         f64 s = m->b2[k];
         for (int j = 0; j < nhid; j++)
-          s += (f64)m->W2[k * nhid + j] * hid[j];
+          s += rs * (f64)m->W2[k * nhid + j] * hid[j];
+        if (use_skip)
+          for (int i = 0; i < nfeat; i++)
+            s += (f64)m->Wskip[k * nfeat + i] * xs[i];
         out[k] = (f32)s;
       }
       if (task == 0) { /* softmax cross-entropy: dL/dlogit = softmax - target */
@@ -187,12 +209,15 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
       for (int k = 0; k < nout; k++) {
         gb2[k] += dout[k];
         for (int j = 0; j < nhid; j++)
-          gW2[k * nhid + j] += dout[k] * hid[j];
+          gW2[k * nhid + j] += dout[k] * rs * hid[j];
+        if (use_skip)
+          for (int i = 0; i < nfeat; i++)
+            gWs[k * nfeat + i] += dout[k] * xs[i];
       }
       for (int j = 0; j < nhid; j++) {
         f64 dh = 0;
         for (int k = 0; k < nout; k++)
-          dh += dout[k] * m->W2[k * nhid + j];
+          dh += dout[k] * rs * m->W2[k * nhid + j];
         dh *= 1.0 - (f64)hid[j] * hid[j]; /* tanh' */
         gb1[j] += dh;
         for (int i = 0; i < nfeat; i++)
@@ -200,13 +225,20 @@ static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
       }
     }
     f64 scale = 1.0 / n, bc1 = 1 - b1p, bc2 = 1 - b2p;
-    mlp_adam(m->W1, gW1, mW1, vW1, nW1, lr, scale, bc1, bc2);
-    mlp_adam(m->b1, gb1, mb1, vb1, nhid, lr, scale, bc1, bc2);
-    mlp_adam(m->W2, gW2, mW2, vW2, nW2, lr, scale, bc1, bc2);
+    if (nhid > 0) {
+      mlp_adam(m->W1, gW1, mW1, vW1, nW1, lr, scale, bc1, bc2);
+      mlp_adam(m->b1, gb1, mb1, vb1, nhid, lr, scale, bc1, bc2);
+      mlp_adam(m->W2, gW2, mW2, vW2, nW2, lr, scale, bc1, bc2);
+    }
+    if (use_skip)
+      mlp_adam(m->Wskip, gWs, mWs, vWs, nWs, lr, scale, bc1, bc2);
     mlp_adam(m->b2, gb2, mb2, vb2, nout, lr, scale, bc1, bc2);
   }
 
 done:
+  sqlite3_free(mWs);
+  sqlite3_free(vWs);
+  sqlite3_free(gWs);
   sqlite3_free(mW1);
   sqlite3_free(vW1);
   sqlite3_free(gW1);
@@ -1139,8 +1171,8 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       goto done;
     }
     rc = train_mlp(X, n_fit, nfeat, nclass, y_teach, soft ? soft_P : NULL,
-                   0 /* classify */, MLP_HIDDEN, MLP_EPOCHS, MLP_LR, &mlp,
-                   errmsg);
+                   0 /* classify */, MLP_HIDDEN, MLP_EPOCHS, MLP_LR,
+                   0 /* no skip */, &mlp, errmsg);
     if (rc != SQLITE_OK)
       goto done;
     mlp.feat_names = sqlite3_malloc(sizeof(char *) * nfeat);
@@ -1683,7 +1715,8 @@ static sqlite3_module distillModule = {
  * output regression MLP is fit to reproduce the teacher. The student serves
  * through forecast() with no teacher and no onnxruntime. */
 
-#define FCST_HIDDEN 128 /* forecast student hidden width (benchmark-chosen) */
+#define FCST_HIDDEN 256 /* forecast student residual width (benchmark-chosen:
+                         * 256 is the m4_hourly optimum, 128 and 512 both worse) */
 #define FCST_EPOCHS 1500 /* forecast regression trains longer at a gentler LR */
 #define FCST_LR 0.005f
 
@@ -1717,11 +1750,11 @@ static int fdistill_fit(sqlite3 *db, const f32 *X, const f32 *Y, int n, int L,
     n_hold = 1;
   int n_fit = n - n_hold;
   rc = train_mlp(X, n_fit, L, nout, NULL, Y, 1 /* regress */, nhid, epochs, lr,
-                 &mlp, errmsg);
+                 1 /* linear skip */, &mlp, errmsg);
   if (rc != SQLITE_OK)
     goto done;
   { /* holdout RMSE (normalized space) as the reported metric */
-    f32 *hid = sqlite3_malloc(sizeof(f32) * nhid);
+    f32 *hid = sqlite3_malloc(sizeof(f32) * (nhid > 0 ? nhid : 1));
     f32 *out = sqlite3_malloc(sizeof(f32) * nout);
     if (!hid || !out) {
       sqlite3_free(hid);
@@ -2202,8 +2235,9 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (L > FCST_MAX_CONTEXT)
     FD_FAIL("%s: context %d exceeds the maximum %d", PREDICT_ERR_OPTIONS, L,
             FCST_MAX_CONTEXT);
-  if (nhid <= 0 || nhid > 2048)
-    FD_FAIL("%s: hidden must be in 1..2048", PREDICT_ERR_OPTIONS);
+  if (nhid < 0 || nhid > 2048)
+    FD_FAIL("%s: hidden must be in 0..2048 (0 = pure linear student)",
+            PREDICT_ERR_OPTIONS);
   if (epochs <= 0 || epochs > 100000)
     FD_FAIL("%s: epochs must be in 1..100000", PREDICT_ERR_OPTIONS);
   if (!(lr > 0.0f) || lr > 10.0f)

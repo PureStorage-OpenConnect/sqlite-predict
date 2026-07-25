@@ -205,8 +205,42 @@ the full model, and its student (1.065) tracks it within ~1.5%, closing 74% of
 the naive->teacher gap, a real jump from the single-decode stub's ~1.17. Second,
 the student is the bottleneck, not the teacher: chronos is far the better teacher
 here (0.802 vs 1.049), yet its student (1.032) barely beats TimesFM's (1.065),
-because the native PSFCST student caps out near ~1.03 on hourly regardless of
-teacher. m4_hourly is stationary, exactly the regime where TimesFM's dropped
-refinements matter least and Chronos wins; TimesFM's edge is non-stationary data,
-which this benchmark does not exercise. Reproduce with
-`benchmarks/timesfm_teacher.py` (needs `TIMESFM_ONNX`).
+because at the time the native PSFCST student was a raw-lag MLP that sat near
+~1.03 on hourly regardless of teacher. m4_hourly is stationary, exactly the
+regime where TimesFM's dropped refinements matter least and Chronos wins;
+TimesFM's edge is non-stationary data, which this benchmark does not exercise.
+Reproduce with `benchmarks/timesfm_teacher.py` (needs `TIMESFM_ONNX`).
+
+## The student architecture was the bottleneck (DLinear/TiDE)
+
+The ~1.03 the distilled student sat at was not a distillation ceiling; it was the
+wrong model. A dense MLP over 512 raw lags has no temporal inductive bias, and
+the 2022-2023 forecasting literature (DLinear, "Are Transformers Effective for
+Time Series Forecasting?", TiDE) is blunt that a linear map with the right
+structure beats it. Rebuilding the student as a **linear skip plus a small
+nonlinear residual** (out = Wskip*x + scale * W2*tanh(W1*x)) fixes it. The linear
+skip carries the seasonal-naive + trend structure the MLP kept failing to
+represent; the residual refines. Distilling the onnx Chronos teacher (0.802) on
+m4_hourly (40 target series, in-DB, single model):
+
+| student | MASE | note |
+| --- | --- | --- |
+| old raw-lag MLP | 1.032 | no temporal structure |
+| pure linear (`hidden=0`) | 0.981 | convex, tiny blob |
+| TiDE, hidden 128 | 0.946 | |
+| **TiDE, hidden 256 (default)** | **0.894** | the m4_hourly optimum |
+| TiDE, hidden 512 / 1024 | 0.919 / 0.915 | slightly overfit |
+| AutoTheta (best classical) | 1.034 | |
+| chronos teacher | 0.802 | ceiling |
+
+The default student now closes ~70% of the naive->chronos gap and beats every
+classical method, distilled into a zero-dependency blob served in microseconds.
+Two design notes fell out of controlled sweeps, both counter to intuition: the
+residual **width** helps only *with* the linear skip (256 beats 128 and 512;
+widening the skip-less MLP had only hurt), and every other lever tried made it
+worse or did nothing in-DB. Ensembling gave nothing (8 models 0.939 vs 0.940
+single, because full-batch + weight decay leave little variance to average),
+more training series *diluted* a single global model (40 target series 0.946 ->
+120 mixed 0.993), more epochs overfit, and removing the feature standardization
+or switching to minibatch both hurt. Reproduce the architecture comparison with
+`benchmarks/forecast_student_arch.py` (needs `CHRONOS_ONNX`).

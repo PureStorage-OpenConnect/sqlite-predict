@@ -27,15 +27,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are deterministic, and carry the same exact-replay receipts as the stat
   models. The student blob is bounds-checked on read (caller-writable
   registry).
-- `distill_forecast()` trains a native **forecast student**: a regression MLP
+- `distill_forecast()` trains a native **forecast student**: a regression net
   that maps an instance-normalized context window to future values, distilled
   from a teacher's forecasts (a foundation model run offline, or any per-window
   teacher) over sliding windows. It registers a `PSFCST` inline BLOB (RFC 0005
   §4.1.6) that `forecast()` serves natively, with no teacher and no onnxruntime,
-  deterministically and in microseconds. On m4_hourly it reaches ~0.89 MASE
-  versus the Chronos teacher's ~0.79 and the seasonal-naive floor of ~1.0, where
-  a gradient-boosted tree student stalls at ~1.18: the gap trees left was an
-  architecture-capacity gap, not a distillation failure. With a `quantiles`
+  deterministically and in microseconds. The student is a **DLinear/TiDE-style
+  net**: a direct linear map from the context to the fan (which carries the
+  seasonal-naive + trend structure) plus a small, scaled nonlinear residual. A
+  raw-lag MLP was the wrong inductive bias here; the linear skip is what makes
+  the student competitive on strongly seasonal data. `hidden=0` drops the
+  residual for a pure-linear student (a smaller, convex, fast-converging model);
+  the default keeps the residual (TiDE) at a benchmark-chosen width of 256. On
+  m4_hourly, distilling an onnx Chronos teacher (~0.80 MASE), the TiDE student
+  reaches ~0.89 MASE and pure-linear ~0.98, both beating the best classical
+  method (AutoTheta ~1.03) and the seasonal-naive floor (~1.11), where the old
+  raw-lag MLP stalled at ~1.03. Notably the residual *width* is the lever the
+  raw MLP lacked: with the linear skip stabilizing it, 256 hidden units help
+  (128 and 512 are both worse), whereas widening the skip-less MLP only hurt.
+  (More diverse training series past the ones being forecast dilute a single
+  global student, so distilling on the target series is best.) With a `quantiles`
   option the student distills the teacher's full quantile fan and `forecast()`
   reads a **calibrated** interval straight off it (78% coverage of an 80% band
   on m4_hourly, matching Chronos, and CRPS-competitive); with no `quantiles` it

@@ -99,6 +99,22 @@ int main(int argc, char **argv) {
             " i < 40) INSERT INTO ser SELECT printf('2020-01-01T%02d:00:00', i),"
             " 10.0 + (i%9) FROM n",
         1);
+    run(db, "CREATE TABLE sk(series_key INTEGER, t INTEGER, value REAL)", 1);
+    run(db, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
+            " i < 60) INSERT INTO sk SELECT 0, i, 10.0 + (i%9) FROM n",
+        1);
+    /* distill the two-head teacher into forecast students -- exercises the
+     * skip/nhid=0 training allocations: a TiDE student (hidden default) and a
+     * pure-linear student (hidden=0), point and quantile. */
+    run(db, "SELECT * FROM distill_forecast('SELECT series_key, value FROM sk"
+            " ORDER BY series_key, t', json_object('teacher','th','context',8,"
+            "'horizon',3,'student_id','fs_tide','epochs',60,'receipt',0))",
+        1);
+    run(db, "SELECT * FROM distill_forecast('SELECT series_key, value FROM sk"
+            " ORDER BY series_key, t', json_object('teacher','th','context',8,"
+            "'horizon',3,'hidden',0,'student_id','fs_lin','epochs',60,"
+            "'receipt',0))",
+        1);
   }
 
   run(db, "CREATE TABLE apply(id INTEGER, f1 REAL, f2 REAL)", 1);
@@ -153,6 +169,11 @@ int main(int argc, char **argv) {
               "json_object('model','th','receipt',0))", 1);
       run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
               "json_object('model','badf','receipt',0))", 0);
+      /* serve the distilled skip students (TiDE + pure linear) */
+      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
+              "json_object('model','fs_tide','receipt',0))", 1);
+      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
+              "json_object('model','fs_lin','confidence_level',0.8))", 1);
     }
   }
 

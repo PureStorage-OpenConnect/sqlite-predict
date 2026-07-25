@@ -382,7 +382,7 @@ static int fcst_run(const ForecastStudent *fs, const f64 *y, int n, int horizon,
   const MLP *m = &fs->mlp;
   int L = m->nfeat, H = fs->horizon, Q = fs->nquant, rc = SQLITE_OK;
   f32 *win = sqlite3_malloc(sizeof(f32) * L);
-  f32 *hid = sqlite3_malloc(sizeof(f32) * m->nhid);
+  f32 *hid = sqlite3_malloc(sizeof(f32) * (m->nhid > 0 ? m->nhid : 1));
   f32 *out = sqlite3_malloc(sizeof(f32) * m->nout);
   f64 *wbuf = sqlite3_malloc(sizeof(f64) * L);
   f64 *val = sqlite3_malloc(sizeof(f64) * Q);
@@ -453,13 +453,14 @@ done:
  * student; a negative SQLITE_ code (and *errmsg) on a load error. */
 static int load_fcst_student(sqlite3 *db, const char *model_id,
                              ForecastStudent *fs, char **errmsg) {
-  static const char FCST_MAGIC8[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
+  /* any PSFCST version (the deserializer validates the exact version) */
+  static const char FCST_PREFIX[6] = {'P', 'S', 'F', 'C', 'S', 'T'};
   predict0_model_row row;
   int lr = predict0_registry_lookup(db, model_id, &row);
   if (lr != 0)
     return 0; /* absent or lookup error: treat as not-a-forecast-student */
-  int is_fcst = row.weights && row.weights_len >= (int)sizeof(FCST_MAGIC8) &&
-                memcmp(row.weights, FCST_MAGIC8, sizeof(FCST_MAGIC8)) == 0;
+  int is_fcst = row.weights && row.weights_len >= (int)sizeof(FCST_PREFIX) &&
+                memcmp(row.weights, FCST_PREFIX, sizeof(FCST_PREFIX)) == 0;
   if (!is_fcst) {
     predict0_model_row_free(&row);
     return 0;

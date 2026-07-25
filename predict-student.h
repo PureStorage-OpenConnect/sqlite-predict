@@ -18,6 +18,10 @@
 #define TREE_MAX_FEAT 64 /* apply-time feature cap; bounds a student's nfeat */
 #define FCST_MAX_CONTEXT 4096 /* forecast student: max context length (nfeat) */
 #define FCST_MAX_QUANT 64 /* forecast student: max quantile levels */
+/* Forecast student with a linear skip: the hidden path is a small correction on
+ * the dominant linear map, so its output is scaled by this. Shared by the
+ * trainer (train_mlp) and the serving forward (mlp_forward). */
+#define FCST_RES_SCALE 0.1
 
 /* A decision-tree node (also the weak learner of a gbt forest). */
 typedef struct {
@@ -56,14 +60,20 @@ typedef struct {
   TreeNode *nodes; /* flat pool; tree j uses [tree_off[j], tree_off[j+1]) */
 } Forest;
 
-/* A one-hidden-layer softmax MLP student (PSMLP01). */
+/* A softmax/regression MLP student (PSMLP01 classify, PSFCST forecast).
+ * `Wskip` is an optional direct linear map from the standardized input to the
+ * output (a DLinear/TiDE-style skip): out = Wskip*x + W2*tanh(W1*x). It is used
+ * only by the forecast student, where the linear skip carries seasonal-naive +
+ * trend and the hidden path adds a nonlinear correction; nhid=0 makes it a pure
+ * linear model. NULL for the classification MLP (unchanged). */
 typedef struct {
   int task, nfeat, nhid, nout, nclass;
   char **feat_names; /* [nfeat] */
   char **labels;     /* [nclass] (classification) */
   f32 *mean, *sd;    /* [nfeat] feature standardization */
-  f32 *W1, *b1;      /* [nhid*nfeat], [nhid] */
+  f32 *W1, *b1;      /* [nhid*nfeat], [nhid] (absent when nhid=0) */
   f32 *W2, *b2;      /* [nout*nhid], [nout] */
+  f32 *Wskip;        /* [nout*nfeat] linear skip, or NULL */
 } MLP;
 
 /* Serialize a trained student to its inline blob (caller frees *blob_out with

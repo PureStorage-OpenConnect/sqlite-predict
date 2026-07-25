@@ -92,6 +92,36 @@ def test_forecast_student_serves_and_tracks_the_signal(db):
     assert corr > 0.5  # a clean wave: the student follows the continuation
 
 
+def test_linear_forecast_student_serves_and_tracks(db):
+    """hidden=0 trains a pure-linear student (a DLinear-style map, the linear
+    skip with no hidden path). It registers a smaller blob than the default
+    TiDE student and still follows a clean wave."""
+    assert _train(db, student_id="lin", hidden=0)[0] == "lin"
+    db.execute("DROP TABLE w")  # _train reloads the window table
+    _train(db, student_id="tide")  # default hidden (TiDE) for a size comparison
+    lin_len, tide_len = (db.execute(
+        "SELECT length(weights) FROM _predict_models WHERE model_id=?",
+        (mid,)).fetchone()[0] for mid in ("lin", "tide"))
+    assert lin_len < tide_len  # no hidden layer => smaller blob
+    _load_series(db)
+    rows = db.execute(
+        "SELECT step, forecast, lower_bound, upper_bound, status FROM forecast("
+        "'SELECT ts, value FROM s', ?, json_object('model','lin','receipt',0))"
+        " ORDER BY step", (H,)).fetchall()
+    assert len(rows) == H
+    fc = []
+    for step, f, lo, hi, status in rows:
+        assert status == "ok"
+        assert f == f and lo <= f <= hi
+        fc.append(f)
+    truth = [_wave(1000 + 64 + j) for j in range(H)]
+    mf, mt = sum(fc) / H, sum(truth) / H
+    cov = sum((a - mf) * (b - mt) for a, b in zip(fc, truth))
+    va = sum((a - mf) ** 2 for a in fc)
+    vb = sum((b - mt) ** 2 for b in truth)
+    assert cov / ((va * vb) ** 0.5 + 1e-9) > 0.5
+
+
 def test_forecast_horizon_may_not_exceed_the_student(db):
     _train(db)
     _load_series(db)
