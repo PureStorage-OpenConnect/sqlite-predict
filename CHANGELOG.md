@@ -127,6 +127,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before it will run.
 - Test suite, AddressSanitizer/UBSan and valgrind soak targets, a libFuzzer
   harness, and Windows, WebAssembly, and ONNX CI jobs.
+- Distribution: a single-file **amalgamation** (`make amalgamation` ->
+  `sqlite-predict.c`) you compile in one `cc` invocation with no build system;
+  a **Python package** (`pip install sqlite-predict`, `sqlite_predict.load(conn)`)
+  whose wheels bundle the loadable per platform; a release workflow that ships
+  Linux/macOS/Windows binaries plus the amalgamation with `SHA256SUMS` on a `v*`
+  tag; and `examples/quickstart.sql`. CI regenerates and compiles the
+  amalgamation on every push so it cannot drift.
 
 _This project is pre-alpha; everything above is subject to change before a
 tagged release._
