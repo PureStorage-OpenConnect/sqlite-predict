@@ -41,7 +41,7 @@ read, so an agent can cite the number and an auditor can reproduce it.
 | `detect_anomalies(query [, options])` | Which points are abnormal? | anomaly-scored rows with expected value and probability |
 | `predict(train_query, apply_query [, options])` | Classify/regress unseen rows | a prediction and confidence per row, zero-shot from in-context examples |
 | `distill_predict(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree or gradient-boosted forest), registered and ready for `predict()` |
-| `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native forecast MLP, registered and ready for `forecast()` |
+| `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native DLinear/TiDE forecast net (a linear skip plus a small residual), registered and ready for `forecast()` |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag by re-running the recorded call against its anchored data state |
 
 `query` is any read-only `SELECT`; results are ordinary rows you can join,
@@ -74,6 +74,10 @@ honest statistical models:
 
 - `theta-classic` (the Theta method) and `stub-seasonal-naive` for
   `forecast()` / `detect_anomalies()`
+- `sub-pca` for `detect_anomalies('...', '{"model":"sub-pca"}')`: a
+  subsequence-reconstruction detector (windowed PCA reconstruction error), the
+  method family that leads the TSB-AD-U benchmark; ~2x the residual detector on
+  the typical series there
 - `knn5-incontext` (z-scored 5-NN) for `predict()`
 
 Foundation models are treated as *teachers*, not serving paths: in
