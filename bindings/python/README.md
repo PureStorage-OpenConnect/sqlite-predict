@@ -1,11 +1,12 @@
-# sqlite-predict (Python)
+# everpure-sqlite-predict
 
 Prediction as a SQL primitive for SQLite: `forecast()`, `detect_anomalies()`,
 `predict()`, with replayable receipts. The wheel bundles the zero-dependency
 loadable extension for your platform.
 
 ```python
-import sqlite3, sqlite_predict
+import sqlite3
+from everpure import sqlite_predict
 
 db = sqlite3.connect(":memory:")
 sqlite_predict.load(db)

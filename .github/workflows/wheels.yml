@@ -8,9 +8,13 @@ on:
 # Builds the Python wheels (`pip install sqlite-predict`). Each wheel bundles the
 # zero-dependency loadable compiled for its platform. Staging runs `make
 # python-src` on the host to drop the amalgamation + SQLite ext headers into the
-# package; cibuildwheel then compiles them per platform. Publishing to PyPI is a
-# deliberate step: add a PYPI_API_TOKEN secret and a pypa/gh-action-pypi-publish
-# step, or download the artifacts and upload by hand.
+# package; cibuildwheel then compiles them per platform.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) -- no token in GitHub. ONE-TIME
+# setup on PyPI: create the `everpure-sqlite-predict` project's trusted publisher
+# pointing at this repo, workflow `wheels.yml`, and environment `pypi`
+# (https://docs.pypi.org/trusted-publishers/). The `publish` job only runs on a
+# v* tag; plain pushes / workflow_dispatch just build wheels.
 jobs:
   wheels:
     name: wheels (${{ matrix.os }})
@@ -50,3 +54,20 @@ jobs:
         with:
           name: sdist
           path: wheelhouse/*.tar.gz
+
+  publish:
+    name: publish to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC), no token needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

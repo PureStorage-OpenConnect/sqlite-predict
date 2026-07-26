@@ -19,7 +19,7 @@ class Build(build_py):
             raise SystemExit(
                 "src/sqlite-predict.c is missing; run `make python-src` from the"
                 " repo root to generate the amalgamation into this package")
-        out = os.path.join(HERE, "sqlite_predict", "predict0." + EXT)
+        out = os.path.join(HERE, "everpure", "sqlite_predict", "predict0." + EXT)
         cc = os.environ.get("CC", "cc")
         flags = ["-O2", "-shared"] if sys.platform == "win32" \
             else ["-O3", "-fPIC", "-shared"]

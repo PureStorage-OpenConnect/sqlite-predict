@@ -1,6 +1,7 @@
-"""sqlite-predict: prediction as a SQL primitive.
+"""everpure.sqlite_predict: prediction as a SQL primitive.
 
-    import sqlite3, sqlite_predict
+    import sqlite3
+    from everpure import sqlite_predict
 
     db = sqlite3.connect(":memory:")
     sqlite_predict.load(db)

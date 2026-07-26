@@ -205,11 +205,12 @@ CPU. The default build never links onnxruntime at all.
 **Python** (the fastest way to try it):
 
 ```sh
-pip install sqlite-predict
+pip install everpure-sqlite-predict
 ```
 
 ```python
-import sqlite3, sqlite_predict
+import sqlite3
+from everpure import sqlite_predict
 
 db = sqlite3.connect("app.db")
 sqlite_predict.load(db)

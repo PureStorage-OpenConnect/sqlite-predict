@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sqlite-predict"
+name = "everpure-sqlite-predict"
 version = "0.0.1a1"
 description = "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, predict, with replayable receipts."
 readme = "README.md"
@@ -23,8 +23,9 @@ classifiers = [
 Homepage = "https://github.com/PureStorage-OpenConnect/sqlite-predict"
 Source = "https://github.com/PureStorage-OpenConnect/sqlite-predict"
 
-[tool.setuptools]
-packages = ["sqlite_predict"]
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["everpure*"]
 
 [tool.setuptools.package-data]
-sqlite_predict = ["predict0.*"]
+"everpure.sqlite_predict" = ["predict0.*"]
