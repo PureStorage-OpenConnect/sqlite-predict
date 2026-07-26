@@ -31,3 +31,10 @@ __pycache__/
 .DS_Store
 *.swp
 *.swo
+
+# python package (generated amalgamation + build artifacts)
+bindings/python/src/
+bindings/python/build/
+bindings/python/dist/
+bindings/python/*.egg-info/
+bindings/python/sqlite_predict/predict0.*

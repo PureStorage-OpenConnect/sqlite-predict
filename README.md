@@ -1,24 +1,55 @@
 # sqlite-predict
 
-An extremely small prediction extension for SQLite and libSQL that runs
-anywhere. It gives you zero-shot `forecast()`, `detect_anomalies()`, and
-`predict()` as SQL functions, and **every result carries a replayable
-receipt**.
+[![CI](https://github.com/PureStorage-OpenConnect/sqlite-predict/actions/workflows/ci.yml/badge.svg)](https://github.com/PureStorage-OpenConnect/sqlite-predict/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+![C99](https://img.shields.io/badge/C99-zero%20dependencies-brightgreen.svg)
+
+**Prediction as a SQL primitive.** `forecast()`, `detect_anomalies()`, and
+`predict()` become functions you call over an ordinary `SELECT`. The core is
+one small C99 file with no dependencies, so it runs where your data already
+lives: on the edge, in the browser, on a phone, next to the local-first
+databases AI agents increasingly sit on. And every result carries a **replayable
+receipt**, so an agent can cite the number and an auditor can reproduce it
+byte-for-byte.
 
 ```sql
 .load ./predict0
 
--- forecast a metric 24 steps ahead
+-- forecast a metric 24 steps ahead. rows in, rows out.
 SELECT * FROM forecast('SELECT ts, value FROM readings', 24);
 -- ┌────────────┬──────┬──────────────────────┬──────────┬───────┬───────┬────────┬──────────────┐
 -- │ series_key │ step │  forecast_timestamp  │ forecast │  lo   │  hi   │ status │  receipt_id  │
 -- └────────────┴──────┴──────────────────────┴──────────┴───────┴───────┴────────┴──────────────┘
 ```
 
+None of this ships your data to a cloud model. It runs in-process, on CPU, in
+microseconds, and where a foundation model would be too heavy to call per query,
+you **distill it once into a tiny native student** that carries the same
+receipts and runs anywhere.
+
+## Is it accurate?
+
+Yes, and the numbers are honest and reproducible (`benchmarks/`), not a demo on
+a toy series.
+
+- **Forecasting.** A Chronos foundation model distilled into a zero-dependency
+  DLinear/TiDE student reaches **0.89 MASE on m4_hourly**, closing ~70% of the
+  gap from the seasonal-naive floor (1.11) to the foundation model itself
+  (~0.80), and beating every classical method (Theta 1.03). The student is a few
+  kilobytes and serves in microseconds. ([details](benchmarks/results/forecast.md))
+- **Anomaly detection.** The `sub-pca` detector scores at the **published
+  state-of-the-art level (~0.44 median VUS-PR)** on TSB-AD-U, the reliable
+  univariate benchmark, about 2x a forecast-residual detector on the typical
+  series.
+- **Tabular.** Distilling TabFM into a gradient-boosted student **matches or
+  beats tuned XGBoost** on most [TabArena](benchmarks/results/tabarena-full.md)
+  tasks, at a couple of kilobytes and microseconds per row.
+
+All of it runs on CPU, in-process, with no network and no GPU.
+
 > [!WARNING]
-> **Pre-alpha and unreleased.** The API, the on-disk receipt format, and
-> the SQL surface are all unstable and may change without notice. Not yet
-> recommended for production.
+> **Pre-alpha.** The API, the on-disk receipt format, and the SQL surface are
+> unstable and may change without notice. Not yet recommended for production.
 
 ## Why
 
@@ -88,7 +119,9 @@ the same receipts. `distill_predict()` does this for the tabular side (the
 teacher we benchmark is **TabFM**, see
 [`benchmarks/results/tabarena-full.md`](benchmarks/results/tabarena-full.md)),
 and `distill_forecast()` does it for time series: a **Chronos** teacher
-distilled into a native forecast student recovers most of the FM's edge (see
+distilled into a native **DLinear/TiDE** student (a direct linear map plus a
+small nonlinear residual, the architecture that actually fits seasonal data
+where a plain MLP does not) closes most of the gap to the FM (see
 [`benchmarks/results/forecast.md`](benchmarks/results/forecast.md)).
 
 By default `distill_predict()` trains directly on the target column. That column can
@@ -169,8 +202,22 @@ CPU. The default build never links onnxruntime at all.
 
 ## Installing
 
-Three ways in, in order of least effort. All produce a loadable extension you
-open with `.load`.
+**Python** (the fastest way to try it):
+
+```sh
+pip install sqlite-predict
+```
+
+```python
+import sqlite3, sqlite_predict
+
+db = sqlite3.connect("app.db")
+sqlite_predict.load(db)
+db.execute("SELECT * FROM forecast('SELECT ts, value FROM readings', 24)")
+```
+
+Or drop the extension into any SQLite client directly. Three ways, in order of
+least effort, all producing a loadable you open with `.load`:
 
 **1. Precompiled binary.** Download `predict0-<os>-<arch>.{so,dylib,dll}` for
 your platform from a [release][rel] (checksums in `SHA256SUMS`), then:

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlite-predict"
+version = "0.0.1a1"
+description = "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, predict, with replayable receipts."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["sqlite", "forecasting", "anomaly-detection", "machine-learning", "time-series"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: C",
+  "Programming Language :: Python :: 3",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/PureStorage-OpenConnect/sqlite-predict"
+Source = "https://github.com/PureStorage-OpenConnect/sqlite-predict"
+
+[tool.setuptools]
+packages = ["sqlite_predict"]
+
+[tool.setuptools.package-data]
+sqlite_predict = ["predict0.*"]

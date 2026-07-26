@@ -1,0 +1,52 @@
+name: Wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Builds the Python wheels (`pip install sqlite-predict`). Each wheel bundles the
+# zero-dependency loadable compiled for its platform. Staging runs `make
+# python-src` on the host to drop the amalgamation + SQLite ext headers into the
+# package; cibuildwheel then compiles them per platform. Publishing to PyPI is a
+# deliberate step: add a PYPI_API_TOKEN secret and a pypa/gh-action-pypi-publish
+# step, or download the artifacts and upload by hand.
+jobs:
+  wheels:
+    name: wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage amalgamation into the package
+        run: make python-src
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        with:
+          package-dir: bindings/python
+        env:
+          # skip pypy and musl for the first cut; CPython manylinux + macOS cover
+          # the target audience
+          CIBW_SKIP: "pp* *-musllinux*"
+          CIBW_BUILD_VERBOSITY: "1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage amalgamation into the package
+        run: make python-src
+      - name: Build sdist
+        run: pipx run build --sdist --outdir wheelhouse bindings/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: wheelhouse/*.tar.gz
