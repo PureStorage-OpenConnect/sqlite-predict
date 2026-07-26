@@ -67,13 +67,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Jacobi eigensolver, and scores each window by its reconstruction error in the
   top-variance subspace (the top 30% of components) -- a window off the "normal"
   manifold reconstructs poorly. `anomaly_probability` is the score's percentile
-  rank; there is no forecast/interval. On TSB-AD-U it reaches ~0.5-0.6 VUS-PR,
-  at or above the published SOTA (~0.44) and 2x the default theta-residual
-  detector, all in zero-dependency C with exact-replay receipts. The forecast-
-  residual detectors do NOT close this gap: a stronger forecaster masks anomalies
-  by predicting them (verified against a Chronos one-step baseline on TSB-AD-U,
-  which only tied the theta z-score), so the win comes from the detector family,
-  not a better forecaster.
+  rank; there is no forecast/interval. On a broad 200-series TSB-AD-U sample it
+  scores 0.44 median VUS-PR (at the published SOTA level) versus the theta
+  residual detector's 0.23 -- roughly 2x on the typical series, all in zero-
+  dependency C with exact-replay receipts. Two honest caveats: the *mean* gap is
+  much smaller (0.41 vs 0.38) because sub-pca fails badly on weakly-periodic or
+  very long series where the fixed-window PCA does not fit, so the two are partly
+  complementary; and on a subset filtered to moderate-length periodic series the
+  gap is far larger (0.63 vs 0.25). Either way the forecast-residual detectors do
+  NOT close it: a stronger forecaster masks anomalies by predicting them (verified
+  against a Chronos one-step baseline on TSB-AD-U, which only tied the theta
+  z-score), so the win comes from the detector family, not a better forecaster.
 - Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`,
