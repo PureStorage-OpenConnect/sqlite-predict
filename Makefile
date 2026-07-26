@@ -70,6 +70,18 @@ sqlite-predict.h: sqlite-predict.h.tmpl VERSION
 loadable: $(prefix) vendor/sqlite3ext.h sqlite-predict.h $(OBJS)
 	$(CC) -fPIC -shared -std=c99 -Wall -Wextra -Ivendor/ -I./ -O3 $(CFLAGS) $(OBJS) -o $(TARGET_LOADABLE) $(LDFLAGS)
 
+# single-file amalgamation of the zero-dependency core: one .c you can drop into
+# any project, no build system, no vendored headers (the sqlite-vec model). The
+# onnx path is excluded (it needs onnxruntime). `amalgamation-check` proves the
+# generated file still compiles clean -- CI runs it so it can't drift.
+AMALGAMATION=$(prefix)/sqlite-predict.c
+amalgamation: $(prefix) sqlite-predict.h
+	python3 scripts/amalgamate.py $(AMALGAMATION)
+
+amalgamation-check: amalgamation
+	$(CC) -std=c99 -Wall -Wextra -Ivendor/ -I./ -O2 -c $(AMALGAMATION) -o $(prefix)/amalg.o
+	$(CC) -fPIC -shared -std=c99 -Ivendor/ -I./ -O2 $(AMALGAMATION) -o $(prefix)/predict0-amalg.$(LOADABLE_EXTENSION)
+
 # opt-in ONNX build: same loadable, plus predict-onnx.c linked against
 # onnxruntime. Serves onnx-runtime models (distilled students, exported
 # classifiers) through predict(). The core `loadable` stays zero-dependency.
@@ -188,5 +200,5 @@ clean:
 format:
 	clang-format -i sqlite-predict.c predict-*.c
 
-.PHONY: loadable loadable-onnx loadable-onnx-gpu debug test test-loadable \
-  test-onnx test-asan-onnx clean format
+.PHONY: loadable loadable-onnx loadable-onnx-gpu amalgamation amalgamation-check \
+  debug test test-loadable test-onnx test-asan-onnx clean format

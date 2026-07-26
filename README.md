@@ -169,18 +169,40 @@ CPU. The default build never links onnxruntime at all.
 
 ## Installing
 
-Pre-alpha: build from source (prebuilt binaries will come with releases).
+Three ways in, in order of least effort. All produce a loadable extension you
+open with `.load`.
+
+**1. Precompiled binary.** Download `predict0-<os>-<arch>.{so,dylib,dll}` for
+your platform from a [release][rel] (checksums in `SHA256SUMS`), then:
+
+```sql
+.load ./predict0
+SELECT predict_version();
+```
+
+**2. Single-file amalgamation.** Grab `sqlite-predict.c` from a [release][rel]
+(or `make amalgamation`) and compile the whole zero-dependency core from one
+file, no build system or vendored headers:
+
+```sh
+cc -O3 -fPIC -shared sqlite-predict.c -o predict0.so   # loadable, or
+cc -c -DSQLITE_CORE sqlite-predict.c                   # static, into your app
+```
+
+**3. From source.**
 
 ```sh
 make loadable        # builds dist/predict0.{dylib,so,dll}
 ```
 
-`make` fetches the SQLite amalgamation headers into `vendor/` on first
-build. Requires a C99 compiler. Then, from any SQLite client:
+`make` fetches the SQLite amalgamation headers into `vendor/` on first build;
+it needs a C99 compiler. From any SQLite client:
 
 ```sql
 .load ./dist/predict0
 ```
+
+[rel]: https://github.com/PureStorage-OpenConnect/sqlite-predict/releases
 
 For the ONNX serving path, install onnxruntime (macOS: `brew install
 onnxruntime`; Linux: extract an [onnxruntime release][ort] and point

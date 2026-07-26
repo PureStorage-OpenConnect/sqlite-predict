@@ -8,8 +8,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: build (${{ matrix.os }})
+  binaries:
+    name: binary (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -33,14 +33,54 @@ jobs:
           name: predict0-${{ runner.os }}-${{ runner.arch }}
           path: out/*
 
+  windows:
+    name: binary (windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc make curl unzip
+      - name: Build loadable DLL
+        run: make loadable
+      - name: Stage artifact
+        run: |
+          mkdir -p out
+          cp dist/predict0.dll out/predict0-Windows-X64.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: predict0-Windows-X64
+          path: out/*
+
+  amalgamation:
+    name: amalgamation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # the single-file drop-in build, attached so users can grab one .c file
+      - name: Generate + compile amalgamation
+        run: make amalgamation-check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amalgamation
+          path: dist/sqlite-predict.c
+
   release:
-    needs: build
+    needs: [binaries, windows, amalgamation]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+      - name: Checksums
+        run: (cd artifacts && sha256sum * > SHA256SUMS)
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:

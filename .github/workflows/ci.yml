@@ -30,6 +30,16 @@ jobs:
       - name: Run test suite
         run: make test
 
+  amalgamation:
+    name: amalgamation compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # regenerate the single-file amalgamation from the current sources and
+      # compile it (static + loadable), so it can never drift from the tree.
+      - name: Generate + compile amalgamation
+        run: make amalgamation-check
+
   sanitizers:
     name: ASan + UBSan
     runs-on: ubuntu-latest
