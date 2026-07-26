@@ -40,6 +40,36 @@ jobs:
       - name: Generate + compile amalgamation
         run: make amalgamation-check
 
+  bindings:
+    name: bindings (node + rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust crate: compiles the amalgamation via build.rs, register + forecast
+      - name: Rust crate
+        run: make rust-src && cargo test --manifest-path bindings/rust/Cargo.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # node binding: load the extension and run a forecast through node:sqlite
+      - name: Node binding
+        run: |
+          make loadable
+          cp dist/predict0.so bindings/node/predict0.so
+          node --experimental-sqlite -e '
+            const sp = require("./bindings/node/index.cjs");
+            const { DatabaseSync } = require("node:sqlite");
+            const db = new DatabaseSync(":memory:", { allowExtension: true });
+            sp.load(db);
+            db.exec("CREATE TABLE r(ts TEXT, value REAL)");
+            const ins = db.prepare("INSERT INTO r VALUES (?,?)");
+            for (let i = 0; i < 96; i++)
+              ins.run("2024-01-01T" + String(i % 24).padStart(2, "0") + ":00:00", 50 + 10 * Math.sin(i));
+            const n = db.prepare("SELECT count(*) c FROM forecast(\x27SELECT ts,value FROM r ORDER BY ts\x27, 6)").get().c;
+            if (n !== 6) { console.error("expected 6, got", n); process.exit(1); }
+            console.log("node binding OK");
+          '
+
   sanitizers:
     name: ASan + UBSan
     runs-on: ubuntu-latest

@@ -200,7 +200,7 @@ clean:
 format:
 	clang-format -i sqlite-predict.c predict-*.c
 
-.PHONY: loadable loadable-onnx loadable-onnx-gpu amalgamation amalgamation-check python-src \
+.PHONY: loadable loadable-onnx loadable-onnx-gpu amalgamation amalgamation-check python-src rust-src \
   debug test test-loadable test-onnx test-asan-onnx clean format
 
 # stage the amalgamation + SQLite ext headers into the python package so it can
@@ -209,3 +209,10 @@ python-src: amalgamation vendor/sqlite3ext.h
 	mkdir -p bindings/python/src
 	cp $(AMALGAMATION) bindings/python/src/sqlite-predict.c
 	cp vendor/sqlite3ext.h vendor/sqlite3.h bindings/python/src/
+
+# stage the amalgamation + SQLite ext header into the rust crate (compiled by
+# its build.rs via the cc crate) so `cargo build`/`cargo publish` is self-contained
+rust-src: amalgamation vendor/sqlite3ext.h
+	mkdir -p bindings/rust/csrc
+	cp $(AMALGAMATION) bindings/rust/csrc/sqlite-predict.c
+	cp vendor/sqlite3ext.h vendor/sqlite3.h bindings/rust/csrc/

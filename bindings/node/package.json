@@ -1,0 +1,33 @@
+{
+  "name": "sqlite-predict",
+  "version": "0.0.1-alpha.1",
+  "description": "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, predict, with replayable receipts.",
+  "main": "index.cjs",
+  "types": "index.d.ts",
+  "files": [
+    "index.cjs",
+    "index.d.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "sqlite",
+    "forecasting",
+    "anomaly-detection",
+    "time-series",
+    "machine-learning",
+    "better-sqlite3"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PureStorage-OpenConnect/sqlite-predict.git",
+    "directory": "bindings/node"
+  },
+  "optionalDependencies": {
+    "sqlite-predict-darwin-arm64": "0.0.1-alpha.1",
+    "sqlite-predict-darwin-x64": "0.0.1-alpha.1",
+    "sqlite-predict-linux-x64": "0.0.1-alpha.1",
+    "sqlite-predict-linux-arm64": "0.0.1-alpha.1",
+    "sqlite-predict-windows-x64": "0.0.1-alpha.1"
+  }
+}

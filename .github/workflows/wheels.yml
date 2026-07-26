@@ -11,7 +11,7 @@ on:
 # package; cibuildwheel then compiles them per platform.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC) -- no token in GitHub. ONE-TIME
-# setup on PyPI: create the `everpure-sqlite-predict` project's trusted publisher
+# setup on PyPI: create the `sqlite-predict` project's trusted publisher
 # pointing at this repo, workflow `wheels.yml`, and environment `pypi`
 # (https://docs.pypi.org/trusted-publishers/). The `publish` job only runs on a
 # v* tag; plain pushes / workflow_dispatch just build wheels.

@@ -37,4 +37,13 @@ bindings/python/src/
 bindings/python/build/
 bindings/python/dist/
 bindings/python/*.egg-info/
-bindings/python/everpure/sqlite_predict/predict0.*
+bindings/python/sqlite_predict/predict0.*
+
+# node binding (dev binary + deps)
+bindings/node/predict0.*
+bindings/node/node_modules/
+
+# rust binding (staged C + build)
+bindings/rust/csrc/
+bindings/rust/target/
+bindings/rust/Cargo.lock
