@@ -51,19 +51,19 @@ int main(int argc, char **argv) {
       "'kind','probs','labels',json_array('0','1')))))",
       argv[2]);
   /* bare-path registration exercises the introspection + positional path */
-  char *regauto = sqlite3_mprintf(
-      "SELECT predict_register('auto', %Q)", argv[1]);
-  if (run(db, reg, 1) || run(db, regic, 1) || run(db, regauto, 1)) {
+  char *regbare = sqlite3_mprintf(
+      "SELECT predict_register('bare', %Q)", argv[1]);
+  if (run(db, reg, 1) || run(db, regic, 1) || run(db, regbare, 1)) {
     fprintf(stderr, "register failed\n");
     sqlite3_free(reg);
     sqlite3_free(regic);
-    sqlite3_free(regauto);
+    sqlite3_free(regbare);
     sqlite3_close(db);
     return 1;
   }
   sqlite3_free(reg);
   sqlite3_free(regic);
-  sqlite3_free(regauto);
+  sqlite3_free(regbare);
 
   /* two-head sequence core: exercises the reconstruction path (two runs,
    * flip-invariance, continuous head, crossing repair, instance denorm) and
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
             "json_object('model','clf','receipt',0))", 1);
     /* introspected model + positional features */
     run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','auto','receipt',0))", 1);
+            "json_object('model','bare','receipt',0))", 1);
     /* in_context: success (train context + 1501-row query, multi-batch) */
     run(db, "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
             "'SELECT id, f1, f2 FROM apply',json_object('model','knn1'))", 1);
