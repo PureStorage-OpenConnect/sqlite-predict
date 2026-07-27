@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from setuptools import setup
+from setuptools import Distribution, setup
 from setuptools.command.build_py import build_py
 
 try:  # setuptools >= 70.1 vendors bdist_wheel; older builds use the wheel package
@@ -33,11 +33,20 @@ class Build(build_py):
         super().run()
 
 
+class BinaryDistribution(Distribution):
+    """The package ships a prebuilt loadable. Declaring ext modules makes
+    setuptools install it to platlib (not purelib, which auditwheel rejects)
+    and marks the wheel platform-specific."""
+
+    def has_ext_modules(self):
+        return True
+
+
 class BDistWheel(_bdist_wheel):
-    """The wheel ships a prebuilt loadable, so it is platform-specific but not
-    tied to the CPython ABI. Tag it py3-none-<platform> rather than the default
-    py3-none-any (which would claim the wheel is pure Python and makes
-    cibuildwheel reject it)."""
+    """The loadable is not a CPython extension, so the wheel is platform-specific
+    but ABI-agnostic. Tag it py3-none-<platform> rather than cp3x-cp3x-<platform>
+    (any Python on that platform can load it), and not py3-none-any (which would
+    claim it is pure Python and makes cibuildwheel reject it)."""
 
     def finalize_options(self):
         super().finalize_options()
@@ -48,4 +57,5 @@ class BDistWheel(_bdist_wheel):
         return "py3", "none", plat
 
 
-setup(cmdclass={"build_py": Build, "bdist_wheel": BDistWheel})
+setup(distclass=BinaryDistribution,
+      cmdclass={"build_py": Build, "bdist_wheel": BDistWheel})
