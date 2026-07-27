@@ -32,9 +32,10 @@ jobs:
         with:
           package-dir: bindings/python
         env:
-          # skip pypy and musl for the first cut; CPython manylinux + macOS cover
-          # the target audience
-          CIBW_SKIP: "pp* *-musllinux*"
+          # the loadable is ABI-agnostic, so one CPython build per platform gives
+          # one py3-none-<platform> wheel usable by any Python there. Skip musl.
+          CIBW_BUILD: "cp312-*"
+          CIBW_SKIP: "*-musllinux*"
           CIBW_BUILD_VERBOSITY: "1"
       - uses: actions/upload-artifact@v4
         with:
