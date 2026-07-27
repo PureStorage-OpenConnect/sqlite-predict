@@ -6,11 +6,10 @@
 
 **Prediction as a SQL primitive.** `forecast()`, `detect_anomalies()`, and
 `predict()` become functions you call over an ordinary `SELECT`. The core is
-one small C99 file with no dependencies, so it runs where your data already
-lives: on the edge, in the browser, on a phone, next to the local-first
-databases AI agents increasingly sit on. And every result carries a **replayable
-receipt**, so an agent can cite the number and an auditor can reproduce it
-byte-for-byte.
+one small C99 file with no dependencies, so it runs wherever SQLite already
+does: in your app, on a phone, in the browser, in the per-database state an AI
+agent keeps. And every result carries a **replayable receipt**, so an agent can
+cite the number and an auditor can reproduce it byte-for-byte.
 
 ```sql
 .load ./predict0
@@ -44,6 +43,10 @@ a toy series.
 - **Tabular.** Distilling TabFM into a gradient-boosted student **matches or
   beats tuned XGBoost** on most [TabArena](benchmarks/results/tabarena-full.md)
   tasks, at a couple of kilobytes and microseconds per row.
+- **Calibrated uncertainty.** On smooth data the default Gaussian prediction
+  band is overconfident (measured **0.57 coverage at a nominal 0.90**); the
+  `conformal` option lands at the nominal level, and `backtest()` lets a caller
+  verify coverage on its own data locally.
 
 All of it runs on CPU, in-process, with no network and no GPU.
 
@@ -54,15 +57,21 @@ All of it runs on CPU, in-process, with no network and no GPU.
 ## Why
 
 Prediction is becoming a query primitive. BigQuery has `AI.FORECAST`,
-Databricks has `ai_forecast()`, Snowflake has ML functions. All of them run
-in the cloud, with your data shipped to the model. `sqlite-predict` brings
-the same shape to the database that runs everywhere else: on the edge, in
-the browser, on a phone, and inside the local-first databases that AI
-agents increasingly sit on.
+Databricks has `ai_forecast()`, Snowflake has ML functions. All of them run in
+the cloud, with your data shipped to the model. `sqlite-predict` brings the same
+shape to the database that already runs everywhere else: in apps, on phones, in
+the browser, and in the per-database state AI agents increasingly keep.
 
-The cloud versions stop at the prediction. This one keeps going: every
-result carries a **receipt** that pins down the model and the exact data it
-read, so an agent can cite the number and an auditor can reproduce it.
+That last one is the point. Agents are getting a database each. This is the
+layer that lets an agent forecast its own metrics, flag anomalies in what it
+observes, and predict outcomes, right where its state already sits, and then
+answer for those calls: every result carries a **receipt** that pins the model
+and the exact data it read, so the prediction reproduces byte-for-byte later.
+
+Two things follow from being a SQL primitive instead of a service. It is
+permissively licensed (MIT/Apache-2.0), so you ship it inside your product
+rather than rent it. And it composes with the rest of the in-database AI
+toolbox: sqlite-vec gave SQLite vector search; this gives it prediction.
 
 ## Operations
 
@@ -208,14 +217,14 @@ SELECT * FROM predict(NULL, 'SELECT id, tenure, spend FROM customers',
 ```
 
 Feature columns map by position (apply-query order); pass an explicit
-`io_spec` only to override — real class labels, a named-feature mapping, or a
+`io_spec` only to override: real class labels, a named-feature mapping, or a
 model whose tensors introspection can't disambiguate. It serves two shapes,
 with a cached session and batched inference:
 
-- **vector** — a self-contained model (a distilled student, or any exported
+- **vector**: a self-contained model (a distilled student, or any exported
   tabular classifier/regressor) mapping a feature vector to a prediction.
   A bare weights path is enough.
-- **in_context** — a teacher that ingests the `train_query` rows as context
+- **in_context**: a teacher that ingests the `train_query` rows as context
   on each call and labels the `apply_query` rows against them, the way TabFM
   works. Register it with the weights path plus a `target` (the training
   label column, which introspection can't infer): `predict_register('t',
