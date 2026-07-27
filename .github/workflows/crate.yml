@@ -1,0 +1,37 @@
+name: crate
+
+# Publishes the sqlite-predict crate to crates.io on a v* tag (build.rs compiles
+# the bundled amalgamation on the user's machine, so no prebuilt binaries).
+#
+# NOTE: 0.0.1-alpha.1 is already published; crates.io versions are immutable, so
+# the next release must use a fresh version.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (without leading v)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: v
+        run: |
+          V="${{ github.event.inputs.version }}"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Sync crate version to the tag
+        run: sed -i "s/^version = .*/version = \"${{ steps.v.outputs.version }}\"/" bindings/rust/Cargo.toml
+      - name: Publish
+        run: make rust-src && cargo publish --manifest-path bindings/rust/Cargo.toml --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

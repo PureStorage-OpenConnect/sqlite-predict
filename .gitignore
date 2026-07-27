@@ -1,5 +1,7 @@
 # Build output
 dist/
+# generated per-platform npm packages (built by the npm workflow)
+/npm/
 *.o
 *.a
 *.dylib

@@ -1,0 +1,116 @@
+name: npm
+
+# Publishes the per-platform binary packages (sqlite-predict-<platform>) and the
+# main `sqlite-predict` package, so `npm install sqlite-predict` ships a working
+# loadable. Each platform job builds the extension on a native runner, wraps it
+# in an os/cpu-gated package that exports loadablePath, and publishes it; the
+# main job then pins its optionalDependencies to the same version and publishes.
+#
+# NOTE: 0.0.1-alpha.1 was published as a name-claim (main package only, no
+# binaries). npm versions are immutable, so the first *functional* release must
+# use a fresh version (0.0.1-alpha.2+).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (without leading v)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  platform:
+    name: ${{ matrix.pkg }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: sqlite-predict-darwin-arm64, runner: macos-14,         os: darwin, cpu: arm64, ext: dylib }
+          - { pkg: sqlite-predict-darwin-x64,   runner: macos-13,         os: darwin, cpu: x64,   ext: dylib }
+          - { pkg: sqlite-predict-linux-x64,    runner: ubuntu-latest,    os: linux,  cpu: x64,   ext: so }
+          - { pkg: sqlite-predict-linux-arm64,  runner: ubuntu-24.04-arm, os: linux,  cpu: arm64, ext: so }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.version }}"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Build loadable extension
+        run: make loadable
+      - name: Assemble platform package
+        run: node scripts/npm-pkg.mjs platform ${{ matrix.pkg }} ${{ matrix.os }} ${{ matrix.cpu }} ${{ matrix.ext }} ${{ steps.v.outputs.version }}
+      - name: Publish
+        working-directory: npm/${{ matrix.pkg }}
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  windows:
+    name: sqlite-predict-windows-x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc make curl unzip
+      - name: Build loadable DLL
+        shell: msys2 {0}
+        run: make loadable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.version }}"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Assemble platform package
+        run: node scripts/npm-pkg.mjs platform sqlite-predict-windows-x64 win32 x64 dll ${{ steps.v.outputs.version }}
+      - name: Publish
+        working-directory: npm/sqlite-predict-windows-x64
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  main:
+    name: sqlite-predict (main)
+    needs: [platform, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.version }}"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Sync main package version
+        run: node scripts/npm-pkg.mjs main ${{ steps.v.outputs.version }}
+      - name: Publish main package
+        working-directory: bindings/node
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
