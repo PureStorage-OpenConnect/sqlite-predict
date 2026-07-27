@@ -32,6 +32,9 @@ __pycache__/
 *.swp
 *.swo
 
+# local-only working files (internal strategy, private notes); never published
+/.local/
+
 # python package (generated amalgamation + build artifacts)
 bindings/python/src/
 bindings/python/build/
