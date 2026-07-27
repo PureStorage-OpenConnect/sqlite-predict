@@ -212,6 +212,29 @@ int main(void) {
                     " '{\"gap\":100000,\"receipt\":0}')",
                 1);
 
+    /* tsb + auto candidate sets (statistical models; the student-candidate
+     * path is exercised by the onnx build) */
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"model\":\"tsb\",\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"model\":\"auto\",\"candidates\":[\"tsb\","
+                    "\"theta-classic\"],\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
+                    " 4, '{\"model\":\"auto\",\"candidates\":"
+                    "[\"stub-seasonal-naive\",\"tsb\"],\"gap\":2}')",
+                1);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"candidates\":[\"tsb\"]}')",
+                0);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"model\":\"auto\",\"candidates\":[\"nope\"]}')",
+                0);
+    run_discard(db, "SELECT * FROM detect_anomalies('SELECT ts, value FROM"
+                    " series', '{\"model\":\"tsb\"}')",
+                0);
+
     /* error paths every iteration too — including every collect_series
      * failure branch, for both ops, so valgrind sees the partial-series
      * cleanup under load */

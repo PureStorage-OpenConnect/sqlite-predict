@@ -306,6 +306,82 @@ static void model_theta(const f64 *y, int n, int horizon, f64 *fc,
   sqlite3_free(seas);
 }
 
+/* Teunter-Syntetos-Babai (TSB) for intermittent demand: separate exponential
+ * smoothing of the demand probability and the demand size, forecast = p*z (a
+ * flat rate). Handles the sparse, mostly-zero series (rare events: errors,
+ * retries, uncommon tool calls) that theta and seasonal-naive model poorly.
+ * Non-negative demand is assumed; a value <= 0 counts as no demand. */
+static void model_tsb(const f64 *y, int n, int horizon, f64 *fc, f64 *sigma) {
+  const f64 alpha = 0.1, beta = 0.1; /* size and probability smoothing */
+  f64 sz = 0, sq = 0;
+  int nnz = 0;
+  for (int i = 0; i < n; i++) {
+    sq += y[i] * y[i];
+    if (y[i] > 0) {
+      sz += y[i];
+      nnz++;
+    }
+  }
+  f64 z = nnz ? sz / nnz : 0;   /* mean nonzero demand size */
+  f64 p = n ? (f64)nnz / n : 0; /* demand probability */
+  f64 *rate = sqlite3_malloc(sizeof(f64) * (n > 0 ? n : 1));
+  f64 cur = p * z;
+  for (int t = 0; t < n; t++) {
+    if (y[t] > 0) {
+      z += alpha * (y[t] - z);
+      p += beta * (1.0 - p);
+    } else {
+      p += beta * (0.0 - p);
+    }
+    cur = p * z;
+    if (rate)
+      rate[t] = cur; /* causal forecast made after seeing y[0..t] */
+  }
+  for (int h = 0; h < horizon; h++)
+    fc[h] = cur; /* intermittent forecast is a flat rate */
+
+  if (!sigma) { /* point-only path (backtesting): skip the interval computation */
+    sqlite3_free(rate);
+    return;
+  }
+
+  f64 *ss = sqlite3_malloc(sizeof(f64) * horizon);
+  int *cnt = sqlite3_malloc(sizeof(int) * horizon);
+  if (rate && ss && cnt) {
+    for (int h = 0; h < horizon; h++) {
+      ss[h] = 0;
+      cnt[h] = 0;
+    }
+    f64 fb2 = 0;
+    int fbm = 0;
+    for (int t = 1; t < n; t++) { /* h-step errors from each causal origin */
+      f64 r = rate[t - 1];
+      f64 e0 = y[t] - r;
+      fb2 += e0 * e0;
+      fbm++;
+      for (int h = 1; h <= horizon && t - 1 + h < n; h++) {
+        f64 e = y[t - 1 + h] - r;
+        ss[h - 1] += e * e;
+        cnt[h - 1]++;
+      }
+    }
+    f64 fb = fbm > 0 ? sqrt(fb2 / fbm) : 0;
+    for (int h = 1; h <= horizon; h++)
+      sigma[h - 1] = cnt[h - 1] >= 2 ? sqrt(ss[h - 1] / cnt[h - 1]) : fb;
+  } else { /* OOM fallback: flat sigma from the overall series std */
+    f64 smean = 0;
+    for (int i = 0; i < n; i++)
+      smean += y[i];
+    f64 mean = n ? smean / n : 0;
+    f64 var = n ? sq / n - mean * mean : 0;
+    for (int h = 0; h < horizon; h++)
+      sigma[h] = var > 0 ? sqrt(var) : 0;
+  }
+  sqlite3_free(rate);
+  sqlite3_free(ss);
+  sqlite3_free(cnt);
+}
+
 typedef void (*predict0_ts_model)(const f64 *, int, int, f64 *, f64 *);
 
 typedef struct {
@@ -316,6 +392,7 @@ typedef struct {
 static const ts_model_entry TS_MODELS[] = {
     {"stub-seasonal-naive", model_seasonal_naive},
     {"theta-classic", model_theta},
+    {"tsb", model_tsb},
 };
 
 static predict0_ts_model resolve_ts_model(const char *name) {
@@ -343,6 +420,7 @@ static const char *resolve_ts_model_id(const char *name) {
 #define FORECAST_DEFAULT_FOLDS 20
 #define FORECAST_MAX_FOLDS 512
 #define CONFORMAL_MIN_FOLDS 3
+#define FORECAST_MAX_CANDIDATES 8
 
 /* Mean absolute one-step difference of y[0..n): the in-sample naive-forecast
  * MAE that scales MASE. 0 for a constant (or length < 2) series. */
@@ -625,6 +703,93 @@ static int load_fcst_student(sqlite3 *db, const char *model_id,
   return rc == SQLITE_OK ? 1 : -rc;
 }
 
+/* Point forecast of a student over y[0..n): the median of its emitted fan per
+ * step (no interval). Lets a student be rolling-origin-evaluated as an auto
+ * candidate without the cost of its interval backtest. */
+static int fcst_point(const ForecastStudent *fs, const f64 *y, int n,
+                      int horizon, f64 *fc) {
+  const MLP *m = &fs->mlp;
+  int L = m->nfeat, Q = fs->nquant, rc = SQLITE_OK;
+  f32 *win = sqlite3_malloc(sizeof(f32) * L);
+  f32 *hid = sqlite3_malloc(sizeof(f32) * (m->nhid > 0 ? m->nhid : 1));
+  f32 *out = sqlite3_malloc(sizeof(f32) * m->nout);
+  f64 *wbuf = sqlite3_malloc(sizeof(f64) * L);
+  f64 *val = sqlite3_malloc(sizeof(f64) * Q);
+  if (!win || !hid || !out || !wbuf || !val) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  for (int i = 0; i < L; i++) {
+    int idx = n - L + i;
+    wbuf[i] = idx >= 0 ? y[idx] : y[0];
+  }
+  f64 mu, sd;
+  fcst_infer(m, wbuf, win, hid, out, &mu, &sd);
+  for (int h = 0; h < horizon; h++) {
+    for (int qq = 0; qq < Q; qq++)
+      val[qq] = (f64)out[h * Q + qq] * sd + mu;
+    for (int i = 1; i < Q; i++)
+      for (int j = i; j > 0 && val[j] < val[j - 1]; j--) {
+        f64 t = val[j];
+        val[j] = val[j - 1];
+        val[j - 1] = t;
+      }
+    fc[h] = predict0_quantile_at(fs->levels, val, Q, 0.5);
+  }
+done:
+  sqlite3_free(win);
+  sqlite3_free(hid);
+  sqlite3_free(out);
+  sqlite3_free(wbuf);
+  sqlite3_free(val);
+  return rc;
+}
+
+/* An auto candidate: a bundled statistical model or a loaded forecast student. */
+typedef struct {
+  const char *id;          /* borrowed: static id, or opts.candidates[i] */
+  predict0_ts_model stat;  /* non-NULL for a statistical model */
+  ForecastStudent student; /* valid when is_student */
+  int is_student;
+} Candidate;
+
+/* Point forecast of a candidate on y[0..n) -> fc[horizon]. */
+static int candidate_point(const Candidate *c, const f64 *y, int n, int horizon,
+                           f64 *fc) {
+  if (c->is_student)
+    return fcst_point(&c->student, y, n, horizon, fc);
+  c->stat(y, n, horizon, fc, NULL);
+  return SQLITE_OK;
+}
+
+/* Rolling-origin aggregate MAE of a candidate (the metric auto ranks by; the
+ * MASE scale is constant per series, so MAE ordering == MASE ordering).
+ * fc_scratch is sized >= gap+horizon. Sets *nf to folds used (0 if too short);
+ * returns the MAE, or a negative SQLITE_ code on OOM. */
+static f64 candidate_mae(const Candidate *c, const f64 *y, int n, int horizon,
+                         int gap, int nfolds, f64 *fc_scratch, int *nf) {
+  int H2 = gap + horizon, c_max = n - H2, c_min = FORECAST_MIN_HISTORY;
+  *nf = 0;
+  if (c_max < c_min)
+    return 0;
+  int avail = c_max - c_min + 1;
+  int folds = nfolds < avail ? nfolds : avail;
+  f64 sum = 0;
+  int cnt = 0;
+  for (int f = 0; f < folds; f++) {
+    int cc = c_max - (folds - 1 - f);
+    int rc = candidate_point(c, y, cc, H2, fc_scratch);
+    if (rc != SQLITE_OK)
+      return -rc;
+    for (int h = 0; h < horizon; h++) {
+      sum += fabs(y[cc + gap + h] - fc_scratch[gap + h]);
+      cnt++;
+    }
+  }
+  *nf = folds;
+  return cnt ? sum / cnt : 0;
+}
+
 #pragma endregion
 
 #pragma region options
@@ -641,6 +806,8 @@ typedef struct {
   int interval_conformal; /* interval_method: 0 residual (default), 1 conformal */
   int folds;              /* rolling-origin folds; 0 = FORECAST_DEFAULT_FOLDS */
   int gap;                /* leakage gap between train end and first target */
+  char *candidates[FORECAST_MAX_CANDIDATES]; /* auto pool, when non-empty */
+  int n_candidates;
 } ForecastOpts;
 
 static void forecast_opts_free(ForecastOpts *o) {
@@ -649,6 +816,8 @@ static void forecast_opts_free(ForecastOpts *o) {
   sqlite3_free(o->model);
   for (int i = 0; i < o->n_group_cols; i++)
     sqlite3_free(o->group_cols[i]);
+  for (int i = 0; i < o->n_candidates; i++)
+    sqlite3_free(o->candidates[i]);
 }
 
 static char *dup_text(sqlite3_value *v) {
@@ -784,6 +953,46 @@ static int forecast_opt_cb(void *ctx, const char *key, sqlite3_value *value,
     }
     return 0;
   }
+  if (strcmp(key, "candidates") == 0) {
+    /* JSON array of model ids (or a bare name), the pool auto ranks over */
+    const char *t = (const char *)sqlite3_value_text(value);
+    if (!t)
+      goto wrong_type;
+    for (int c = 0; c < o->n_candidates; c++)
+      sqlite3_free(o->candidates[c]);
+    o->n_candidates = 0;
+    if (t[0] != '[') {
+      if (vtype != SQLITE_TEXT)
+        goto wrong_type;
+      o->candidates[0] = sqlite3_mprintf("%s", t);
+      o->n_candidates = 1;
+      return 0;
+    }
+    const char *pch = t + 1;
+    while (*pch && *pch != ']') {
+      while (*pch == ' ' || *pch == '"' || *pch == ',')
+        pch++;
+      if (*pch == ']' || !*pch)
+        break;
+      const char *end = pch;
+      while (*end && *end != '"' && *end != ',' && *end != ']')
+        end++;
+      if (o->n_candidates >= FORECAST_MAX_CANDIDATES) {
+        *errmsg = sqlite3_mprintf("%s: too many candidates (max %d)",
+                                  PREDICT_ERR_OPTIONS, FORECAST_MAX_CANDIDATES);
+        return 1;
+      }
+      o->candidates[o->n_candidates++] =
+          sqlite3_mprintf("%.*s", (int)(end - pch), pch);
+      pch = end;
+    }
+    if (o->n_candidates == 0) {
+      *errmsg = sqlite3_mprintf("%s: candidates must not be empty",
+                                PREDICT_ERR_OPTIONS);
+      return 1;
+    }
+    return 0;
+  }
 
 wrong_type:
   *errmsg = sqlite3_mprintf("%s: wrong type for option '%s'",
@@ -794,7 +1003,7 @@ wrong_type:
 static const char *const FORECAST_OPTION_KEYS[] = {
     "time_col",      "value_col",       "group_cols", "confidence_level",
     "context_limit", "model",           "receipt",    "interval_method",
-    "folds",         "gap",             NULL};
+    "folds",         "gap",             "candidates", NULL};
 
 static const char *const BACKTEST_OPTION_KEYS[] = {
     "time_col",      "value_col", "group_cols",      "confidence_level",
@@ -806,6 +1015,79 @@ static const char *const BACKTEST_OPTION_KEYS[] = {
 static const char *const ANOMALY_OPTION_KEYS[] = {
     "time_col", "value_col", "group_cols", "anomaly_prob_threshold",
     "context_limit", "model", "receipt", NULL};
+
+/* Resolve opts->candidates into a Candidate array (statistical models +
+ * distilled forecast students). Rejects onnx/unknown ids, a conformal request
+ * over a student candidate, and a student trained for a shorter horizon than
+ * gap+horizon. On SQLITE_OK the caller owns *out and MUST free each loaded
+ * student (fcst_student_free) then the array; on failure everything is freed
+ * here and *errmsg is set. */
+static int resolve_candidates(sqlite3 *db, const ForecastOpts *opts, int horizon,
+                              Candidate **out, int *out_n, char **errmsg) {
+  *out = NULL;
+  *out_n = 0;
+  Candidate *cands = sqlite3_malloc(sizeof(Candidate) * opts->n_candidates);
+  if (!cands)
+    return SQLITE_NOMEM;
+  memset(cands, 0, sizeof(Candidate) * opts->n_candidates);
+  int n = 0, rc = SQLITE_OK;
+  for (int ci = 0; ci < opts->n_candidates; ci++) {
+    const char *id = opts->candidates[ci];
+    predict0_ts_model sm = resolve_ts_model(id);
+    if (sm) {
+      cands[n].id = resolve_ts_model_id(id);
+      cands[n].stat = sm;
+      cands[n].is_student = 0;
+      n++;
+      continue;
+    }
+    char *lerr = NULL;
+    ForecastStudent fs;
+    int lr = load_fcst_student(db, id, &fs, &lerr);
+    sqlite3_free(lerr);
+    if (lr == 1) {
+      if (opts->interval_conformal) {
+        fcst_student_free(&fs);
+        *errmsg = sqlite3_mprintf("%s: interval_method='conformal' is not "
+                                  "supported for a forecast-student candidate: "
+                                  "%s",
+                                  PREDICT_ERR_OPTIONS, id);
+        rc = SQLITE_ERROR;
+        break;
+      }
+      if (opts->gap + horizon > fs.horizon) {
+        fcst_student_free(&fs);
+        *errmsg = sqlite3_mprintf("%s: candidate student was trained for a "
+                                  "shorter horizon: %s",
+                                  PREDICT_ERR_HORIZON, id);
+        rc = SQLITE_ERROR;
+        break;
+      }
+      cands[n].id = id; /* borrowed from opts->candidates */
+      cands[n].student = fs;
+      cands[n].is_student = 1;
+      n++;
+      continue;
+    }
+    /* onnx forecast models are valid but too slow to backtest as candidates;
+     * unknown ids land here too */
+    *errmsg = sqlite3_mprintf("%s: candidate must be a statistical model or a "
+                              "distilled forecast student: %s",
+                              PREDICT_ERR_MODEL_NOT_FOUND, id);
+    rc = SQLITE_ERROR;
+    break;
+  }
+  if (rc != SQLITE_OK) {
+    for (int i = 0; i < n; i++)
+      if (cands[i].is_student)
+        fcst_student_free(&cands[i].student);
+    sqlite3_free(cands);
+    return rc;
+  }
+  *out = cands;
+  *out_n = n;
+  return SQLITE_OK;
+}
 
 #pragma endregion
 
@@ -1350,6 +1632,27 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     return rc;
   }
 
+  /* auto over an explicit candidate set: resolve the statistical models +
+   * distilled forecast students (validated) before collecting the series */
+  Candidate *cands = NULL;
+  int n_cands = 0;
+  if (opts.n_candidates > 0) {
+    if (!is_auto) {
+      int rc = fc_error(cur, PREDICT_ERR_OPTIONS,
+                        "candidates requires model=\"auto\"", NULL);
+      forecast_opts_free(&opts);
+      return rc;
+    }
+    char *cverr = NULL;
+    int crc = resolve_candidates(db, &opts, horizon, &cands, &n_cands, &cverr);
+    if (crc != SQLITE_OK) {
+      sqlite3_free(vtab->base.zErrMsg);
+      vtab->base.zErrMsg = cverr;
+      forecast_opts_free(&opts);
+      return crc;
+    }
+  }
+
   /* prepare + collect the series (shared with detect_anomalies) */
   SeriesBuf *series = NULL;
   int n_series = 0;
@@ -1360,6 +1663,10 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   if (rc != SQLITE_OK) {
     sqlite3_free(vtab->base.zErrMsg);
     vtab->base.zErrMsg = cerr;
+    for (int ci = 0; ci < n_cands; ci++)
+      if (cands[ci].is_student)
+        fcst_student_free(&cands[ci].student);
+    sqlite3_free(cands);
     forecast_opts_free(&opts);
     return rc;
   }
@@ -1384,9 +1691,10 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   f64 *lo = sqlite3_malloc(sizeof(f64) * horizon);
   f64 *hi = sqlite3_malloc(sizeof(f64) * horizon);
 
-  /* rolling-origin scratch, shared by auto-selection and conformal intervals */
+  /* rolling-origin scratch: bt_* for default auto-selection and conformal,
+   * cand_fc for candidate-set selection */
   int folds_req = opts.folds > 0 ? opts.folds : FORECAST_DEFAULT_FOLDS;
-  int need_bt = is_auto || opts.interval_conformal;
+  int need_bt = (is_auto && opts.n_candidates == 0) || opts.interval_conformal;
   f64 *bt_act = NULL, *bt_fcst = NULL, *bt_col = NULL, *bt_q = NULL;
   if (need_bt) {
     bt_act = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
@@ -1396,10 +1704,16 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     if (!bt_act || !bt_fcst || !bt_col || !bt_q)
       rc = SQLITE_NOMEM;
   }
+  f64 *cand_fc = NULL;
+  if (n_cands > 0) {
+    cand_fc = sqlite3_malloc(sizeof(f64) * ((size_t)opts.gap + horizon));
+    if (!cand_fc)
+      rc = SQLITE_NOMEM;
+  }
 
   for (int i = 0; cur->rows && fc && sg && lo && hi &&
                   (!need_bt || (bt_act && bt_fcst && bt_col && bt_q)) &&
-                  i < n_series;
+                  (n_cands == 0 || cand_fc) && i < n_series;
        i++) {
     SeriesBuf *s = &series[i];
     const char *status = NULL;
@@ -1451,7 +1765,40 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 #endif
     } else {
       predict0_ts_model use_model = model;
-      if (is_auto) {
+      const ForecastStudent *win_student = NULL;
+      if (is_auto && n_cands > 0) {
+        /* rank the explicit candidate set (stat models + students) per series */
+        int best = -1;
+        f64 best_mae = 0;
+        for (int ci = 0; ci < n_cands; ci++) {
+          int cnf = 0;
+          f64 mae = candidate_mae(&cands[ci], y, n, horizon, opts.gap,
+                                   folds_req, cand_fc, &cnf);
+          if (mae < 0) {
+            rc = SQLITE_NOMEM;
+            break;
+          }
+          if (cnf == 0)
+            continue; /* candidate could not be backtested on this series */
+          if (best < 0 || mae < best_mae) {
+            best = ci;
+            best_mae = mae;
+          }
+        }
+        if (rc != SQLITE_OK)
+          break;
+        if (best < 0) { /* no candidate had a usable fold */
+          ForecastRow *r = &cur->rows[cur->n_rows++];
+          memset(r, 0, sizeof(*r));
+          r->series_key = sqlite3_mprintf("%s", s->key);
+          r->status = "insufficient_history";
+          continue;
+        }
+        if (cands[best].is_student)
+          win_student = &cands[best].student;
+        else
+          use_model = cands[best].stat;
+      } else if (is_auto) {
         int bi = ts_auto_select(y, ts, n, horizon, opts.gap, folds_req,
                                 naive_scale(y, n), bt_act, bt_fcst);
         if (bi <= -2) { /* negative SQLITE code (OOM) */
@@ -1461,7 +1808,13 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
         /* bi == -1: series too short to backtest -> default to theta */
         use_model = bi >= 0 ? TS_MODELS[bi].run : model_theta;
       }
-      if (opts.interval_conformal) {
+      if (win_student) {
+        if (fcst_run(win_student, y, n, horizon, opts.confidence, fc, lo, hi) !=
+            SQLITE_OK) {
+          rc = SQLITE_NOMEM;
+          break;
+        }
+      } else if (opts.interval_conformal) {
         int nf = ts_conformal_q(use_model, y, ts, n, horizon, opts.gap,
                                 folds_req, opts.confidence, bt_act, bt_fcst,
                                 bt_col, bt_q);
@@ -1512,6 +1865,11 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   sqlite3_free(bt_fcst);
   sqlite3_free(bt_col);
   sqlite3_free(bt_q);
+  sqlite3_free(cand_fc);
+  for (int ci = 0; ci < n_cands; ci++)
+    if (cands[ci].is_student)
+      fcst_student_free(&cands[ci].student);
+  sqlite3_free(cands);
   if (have_fstudent)
     fcst_student_free(&fstudent); /* done serving; safe for every exit below */
 #ifdef SQLITE_PREDICT_ONNX
@@ -1590,11 +1948,22 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                               "%s\"%s\"", g ? "," : "", opts.group_cols[g]);
       snprintf(group_json + gl, sizeof(group_json) - gl, "]");
     }
+    char cand_json[600] = "";
+    if (opts.n_candidates) {
+      usize cl = 0;
+      cl += (usize)snprintf(cand_json + cl, sizeof(cand_json) - cl, "[");
+      for (int g = 0; g < opts.n_candidates && cl < sizeof(cand_json) - 4; g++)
+        cl += (usize)snprintf(cand_json + cl, sizeof(cand_json) - cl,
+                              "%s\"%s\"", g ? "," : "", opts.candidates[g]);
+      snprintf(cand_json + cl, sizeof(cand_json) - cl, "]");
+    }
     sqlite3_stmt *pj = NULL;
     char *params = NULL;
     if (sqlite3_prepare_v2(
             db,
-            "SELECT json_object('confidence_level', ?1, 'context_limit', ?2,"
+            "SELECT json_object("
+            " 'candidates', CASE WHEN ?11 = '' THEN NULL ELSE json(?11) END,"
+            " 'confidence_level', ?1, 'context_limit', ?2,"
             " 'folds', ?3, 'gap', ?4,"
             " 'group_cols', CASE WHEN ?5 = '' THEN NULL ELSE json(?5) END,"
             " 'horizon', ?6, 'interval_method', ?7, 'model', ?8,"
@@ -1619,6 +1988,7 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
         sqlite3_bind_text(pj, 9, resolved_time, -1, SQLITE_STATIC);
       if (resolved_value)
         sqlite3_bind_text(pj, 10, resolved_value, -1, SQLITE_STATIC);
+      sqlite3_bind_text(pj, 11, cand_json, -1, SQLITE_STATIC);
       if (sqlite3_step(pj) == SQLITE_ROW)
         params = sqlite3_mprintf(
             "%s", (const char *)sqlite3_column_text(pj, 0));
@@ -2202,6 +2572,18 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   const char *model_id = use_subpca ? "sub-pca" : resolve_ts_model_id(opts.model);
   if (!model_id) {
     int rc = an_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
+                      opts.model);
+    forecast_opts_free(&opts);
+    return rc;
+  }
+  /* the anomaly scorer implements only the one-step forecasters (theta /
+   * seasonal-naive) and sub-pca; a forecast-only model such as tsb must be
+   * rejected here rather than silently scored with theta */
+  if (!use_subpca && strcmp(model_id, "theta-classic") != 0 &&
+      strcmp(model_id, "stub-seasonal-naive") != 0) {
+    int rc = an_error(cur, PREDICT_ERR_OPTIONS,
+                      "model not supported for detect_anomalies (use "
+                      "theta-classic, stub-seasonal-naive, or sub-pca): ",
                       opts.model);
     forecast_opts_free(&opts);
     return rc;

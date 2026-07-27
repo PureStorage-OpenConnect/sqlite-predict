@@ -22,6 +22,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   caller can score forecasts and validate conformal coverage on-device
   (conformal via leave-fold-out calibration). All three share one rolling-origin
   backtest core, carry exact-replay receipts, and are covered by ASan/UBSan.
+- **Intermittent-demand model + explicit auto candidates.** `tsb`
+  (Teunter-Syntetos-Babai) joins the bundled statistical models and the `auto`
+  pool, for the sparse, mostly-zero series (rare events: errors, retries) that
+  theta and seasonal-naive model poorly; it is forecast-only (rejected by
+  `detect_anomalies`). `'{"model":"auto","candidates":[...]}'` sets the auto
+  pool explicitly, and a candidate may be a distilled forecast student, so an
+  agent's own foundation-model student competes with the cheap baselines per
+  series. Candidates are recorded canonically in the receipt for deterministic
+  replay; `conformal` and an over-long horizon are rejected for a student
+  candidate.
 - `distill_predict()` trains a native student, stored as an inline BLOB and executed
   by the zero-dependency core with no onnxruntime. By default it trains on the
   target column — your labels, or a strong teacher's predictions computed

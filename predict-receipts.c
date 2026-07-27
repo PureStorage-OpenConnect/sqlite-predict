@@ -183,6 +183,8 @@ int predict0_receipts_ensure(sqlite3 *db, char **errmsg) {
   if (rc == SQLITE_OK)
     rc = bundled_model_row(db, "sub-pca", "ts-stat");
   if (rc == SQLITE_OK)
+    rc = bundled_model_row(db, "tsb", "ts-stat");
+  if (rc == SQLITE_OK)
     /* 'auto' is a meta-model: it selects among the ts-stat models per series
      * by rolling-origin MASE. Registered so receipts can reference it. */
     rc = bundled_model_row(db, "auto", "ts-stat");

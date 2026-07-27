@@ -664,6 +664,50 @@ def test_onnx_teacher_distill_forecast(db):
         assert 24.0 < f < 44.0              # near the recent mean (~33.5)
 
 
+def test_auto_candidates_include_a_distilled_student(db):
+    """The headline of `candidates`: a distilled forecast student competes in
+    the auto pool head-to-head with the cheap baselines per series. Also checks
+    the guards: conformal is rejected for a student candidate, and a horizon
+    beyond the student's trained horizon is rejected (loud, not a silent drop)."""
+    _register(db, "fteach", "forecast.onnx", FCAST_IO)
+    db.execute("CREATE TABLE s(series_key INTEGER, t INTEGER, value REAL)")
+    srows = [(sk, t, base + (t % 8))
+             for sk, base in enumerate([10.0, 50.0]) for t in range(60)]
+    db.executemany("INSERT INTO s VALUES (?,?,?)", srows)
+    db.execute("SELECT model_id FROM distill_forecast("
+               "'SELECT series_key, value FROM s ORDER BY series_key, t',"
+               " json_object('teacher','fteach','context',16,'horizon',4,"
+               "'student_id','stud','epochs',300))").fetchone()
+
+    db.execute("CREATE TABLE q(ts TEXT, value REAL)")
+    db.executemany("INSERT INTO q VALUES (?,?)",
+                   [(f"2020-01-01T00:{i:02d}:00", 30.0 + (i % 8)) for i in range(40)])
+    fcq = "SELECT ts, value FROM q"
+
+    # auto over {stat model, distilled student}: full horizon + deterministic replay
+    out = db.execute(
+        "SELECT step, forecast, receipt_id FROM forecast(?, 4,"
+        " json_object('model','auto','candidates',"
+        " json_array('theta-classic','stud'))) ORDER BY step", (fcq,)).fetchall()
+    assert len(out) == 4
+    assert db.execute("SELECT match FROM predict_replay(?)",
+                      (out[0][2],)).fetchone()[0] == 1
+
+    # conformal is rejected for a student candidate
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT * FROM forecast(?, 4, json_object('model','auto',"
+                   "'candidates', json_array('theta-classic','stud'),"
+                   "'interval_method','conformal'))", (fcq,)).fetchall()
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+    # a horizon beyond the student's trained horizon (4) is rejected
+    with pytest.raises(sqlite3.OperationalError) as e2:
+        db.execute("SELECT * FROM forecast(?, 8, json_object('model','auto',"
+                   "'candidates', json_array('theta-classic','stud')))",
+                   (fcq,)).fetchall()
+    assert "PREDICT_ERR_HORIZON" in str(e2.value)
+
+
 def test_distill_forecast_teacher_must_be_onnx(db):
     db.execute("CREATE TABLE s(k INTEGER, v REAL)")
     db.executemany("INSERT INTO s VALUES (?,?)", [(0, float(i)) for i in range(40)])

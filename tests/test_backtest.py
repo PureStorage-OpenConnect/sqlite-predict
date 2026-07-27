@@ -219,3 +219,113 @@ def test_backtest_rejects_unknown_model(db):
     with pytest.raises(sqlite3.OperationalError):
         rows(db, "SELECT * FROM backtest(?, 6, ?)", FC,
              json.dumps({"model": "no-such-model"}))
+
+
+# ---------------------------------------------------------------- tsb (intermittent)
+
+def _intermittent_trailing_zeros(n=200, active=25):
+    """Early varying demand, then a long tail of zeros: seasonal-naive+drift
+    extrapolates a spurious trend, tsb stays at a small non-negative rate."""
+    return [(f"2024-01-01T{i // 24:02d}:{i % 24:02d}:00",
+             float((i * 7 + 3) % 9 + 3) if i < active else 0.0)
+            for i in range(n)]
+
+
+def test_tsb_forecast_is_flat_and_nonnegative(db):
+    syn.load_into(db, _intermittent_trailing_zeros())
+    fcs = [r[0] for r in rows(db, "SELECT forecast FROM forecast(?, 5, ?)",
+                              FC, json.dumps({"model": "tsb"}))]
+    assert len(fcs) == 5
+    assert all(abs(f - fcs[0]) < 1e-12 for f in fcs)   # intermittent = flat rate
+    assert fcs[0] >= 0
+
+
+def test_tsb_rejected_in_detect_anomalies(db):
+    syn.load_into(db, _intermittent_trailing_zeros())
+    with pytest.raises(sqlite3.OperationalError) as e:
+        rows(db, "SELECT * FROM detect_anomalies(?, ?)", FC,
+             json.dumps({"model": "tsb"}))
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
+def test_tsb_wins_intermittent_and_auto_picks_it(db):
+    syn.load_into(db, _intermittent_trailing_zeros())
+    tsb = avg_mase(db, "tsb", horizon=6, folds=15)
+    theta = avg_mase(db, "theta-classic", horizon=6, folds=15)
+    snaive = avg_mase(db, "stub-seasonal-naive", horizon=6, folds=15)
+    auto = avg_mase(db, "auto", horizon=6, folds=15)
+    assert tsb < theta and tsb < snaive          # tsb is genuinely better here
+    assert abs(auto - tsb) < 1e-9                 # auto selects it
+
+
+def test_auto_pool_includes_tsb(db):
+    series, _ = syn.trend_season(n=200, noise=1.5, seed=13)
+    syn.load_into(db, series)
+    best = min(avg_mase(db, m) for m in
+               ("theta-classic", "stub-seasonal-naive", "tsb"))
+    assert abs(avg_mase(db, "auto") - best) < 1e-9
+
+
+# ------------------------------------------------------------- auto candidates
+
+def _fc_auto(db, cands, horizon=4):
+    return [r[0] for r in rows(
+        db, "SELECT forecast FROM forecast(?, ?, ?)", FC, horizon,
+        json.dumps({"model": "auto", "candidates": cands, "receipt": 0}))]
+
+
+def test_candidates_restrict_and_select_pool(db):
+    """The candidate set is the auto pool: restricting it changes the winner,
+    and auto picks the better of a mixed set."""
+    syn.load_into(db, _intermittent_trailing_zeros())
+    tsb_only = _fc_auto(db, ["tsb"])
+    theta_only = _fc_auto(db, ["theta-classic"])
+    both = _fc_auto(db, ["tsb", "theta-classic"])
+    assert all(abs(v) < 0.05 for v in tsb_only)      # tsb rate ~ 0 on the tail
+    assert any(abs(v) > 0.05 for v in theta_only)     # theta is not flat-zero
+    assert both == tsb_only                           # auto picks tsb (the better)
+
+
+def test_candidates_replay(db):
+    syn.load_into(db, _intermittent_trailing_zeros())
+    rid = rows(db, "SELECT receipt_id FROM forecast(?, 6, ?) LIMIT 1", FC,
+               json.dumps({"model": "auto",
+                           "candidates": ["tsb", "theta-classic"]}))[0][0]
+    assert rows(db, "SELECT match FROM predict_replay(?)", rid)[0][0] == 1
+
+
+def test_candidates_recorded_in_receipt(db):
+    syn.load_into(db, _intermittent_trailing_zeros())
+    rid = rows(db, "SELECT receipt_id FROM forecast(?, 6, ?) LIMIT 1", FC,
+               json.dumps({"model": "auto",
+                           "candidates": ["tsb", "theta-classic"]}))[0][0]
+    params = rows(db, "SELECT params FROM _predict_receipts WHERE receipt_id=?",
+                  rid)[0][0]
+    assert json.loads(params)["candidates"] == ["tsb", "theta-classic"]
+
+
+def test_candidates_requires_auto(db):
+    series, _ = syn.trend_season(n=100, seed=1)
+    syn.load_into(db, series)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        rows(db, "SELECT * FROM forecast(?, 6, ?)", FC,
+             json.dumps({"candidates": ["theta-classic"]}))
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
+def test_candidates_reject_unknown(db):
+    series, _ = syn.trend_season(n=100, seed=1)
+    syn.load_into(db, series)
+    with pytest.raises(sqlite3.OperationalError):
+        rows(db, "SELECT * FROM forecast(?, 6, ?)", FC,
+             json.dumps({"model": "auto", "candidates": ["theta-classic", "nope"]}))
+
+
+def test_candidates_conformal_with_stat_models_ok(db):
+    series, _ = syn.trend_season(n=200, noise=1.0, seed=3)
+    syn.load_into(db, series)
+    out = rows(db, "SELECT lower_bound, upper_bound FROM forecast(?, 6, ?)", FC,
+               json.dumps({"model": "auto",
+                           "candidates": ["theta-classic", "stub-seasonal-naive"],
+                           "interval_method": "conformal"}))
+    assert len(out) == 6 and all(lo <= hi for lo, hi in out)

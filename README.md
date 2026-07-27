@@ -85,7 +85,9 @@ deliberately mirrors BigQuery's `AI.FORECAST`: rows in, rows out.
 
 - **Auto-selection.** `'{"model":"auto"}'` picks the model with the lowest
   rolling-origin error per series, so you don't hand-tune the choice. It is
-  deterministic and replayable.
+  deterministic and replayable. `'{"model":"auto","candidates":[...]}'` sets the
+  pool explicitly, and a candidate may be a distilled forecast student, so the
+  agent's own model competes head-to-head with the baselines per series.
 - **Conformal intervals.** `'{"interval_method":"conformal"}'` replaces the
   default Gaussian band with a distribution-free one calibrated on out-of-sample
   residuals. On smooth data the default band is overconfident; conformal lands
@@ -125,9 +127,12 @@ Pass `'{"receipt": 0}'` to skip receipt writing on hot paths.
 The default build is **pure C with no dependencies**. It ships small,
 honest statistical models:
 
-- `theta-classic` (the Theta method) and `stub-seasonal-naive` for
-  `forecast()` / `detect_anomalies()`, or `auto` to pick between them per series
-  by rolling-origin error
+- `theta-classic` (the Theta method) and `stub-seasonal-naive` for `forecast()`
+  and `detect_anomalies()`; `tsb` (Teunter-Syntetos-Babai) for
+  intermittent / sparse-demand `forecast()` (rare events: errors, retries).
+  `auto` picks among them per series by rolling-origin error, and a
+  `candidates` list sets the pool explicitly, a distilled forecast student
+  included
 - `sub-pca` for `detect_anomalies('...', '{"model":"sub-pca"}')`: a
   subsequence-reconstruction detector (windowed PCA reconstruction error), the
   method family that leads the TSB-AD-U benchmark; ~2x the residual detector on
