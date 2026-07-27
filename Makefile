@@ -201,7 +201,7 @@ format:
 	clang-format -i sqlite-predict.c predict-*.c
 
 .PHONY: loadable loadable-onnx loadable-onnx-gpu amalgamation amalgamation-check python-src rust-src \
-  debug test test-loadable test-onnx test-asan-onnx clean format
+  sync-version debug test test-loadable test-onnx test-asan-onnx clean format
 
 # stage the amalgamation + SQLite ext headers into the python package so it can
 # build a self-contained wheel (used by dev installs and the wheels workflow)
@@ -216,3 +216,8 @@ rust-src: amalgamation vendor/sqlite3ext.h
 	mkdir -p bindings/rust/csrc
 	cp $(AMALGAMATION) bindings/rust/csrc/sqlite-predict.c
 	cp vendor/sqlite3ext.h vendor/sqlite3.h bindings/rust/csrc/
+
+# sync every package manifest (Cargo.toml, package.json, pyproject.toml) to the
+# VERSION file; `make sync-version V=0.0.1-alpha.2` sets VERSION first, then syncs
+sync-version:
+	node scripts/sync-version.mjs $(V)
