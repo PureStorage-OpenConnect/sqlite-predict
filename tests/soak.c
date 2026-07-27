@@ -175,6 +175,43 @@ int main(void) {
                     " '{\"student_id\":\"nope\"}')",
                 0);
 
+    /* Phase-1: auto selection, conformal intervals, backtest() (with and
+     * without receipts, grouped, gapped) — exercises the rolling-origin
+     * backtest scratch allocations and the backtest receipt path */
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"model\":\"auto\",\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"interval_method\":\"conformal\",\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
+                    " 4, '{\"model\":\"auto\",\"interval_method\":\"conformal\","
+                    "\"group_cols\":[\"grp\"],\"folds\":8,\"gap\":2}')",
+                1);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+                    " '{\"folds\":10,\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+                    " '{\"model\":\"auto\",\"interval_method\":\"conformal\","
+                    "\"folds\":12}')",
+                1);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
+                    " 5, '{\"group_cols\":[\"grp\"],\"gap\":3,\"receipt\":0}')",
+                1);
+    /* new option error + edge paths */
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"interval_method\":\"bogus\"}')",
+                0);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+                    " '{\"folds\":0}')",
+                0);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+                    " '{\"model\":\"nope\"}')",
+                0);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+                    " '{\"gap\":100000,\"receipt\":0}')",
+                1);
+
     /* error paths every iteration too — including every collect_series
      * failure branch, for both ops, so valgrind sees the partial-series
      * cleanup under load */

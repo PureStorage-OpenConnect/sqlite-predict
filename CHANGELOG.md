@@ -8,8 +8,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `forecast()`, `detect_anomalies()`, `predict()`, and `distill_predict()`
-  table-valued functions with a trailing JSON options argument.
+- `forecast()`, `detect_anomalies()`, `predict()`, `distill_predict()`, and
+  `backtest()` table-valued functions with a trailing JSON options argument.
+- **Auto model selection, conformal intervals, and `backtest()`.**
+  `forecast('...', h, '{"model":"auto"}')` selects the statistical model with the
+  lowest rolling-origin MASE per series (deterministic and replayable).
+  `'{"interval_method":"conformal"}'` swaps the default Gaussian prediction band
+  for a distribution-free one calibrated on out-of-sample residuals: on smooth
+  series the in-sample band is overconfident (measured 0.57 empirical coverage at
+  a nominal 0.90), while conformal lands at the nominal level. `backtest(query,
+  horizon, options)` reports per-fold MAE/RMSE/MASE/sMAPE and interval coverage
+  from a rolling-origin evaluation, with `folds` and a `gap` leakage guard, so a
+  caller can score forecasts and validate conformal coverage on-device
+  (conformal via leave-fold-out calibration). All three share one rolling-origin
+  backtest core, carry exact-replay receipts, and are covered by ASan/UBSan.
 - `distill_predict()` trains a native student, stored as an inline BLOB and executed
   by the zero-dependency core with no onnxruntime. By default it trains on the
   target column — your labels, or a strong teacher's predictions computed

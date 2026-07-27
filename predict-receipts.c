@@ -119,7 +119,7 @@ static const char *DDL =
     "CREATE TABLE IF NOT EXISTS _predict_receipts (\n"
     "  receipt_id  TEXT PRIMARY KEY,\n"
     "  operation   TEXT NOT NULL CHECK (operation IN\n"
-    "    ('forecast','detect_anomalies','predict','distill')),\n"
+    "    ('forecast','detect_anomalies','predict','distill','backtest')),\n"
     "  model_id    TEXT NOT NULL,\n"
     "  model_hash  TEXT NOT NULL,\n"
     "  anchor_kind TEXT NOT NULL CHECK (anchor_kind IN\n"
@@ -182,6 +182,10 @@ int predict0_receipts_ensure(sqlite3 *db, char **errmsg) {
     rc = bundled_model_row(db, "stub-seasonal-naive", "ts-stat");
   if (rc == SQLITE_OK)
     rc = bundled_model_row(db, "sub-pca", "ts-stat");
+  if (rc == SQLITE_OK)
+    /* 'auto' is a meta-model: it selects among the ts-stat models per series
+     * by rolling-origin MASE. Registered so receipts can reference it. */
+    rc = bundled_model_row(db, "auto", "ts-stat");
   if (rc == SQLITE_OK)
     rc = bundled_model_row(db, "knn5-incontext", "tabular-stat");
   if (rc != SQLITE_OK)
@@ -634,7 +638,8 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   int is_forecast = strcmp(operation, "forecast") == 0;
   int is_anomalies = strcmp(operation, "detect_anomalies") == 0;
   int is_predict = strcmp(operation, "predict") == 0;
-  if (!is_forecast && !is_anomalies && !is_predict) {
+  int is_backtest = strcmp(operation, "backtest") == 0;
+  if (!is_forecast && !is_anomalies && !is_predict && !is_backtest) {
     int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
                      "replay not implemented for this operation yet");
     RP_CLEANUP();
@@ -762,6 +767,55 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     cur->detail =
         cur->match ? sqlite3_mprintf("reproduced (%d rows)", n3)
                    : sqlite3_mprintf("result hash diverged over %d rows", n3);
+    RP_CLEANUP();
+    return SQLITE_OK;
+  }
+
+  /* backtest replay: re-run ordered by (series_key, fold) and hash the result
+   * columns directly (each series is all-metrics or one status row, so the
+   * ordering never mixes the two types within a key). */
+  if (is_backtest) {
+    sqlite3_stmt *run4 = NULL;
+    rc = sqlite3_prepare_v2(
+        db,
+        "SELECT series_key, fold, cutoff_timestamp, model, n, mae, rmse, mase,"
+        " smape, coverage, mean_interval_width FROM backtest(?1,"
+        " CAST(json_extract(?2, '$.horizon') AS INTEGER),"
+        " json_set(json_remove(?2, '$.horizon'), '$.receipt', 0))"
+        " ORDER BY series_key, fold",
+        -1, &run4, NULL);
+    if (rc != SQLITE_OK) {
+      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH,
+                       "could not re-prepare backtest");
+      RP_CLEANUP();
+      return r;
+    }
+    sqlite3_bind_text(run4, 1, input_sql, -1, SQLITE_STATIC);
+    sqlite3_bind_text(run4, 2, params, -1, SQLITE_STATIC);
+    predict0_hasher h4;
+    predict0_hash_init(&h4);
+    int n4 = 0;
+    while ((rc = sqlite3_step(run4)) == SQLITE_ROW) {
+      for (int i = 0; i < 11; i++)
+        hash_column_value(&h4, run4, i);
+      predict0_hash_row_end(&h4);
+      n4++;
+    }
+    int done = rc == SQLITE_DONE;
+    sqlite3_finalize(run4);
+    if (!done) {
+      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH, sqlite3_errmsg(db));
+      RP_CLEANUP();
+      return r;
+    }
+    predict0_hash_hex(&h4, cur->hash);
+    cur->match = strcmp(cur->hash, orig_hash) == 0;
+    sqlite3_free(cur->orig);
+    cur->orig = sqlite3_mprintf("%s", orig_hash);
+    sqlite3_free(cur->detail);
+    cur->detail = cur->match
+                      ? sqlite3_mprintf("reproduced (%d rows)", n4)
+                      : sqlite3_mprintf("result hash diverged over %d rows", n4);
     RP_CLEANUP();
     return SQLITE_OK;
   }

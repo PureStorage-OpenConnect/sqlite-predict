@@ -538,6 +538,23 @@ def test_onnx_forecast_sequence(db):
             assert abs(hi - case["upper"]) < 1e-3
 
 
+def test_conformal_interval_rejected_for_onnx_forecast_model(db):
+    """interval_method='conformal' is only for the statistical models. A
+    registered onnx forecast model already emits its own quantile-fan band, so
+    asking for conformal on it must fail loudly, not silently ignore the flag."""
+    _register(db, "fcast", "forecast.onnx", FCAST_IO)
+    db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+    db.executemany(
+        "INSERT INTO s VALUES (?,?)",
+        [(f"2020-01-01T{i // 24:02d}:{i % 24:02d}:00", 10.0 + i) for i in range(40)])
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT * FROM forecast('SELECT ts, value FROM s', 6,"
+            " json_object('model', 'fcast', 'interval_method', 'conformal'))"
+        ).fetchall()
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
 THEAD_IO = {"layout": "sequence", "input": "context",
             "outputs": {"point": "point_fan", "quantile": "quant_fan"},
             "quantiles": [0.1, 0.3, 0.5, 0.7, 0.9], "patch": 8,

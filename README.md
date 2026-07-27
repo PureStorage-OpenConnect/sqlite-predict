@@ -73,12 +73,34 @@ read, so an agent can cite the number and an auditor can reproduce it.
 | `predict(train_query, apply_query [, options])` | Classify/regress unseen rows | a prediction and confidence per row, zero-shot from in-context examples |
 | `distill_predict(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree or gradient-boosted forest), registered and ready for `predict()` |
 | `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native DLinear/TiDE forecast net (a linear skip plus a small residual), registered and ready for `forecast()` |
+| `backtest(query, horizon [, options])` | How accurate is the model here? | per-fold accuracy (MAE, RMSE, MASE, sMAPE) and interval coverage from a rolling-origin evaluation |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag by re-running the recorded call against its anchored data state |
 
 `query` is any read-only `SELECT`; results are ordinary rows you can join,
 filter, and materialize. Options are a trailing JSON object
 (`'{"group_cols":["region"],"confidence_level":0.9}'`). The interface
 deliberately mirrors BigQuery's `AI.FORECAST`: rows in, rows out.
+
+### Calibrated intervals, auto-selection, and backtesting
+
+- **Auto-selection.** `'{"model":"auto"}'` picks the model with the lowest
+  rolling-origin error per series, so you don't hand-tune the choice. It is
+  deterministic and replayable.
+- **Conformal intervals.** `'{"interval_method":"conformal"}'` replaces the
+  default Gaussian band with a distribution-free one calibrated on out-of-sample
+  residuals. On smooth data the default band is overconfident; conformal lands
+  at the nominal coverage. (Statistical models only; foundation-model students
+  already emit their own quantile band.)
+- **`backtest()`.** Rolling-origin evaluation with per-fold MAE/RMSE/MASE/sMAPE
+  and interval coverage, so a caller can score its own forecasts and validate
+  conformal coverage locally. `folds` sets the number of origins; `gap` inserts
+  a leakage guard between train and test.
+
+```sql
+-- confirm the conformal band actually covers at the nominal 90%
+SELECT avg(coverage) FROM backtest('SELECT ts, value FROM readings', 6,
+  '{"interval_method":"conformal","confidence_level":0.9,"folds":25}');
+```
 
 ### Receipts and replay
 
@@ -104,7 +126,8 @@ The default build is **pure C with no dependencies**. It ships small,
 honest statistical models:
 
 - `theta-classic` (the Theta method) and `stub-seasonal-naive` for
-  `forecast()` / `detect_anomalies()`
+  `forecast()` / `detect_anomalies()`, or `auto` to pick between them per series
+  by rolling-origin error
 - `sub-pca` for `detect_anomalies('...', '{"model":"sub-pca"}')`: a
   subsequence-reconstruction detector (windowed PCA reconstruction error), the
   method family that leads the TSB-AD-U benchmark; ~2x the residual detector on

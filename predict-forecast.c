@@ -113,6 +113,9 @@ static void model_seasonal_naive(const f64 *y, int n, int horizon, f64 *fc,
     fc[h - 1] = base + drift * (f64)gap;
   }
 
+  if (!sigma)
+    return; /* point-only path (backtesting): skip the interval computation */
+
   /* Per-horizon sigma from an in-sample backtest of this exact forecast:
    * for each past origin, forecast h steps ahead and record the error, then
    * take the RMS per h. This calibrates the interval to the model's real
@@ -255,6 +258,12 @@ static void model_theta(const f64 *y, int n, int horizon, f64 *fc,
     fc[h - 1] = theta_fc;
   }
 
+  if (!sigma) { /* point-only path (backtesting): skip the interval computation */
+    sqlite3_free(yd);
+    sqlite3_free(seas);
+    return;
+  }
+
   /* Per-horizon sigma from the fitted model's in-sample h-step errors: roll
    * the theta forecast forward from every past origin using that origin's SES
    * level, and take the RMS error per h. Empirically calibrated per horizon,
@@ -327,6 +336,152 @@ static const char *resolve_ts_model_id(const char *name) {
       return TS_MODELS[i].id;
   }
   return NULL;
+}
+
+/* ---- shared rolling-origin backtest (auto-selection, conformal, backtest()) ---- */
+
+#define FORECAST_DEFAULT_FOLDS 20
+#define FORECAST_MAX_FOLDS 512
+#define CONFORMAL_MIN_FOLDS 3
+
+/* Mean absolute one-step difference of y[0..n): the in-sample naive-forecast
+ * MAE that scales MASE. 0 for a constant (or length < 2) series. */
+static f64 naive_scale(const f64 *y, int n) {
+  f64 s = 0;
+  int m = 0;
+  for (int i = 1; i < n; i++) {
+    s += fabs(y[i] - y[i - 1]);
+    m++;
+  }
+  return m > 0 ? s / m : 0;
+}
+
+static f64 metric_mae(const f64 *a, const f64 *f, int m) {
+  f64 s = 0;
+  for (int i = 0; i < m; i++)
+    s += fabs(a[i] - f[i]);
+  return m > 0 ? s / m : 0;
+}
+
+static f64 metric_rmse(const f64 *a, const f64 *f, int m) {
+  f64 s = 0;
+  for (int i = 0; i < m; i++) {
+    f64 e = a[i] - f[i];
+    s += e * e;
+  }
+  return m > 0 ? sqrt(s / m) : 0;
+}
+
+/* Symmetric MAPE in [0,2]. A pair with |a|+|f| == 0 is a perfect 0-vs-0 hit:
+ * it contributes 0 and is still counted, so two identical zero series score 0. */
+static f64 metric_smape(const f64 *a, const f64 *f, int m) {
+  f64 s = 0;
+  for (int i = 0; i < m; i++) {
+    f64 d = fabs(a[i]) + fabs(f[i]);
+    if (d > 0)
+      s += 2.0 * fabs(a[i] - f[i]) / d;
+  }
+  return m > 0 ? s / m : 0;
+}
+
+/* Rolling-origin backtest of a point model over series y[0..n) with timestamps
+ * ts. For each of up to `nfolds` contiguous origins ending at the latest usable
+ * cutoff, fit `model` on the prefix and forecast gap+horizon steps, keeping the
+ * last `horizon` (so `gap` points sit between train end and the first scored
+ * target: a leakage guard). Fills act/fcst[folds*horizon] row-major by fold;
+ * when sig != NULL, the model's per-horizon sigma too; when cutoff_ms != NULL,
+ * each origin's last-training timestamp. Returns the number of folds evaluated
+ * (0 if history is too short), or a negative SQLITE_ code on OOM. */
+static int ts_backtest(predict0_ts_model model, const f64 *y, const i64 *ts,
+                       int n, int horizon, int gap, int nfolds, f64 *act,
+                       f64 *fcst, f64 *sig, i64 *cutoff_ms) {
+  int H2 = gap + horizon;
+  int c_max = n - H2;               /* latest cutoff with H2 held-out actuals */
+  int c_min = FORECAST_MIN_HISTORY; /* minimum training length */
+  if (c_max < c_min)
+    return 0;
+  int avail = c_max - c_min + 1;
+  int folds = nfolds < avail ? nfolds : avail;
+  f64 *fb = sqlite3_malloc(sizeof(f64) * H2);
+  f64 *sb = sig ? sqlite3_malloc(sizeof(f64) * H2) : NULL;
+  if (!fb || (sig && !sb)) {
+    sqlite3_free(fb);
+    sqlite3_free(sb);
+    return -SQLITE_NOMEM;
+  }
+  for (int f = 0; f < folds; f++) {
+    int c = c_max - (folds - 1 - f); /* ascending cutoffs; last fold = c_max */
+    model(y, c, H2, fb, sb);
+    for (int h = 0; h < horizon; h++) {
+      int step = gap + h;
+      act[f * horizon + h] = y[c + step];
+      fcst[f * horizon + h] = fb[step];
+      if (sig)
+        sig[f * horizon + h] = sb[step];
+    }
+    if (cutoff_ms)
+      cutoff_ms[f] = ts[c - 1];
+  }
+  sqlite3_free(fb);
+  sqlite3_free(sb);
+  return folds;
+}
+
+/* Pick the TS_MODELS index that minimizes rolling-origin MASE on this series.
+ * scale is naive_scale(y,n); act/fcst are scratch [nfolds*horizon]. Returns the
+ * index, -1 if no fold was usable, or a negative SQLITE_ code on OOM. */
+static int ts_auto_select(const f64 *y, const i64 *ts, int n, int horizon,
+                          int gap, int nfolds, f64 scale, f64 *act, f64 *fcst) {
+  int best = -1;
+  f64 best_mase = 0;
+  for (usize mi = 0; mi < countof(TS_MODELS); mi++) {
+    int nf = ts_backtest(TS_MODELS[mi].run, y, ts, n, horizon, gap, nfolds, act,
+                         fcst, NULL, NULL);
+    if (nf < 0)
+      return nf;
+    if (nf == 0)
+      continue;
+    f64 mae = metric_mae(act, fcst, nf * horizon);
+    f64 mase = scale > 0 ? mae / scale : mae;
+    if (best < 0 || mase < best_mase) {
+      best = (int)mi;
+      best_mase = mase;
+    }
+  }
+  return best;
+}
+
+/* Per-step conformal absolute-residual quantiles at level conf, from an out-of-
+ * sample rolling-origin backtest of `model`. Fills q[horizon]; act/fcst are
+ * scratch [nfolds*horizon] and col is scratch [nfolds]. Returns the fold count
+ * used, 0 if too short, or a negative SQLITE_ code on OOM. */
+static int ts_conformal_q(predict0_ts_model model, const f64 *y, const i64 *ts,
+                          int n, int horizon, int gap, int nfolds, f64 conf,
+                          f64 *act, f64 *fcst, f64 *col, f64 *q) {
+  int nf = ts_backtest(model, y, ts, n, horizon, gap, nfolds, act, fcst, NULL,
+                       NULL);
+  if (nf <= 0)
+    return nf;
+  for (int h = 0; h < horizon; h++) {
+    for (int f = 0; f < nf; f++)
+      col[f] = fabs(act[f * horizon + h] - fcst[f * horizon + h]);
+    for (int i = 1; i < nf; i++) { /* insertion sort (nf small) */
+      f64 v = col[i];
+      int j = i - 1;
+      while (j >= 0 && col[j] > v) {
+        col[j + 1] = col[j];
+        j--;
+      }
+      col[j + 1] = v;
+    }
+    int rank = (int)ceil((f64)(nf + 1) * conf); /* conformal quantile index */
+    if (rank > nf)
+      rank = nf;
+    if (rank < 1)
+      rank = 1;
+    q[h] = col[rank - 1];
+  }
+  return nf;
 }
 
 /* ---- forecast student serving (PSFCST, §4.1.6) ---- */
@@ -483,6 +638,9 @@ typedef struct {
   int context_limit;
   char *model;
   int receipt;
+  int interval_conformal; /* interval_method: 0 residual (default), 1 conformal */
+  int folds;              /* rolling-origin folds; 0 = FORECAST_DEFAULT_FOLDS */
+  int gap;                /* leakage gap between train end and first target */
 } ForecastOpts;
 
 static void forecast_opts_free(ForecastOpts *o) {
@@ -589,6 +747,43 @@ static int forecast_opt_cb(void *ctx, const char *key, sqlite3_value *value,
     }
     return 0;
   }
+  if (strcmp(key, "interval_method") == 0) {
+    if (vtype != SQLITE_TEXT)
+      goto wrong_type;
+    const char *m = (const char *)sqlite3_value_text(value);
+    if (m && strcmp(m, "residual") == 0)
+      o->interval_conformal = 0;
+    else if (m && strcmp(m, "conformal") == 0)
+      o->interval_conformal = 1;
+    else {
+      *errmsg = sqlite3_mprintf(
+          "%s: interval_method must be 'residual' or 'conformal'",
+          PREDICT_ERR_OPTIONS);
+      return 1;
+    }
+    return 0;
+  }
+  if (strcmp(key, "folds") == 0) {
+    if (vtype != SQLITE_INTEGER)
+      goto wrong_type;
+    o->folds = sqlite3_value_int(value);
+    if (o->folds < 1 || o->folds > FORECAST_MAX_FOLDS) {
+      *errmsg = sqlite3_mprintf("%s: folds must be in 1..%d",
+                                PREDICT_ERR_OPTIONS, FORECAST_MAX_FOLDS);
+      return 1;
+    }
+    return 0;
+  }
+  if (strcmp(key, "gap") == 0) {
+    if (vtype != SQLITE_INTEGER)
+      goto wrong_type;
+    o->gap = sqlite3_value_int(value);
+    if (o->gap < 0) {
+      *errmsg = sqlite3_mprintf("%s: gap must be >= 0", PREDICT_ERR_OPTIONS);
+      return 1;
+    }
+    return 0;
+  }
 
 wrong_type:
   *errmsg = sqlite3_mprintf("%s: wrong type for option '%s'",
@@ -597,8 +792,14 @@ wrong_type:
 }
 
 static const char *const FORECAST_OPTION_KEYS[] = {
-    "time_col", "value_col", "group_cols", "confidence_level",
-    "context_limit", "model", "receipt", NULL};
+    "time_col",      "value_col",       "group_cols", "confidence_level",
+    "context_limit", "model",           "receipt",    "interval_method",
+    "folds",         "gap",             NULL};
+
+static const char *const BACKTEST_OPTION_KEYS[] = {
+    "time_col",      "value_col", "group_cols",      "confidence_level",
+    "context_limit", "folds",     "gap",             "interval_method",
+    "model",         "receipt",   NULL};
 
 /* detect_anomalies shares the struct; anomaly_prob_threshold lands in
  * .confidence (same (0,1) validation) with a 0.99 default. */
@@ -1078,14 +1279,15 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     return SQLITE_ERROR;
   }
 
-  predict0_ts_model model = resolve_ts_model(opts.model);
+  int is_auto = opts.model && strcmp(opts.model, "auto") == 0;
+  predict0_ts_model model = is_auto ? NULL : resolve_ts_model(opts.model);
   ForecastStudent fstudent;
   int have_fstudent = 0, have_onnx = 0;
   char *serve_err = NULL; /* an error surfaced from serving a registered model */
 #ifdef SQLITE_PREDICT_ONNX
   predict0_model_row onnx_row;
 #endif
-  if (!model) {
+  if (!is_auto && !model) {
     /* not a bundled model: maybe a registered forecast student (PSFCST) */
     char *lerr = NULL;
     int lr = load_fcst_student(db, opts.model, &fstudent, &lerr);
@@ -1132,6 +1334,22 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     }
   }
 
+  if (opts.interval_conformal && (have_fstudent || have_onnx)) {
+    if (have_fstudent)
+      fcst_student_free(&fstudent);
+#ifdef SQLITE_PREDICT_ONNX
+    if (have_onnx)
+      predict0_model_row_free(&onnx_row);
+#endif
+    int rc = fc_error(
+        cur, PREDICT_ERR_OPTIONS,
+        "interval_method='conformal' is only supported for the statistical "
+        "models (theta-classic, stub-seasonal-naive, auto)",
+        NULL);
+    forecast_opts_free(&opts);
+    return rc;
+  }
+
   /* prepare + collect the series (shared with detect_anomalies) */
   SeriesBuf *series = NULL;
   int n_series = 0;
@@ -1166,7 +1384,23 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   f64 *lo = sqlite3_malloc(sizeof(f64) * horizon);
   f64 *hi = sqlite3_malloc(sizeof(f64) * horizon);
 
-  for (int i = 0; cur->rows && fc && sg && lo && hi && i < n_series; i++) {
+  /* rolling-origin scratch, shared by auto-selection and conformal intervals */
+  int folds_req = opts.folds > 0 ? opts.folds : FORECAST_DEFAULT_FOLDS;
+  int need_bt = is_auto || opts.interval_conformal;
+  f64 *bt_act = NULL, *bt_fcst = NULL, *bt_col = NULL, *bt_q = NULL;
+  if (need_bt) {
+    bt_act = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
+    bt_fcst = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
+    bt_col = sqlite3_malloc(sizeof(f64) * folds_req);
+    bt_q = sqlite3_malloc(sizeof(f64) * horizon);
+    if (!bt_act || !bt_fcst || !bt_col || !bt_q)
+      rc = SQLITE_NOMEM;
+  }
+
+  for (int i = 0; cur->rows && fc && sg && lo && hi &&
+                  (!need_bt || (bt_act && bt_fcst && bt_col && bt_q)) &&
+                  i < n_series;
+       i++) {
     SeriesBuf *s = &series[i];
     const char *status = NULL;
     if (s->non_numeric)
@@ -1216,10 +1450,43 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       }
 #endif
     } else {
-      model(y, n, horizon, fc, sg);
-      for (int h = 0; h < horizon; h++) { /* symmetric Gaussian interval */
-        lo[h] = fc[h] - z * sg[h];
-        hi[h] = fc[h] + z * sg[h];
+      predict0_ts_model use_model = model;
+      if (is_auto) {
+        int bi = ts_auto_select(y, ts, n, horizon, opts.gap, folds_req,
+                                naive_scale(y, n), bt_act, bt_fcst);
+        if (bi <= -2) { /* negative SQLITE code (OOM) */
+          rc = SQLITE_NOMEM;
+          break;
+        }
+        /* bi == -1: series too short to backtest -> default to theta */
+        use_model = bi >= 0 ? TS_MODELS[bi].run : model_theta;
+      }
+      if (opts.interval_conformal) {
+        int nf = ts_conformal_q(use_model, y, ts, n, horizon, opts.gap,
+                                folds_req, opts.confidence, bt_act, bt_fcst,
+                                bt_col, bt_q);
+        if (nf <= -2) {
+          rc = SQLITE_NOMEM;
+          break;
+        }
+        if (nf < CONFORMAL_MIN_FOLDS) { /* cannot calibrate honestly */
+          ForecastRow *r = &cur->rows[cur->n_rows++];
+          memset(r, 0, sizeof(*r));
+          r->series_key = sqlite3_mprintf("%s", s->key);
+          r->status = "insufficient_history";
+          continue;
+        }
+        use_model(y, n, horizon, fc, NULL); /* point-only */
+        for (int h = 0; h < horizon; h++) {
+          lo[h] = fc[h] - bt_q[h];
+          hi[h] = fc[h] + bt_q[h];
+        }
+      } else {
+        use_model(y, n, horizon, fc, sg);
+        for (int h = 0; h < horizon; h++) { /* symmetric Gaussian interval */
+          lo[h] = fc[h] - z * sg[h];
+          hi[h] = fc[h] + z * sg[h];
+        }
       }
     }
     for (int h = 1; h <= horizon; h++) {
@@ -1241,6 +1508,10 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   sqlite3_free(sg);
   sqlite3_free(lo);
   sqlite3_free(hi);
+  sqlite3_free(bt_act);
+  sqlite3_free(bt_fcst);
+  sqlite3_free(bt_col);
+  sqlite3_free(bt_q);
   if (have_fstudent)
     fcst_student_free(&fstudent); /* done serving; safe for every exit below */
 #ifdef SQLITE_PREDICT_ONNX
@@ -1273,7 +1544,8 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
    * json_object with alphabetical keys, resolved column names recorded */
   if (opts.receipt) {
     char *errmsg = NULL;
-    const char *model_id = (have_fstudent || have_onnx)
+    const char *model_id = is_auto ? "auto"
+                           : (have_fstudent || have_onnx)
                                ? opts.model
                                : resolve_ts_model_id(opts.model);
 
@@ -1323,19 +1595,30 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     if (sqlite3_prepare_v2(
             db,
             "SELECT json_object('confidence_level', ?1, 'context_limit', ?2,"
-            " 'group_cols', CASE WHEN ?3 = '' THEN NULL ELSE json(?3) END,"
-            " 'horizon', ?4, 'model', ?5, 'receipt', 1,"
-            " 'time_col', ?6, 'value_col', ?7)",
+            " 'folds', ?3, 'gap', ?4,"
+            " 'group_cols', CASE WHEN ?5 = '' THEN NULL ELSE json(?5) END,"
+            " 'horizon', ?6, 'interval_method', ?7, 'model', ?8,"
+            " 'receipt', 1, 'time_col', ?9, 'value_col', ?10)",
             -1, &pj, NULL) == SQLITE_OK) {
       sqlite3_bind_double(pj, 1, opts.confidence);
       sqlite3_bind_int(pj, 2, opts.context_limit);
-      sqlite3_bind_text(pj, 3, group_json, -1, SQLITE_STATIC);
-      sqlite3_bind_int(pj, 4, horizon);
-      sqlite3_bind_text(pj, 5, model_id, -1, SQLITE_STATIC);
+      if (opts.folds > 0)
+        sqlite3_bind_int(pj, 3, opts.folds);
+      else
+        sqlite3_bind_null(pj, 3);
+      if (opts.gap > 0)
+        sqlite3_bind_int(pj, 4, opts.gap);
+      else
+        sqlite3_bind_null(pj, 4);
+      sqlite3_bind_text(pj, 5, group_json, -1, SQLITE_STATIC);
+      sqlite3_bind_int(pj, 6, horizon);
+      sqlite3_bind_text(pj, 7, opts.interval_conformal ? "conformal" : "residual",
+                        -1, SQLITE_STATIC);
+      sqlite3_bind_text(pj, 8, model_id, -1, SQLITE_STATIC);
       if (resolved_time)
-        sqlite3_bind_text(pj, 6, resolved_time, -1, SQLITE_STATIC);
+        sqlite3_bind_text(pj, 9, resolved_time, -1, SQLITE_STATIC);
       if (resolved_value)
-        sqlite3_bind_text(pj, 7, resolved_value, -1, SQLITE_STATIC);
+        sqlite3_bind_text(pj, 10, resolved_value, -1, SQLITE_STATIC);
       if (sqlite3_step(pj) == SQLITE_ROW)
         params = sqlite3_mprintf(
             "%s", (const char *)sqlite3_column_text(pj, 0));
@@ -2276,9 +2559,610 @@ static sqlite3_module anomModule = {
 
 #pragma endregion
 
+#pragma region backtest
+
+/* backtest(query, horizon, options) — eponymous table-valued function. Rolling-
+ * origin evaluation of a statistical model (or auto) over each series: for each
+ * fold it reports point-accuracy metrics and, for the chosen interval_method,
+ * interval coverage + width. This is the on-device audit primitive: an agent
+ * scores its own forecasts, and validates conformal coverage, locally. */
+
+#define BT_COL_SERIES_KEY 0
+#define BT_COL_FOLD 1
+#define BT_COL_CUTOFF 2
+#define BT_COL_MODEL 3
+#define BT_COL_N 4
+#define BT_COL_MAE 5
+#define BT_COL_RMSE 6
+#define BT_COL_MASE 7
+#define BT_COL_SMAPE 8
+#define BT_COL_COVERAGE 9
+#define BT_COL_WIDTH 10
+#define BT_COL_STATUS 11
+#define BT_COL_RECEIPT 12
+#define BT_COL_QUERY 13
+#define BT_COL_HORIZON 14
+#define BT_COL_OPTIONS 15
+
+typedef struct {
+  char *series_key;
+  int fold;
+  char cutoff[PREDICT_TS_BUFSIZE];
+  const char *model; /* static id */
+  int n;
+  f64 mae, rmse, mase, smape, coverage, width;
+  int has_metrics; /* 0 for status-only rows */
+  int has_band;    /* 0 when no interval was computed */
+  const char *status;
+  char receipt_id[PREDICT_ULID_BUFSIZE];
+} BtRow;
+
+static int bt_row_cmp(const void *a, const void *b) {
+  const BtRow *x = *(BtRow *const *)a;
+  const BtRow *y = *(BtRow *const *)b;
+  int c = strcmp(x->series_key ? x->series_key : "",
+                 y->series_key ? y->series_key : "");
+  if (c)
+    return c;
+  return x->fold - y->fold;
+}
+
+typedef struct {
+  sqlite3_vtab base;
+  sqlite3 *db;
+} bt_vtab;
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  BtRow *rows;
+  int n_rows;
+  int i;
+} bt_cursor;
+
+static int bt_connect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
+                      sqlite3_vtab **ppVtab, char **pzErr) {
+  UNUSED_PARAMETER(pAux);
+  UNUSED_PARAMETER(argc);
+  UNUSED_PARAMETER(argv);
+  UNUSED_PARAMETER(pzErr);
+  bt_vtab *v = sqlite3_malloc(sizeof(*v));
+  if (!v)
+    return SQLITE_NOMEM;
+  memset(v, 0, sizeof(*v));
+  v->db = db;
+  int rc = sqlite3_declare_vtab(
+      db, "CREATE TABLE x(series_key TEXT, fold INTEGER, cutoff_timestamp TEXT,"
+          " model TEXT, n INTEGER, mae REAL, rmse REAL, mase REAL, smape REAL,"
+          " coverage REAL, mean_interval_width REAL, status TEXT,"
+          " receipt_id TEXT, query HIDDEN, horizon HIDDEN, options HIDDEN)");
+  if (rc != SQLITE_OK) {
+    sqlite3_free(v);
+    return rc;
+  }
+  *ppVtab = &v->base;
+  return SQLITE_OK;
+}
+
+static int bt_disconnect(sqlite3_vtab *pVtab) {
+  sqlite3_free(pVtab);
+  return SQLITE_OK;
+}
+
+static int bt_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdx) {
+  int seen_query = 0, seen_horizon = 0;
+  for (int i = 0; i < pIdx->nConstraint; i++) {
+    const struct sqlite3_index_constraint *c = &pIdx->aConstraint[i];
+    if (c->op != SQLITE_INDEX_CONSTRAINT_EQ)
+      continue;
+    if (c->iColumn == BT_COL_QUERY) {
+      if (!c->usable)
+        return SQLITE_CONSTRAINT;
+      pIdx->aConstraintUsage[i].argvIndex = 1;
+      pIdx->aConstraintUsage[i].omit = 1;
+      seen_query = 1;
+    } else if (c->iColumn == BT_COL_HORIZON) {
+      if (!c->usable)
+        return SQLITE_CONSTRAINT;
+      pIdx->aConstraintUsage[i].argvIndex = 2;
+      pIdx->aConstraintUsage[i].omit = 1;
+      seen_horizon = 1;
+    } else if (c->iColumn == BT_COL_OPTIONS) {
+      if (!c->usable)
+        return SQLITE_CONSTRAINT;
+      pIdx->aConstraintUsage[i].argvIndex = 3;
+      pIdx->aConstraintUsage[i].omit = 1;
+    }
+  }
+  if (!seen_query || !seen_horizon) {
+    pVtab->zErrMsg = sqlite3_mprintf(
+        "%s: backtest(query, horizon) requires both arguments",
+        PREDICT_ERR_SCHEMA);
+    return SQLITE_ERROR;
+  }
+  pIdx->estimatedCost = 1000;
+  return SQLITE_OK;
+}
+
+static int bt_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur) {
+  UNUSED_PARAMETER(pVtab);
+  bt_cursor *c = sqlite3_malloc(sizeof(*c));
+  if (!c)
+    return SQLITE_NOMEM;
+  memset(c, 0, sizeof(*c));
+  *ppCur = &c->base;
+  return SQLITE_OK;
+}
+
+static void bt_rows_free(bt_cursor *c) {
+  for (int i = 0; i < c->n_rows; i++)
+    sqlite3_free(c->rows[i].series_key);
+  sqlite3_free(c->rows);
+  c->rows = NULL;
+  c->n_rows = 0;
+  c->i = 0;
+}
+
+static int bt_close(sqlite3_vtab_cursor *pCur) {
+  bt_cursor *c = (bt_cursor *)pCur;
+  bt_rows_free(c);
+  sqlite3_free(c);
+  return SQLITE_OK;
+}
+
+static int bt_error(bt_cursor *cur, const char *code, const char *msg,
+                    const char *detail) {
+  sqlite3_free(cur->base.pVtab->zErrMsg);
+  cur->base.pVtab->zErrMsg =
+      sqlite3_mprintf("%s: %s%s", code, msg, detail ? detail : "");
+  return SQLITE_ERROR;
+}
+
+/* Conformal leave-fold-out absolute-residual quantile for step h, excluding
+ * fold `skip`. col is scratch [nf]. Returns the quantile at level conf. */
+static f64 bt_lofo_q(const f64 *act, const f64 *fcst, int nf, int horizon, int h,
+                     int skip, f64 conf, f64 *col) {
+  int m = 0;
+  for (int g = 0; g < nf; g++)
+    if (g != skip)
+      col[m++] = fabs(act[g * horizon + h] - fcst[g * horizon + h]);
+  for (int i = 1; i < m; i++) { /* insertion sort (m small) */
+    f64 v = col[i];
+    int j = i - 1;
+    while (j >= 0 && col[j] > v) {
+      col[j + 1] = col[j];
+      j--;
+    }
+    col[j + 1] = v;
+  }
+  int rank = (int)ceil((f64)(m + 1) * conf);
+  if (rank > m)
+    rank = m;
+  if (rank < 1)
+    rank = 1;
+  return col[rank - 1];
+}
+
+static int bt_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
+                     int argc, sqlite3_value **argv) {
+  UNUSED_PARAMETER(idxNum);
+  UNUSED_PARAMETER(idxStr);
+  bt_cursor *cur = (bt_cursor *)pCur;
+  bt_vtab *vtab = (bt_vtab *)cur->base.pVtab;
+  sqlite3 *db = vtab->db;
+  bt_rows_free(cur);
+
+  if (argc < 2)
+    return bt_error(cur, PREDICT_ERR_SCHEMA,
+                    "backtest(query, horizon) requires both arguments", NULL);
+  const char *query = (const char *)sqlite3_value_text(argv[0]);
+  if (!query)
+    return bt_error(cur, PREDICT_ERR_SCHEMA, "query must be text", NULL);
+  if (sqlite3_value_type(argv[1]) != SQLITE_INTEGER)
+    return bt_error(cur, PREDICT_ERR_HORIZON, "horizon must be an integer", NULL);
+  int horizon = sqlite3_value_int(argv[1]);
+  if (horizon < 1 || horizon > FORECAST_MAX_HORIZON)
+    return bt_error(cur, PREDICT_ERR_HORIZON, "horizon out of range 1..1000",
+                    NULL);
+
+  ForecastOpts opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.confidence = 0.95;
+  opts.context_limit = FORECAST_DEFAULT_CONTEXT_LIMIT;
+  opts.receipt = 1;
+
+  const char *options_json =
+      argc >= 3 ? (const char *)sqlite3_value_text(argv[2]) : NULL;
+  char *errmsg = NULL;
+  if (predict0_options_parse(db, options_json, BACKTEST_OPTION_KEYS,
+                             forecast_opt_cb, &opts, &errmsg)) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = errmsg;
+    forecast_opts_free(&opts);
+    return SQLITE_ERROR;
+  }
+
+  int is_auto = opts.model && strcmp(opts.model, "auto") == 0;
+  predict0_ts_model fixed_model = is_auto ? NULL : resolve_ts_model(opts.model);
+  const char *fixed_id = is_auto ? "auto" : resolve_ts_model_id(opts.model);
+  if (!is_auto && !fixed_model) {
+    int rc = bt_error(cur, PREDICT_ERR_MODEL_NOT_FOUND,
+                      "backtest() supports the statistical models "
+                      "(theta-classic, stub-seasonal-naive) or auto: ",
+                      opts.model);
+    forecast_opts_free(&opts);
+    return rc;
+  }
+
+  SeriesBuf *series = NULL;
+  int n_series = 0;
+  char *resolved_time = NULL, *resolved_value = NULL, *cerr = NULL;
+  int rc = collect_series(db, query, &opts, &series, &n_series, &resolved_time,
+                          &resolved_value, &cerr);
+
+#define BT_FREE_SERIES()                                                       \
+  do {                                                                         \
+    series_array_free(series, n_series);                                       \
+    sqlite3_free(resolved_time);                                               \
+    sqlite3_free(resolved_value);                                              \
+    forecast_opts_free(&opts);                                                 \
+  } while (0)
+
+  if (rc != SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = cerr;
+    forecast_opts_free(&opts);
+    return rc;
+  }
+
+  int folds_req = opts.folds > 0 ? opts.folds : FORECAST_DEFAULT_FOLDS;
+  f64 z = predict0_norm_quantile(0.5 + opts.confidence / 2);
+
+  int max_rows = 0;
+  for (int i = 0; i < n_series; i++) {
+    SeriesBuf *s = &series[i];
+    int usable = !s->non_numeric && s->n >= FORECAST_MIN_HISTORY;
+    max_rows += usable ? folds_req : 1;
+  }
+  cur->rows = sqlite3_malloc(sizeof(BtRow) * (max_rows ? max_rows : 1));
+  f64 *act = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
+  f64 *fcst = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
+  f64 *sig = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
+  f64 *col = sqlite3_malloc(sizeof(f64) * folds_req);
+  i64 *cutoff_ms = sqlite3_malloc(sizeof(i64) * folds_req);
+  if (!cur->rows || !act || !fcst || !sig || !col || !cutoff_ms)
+    rc = SQLITE_NOMEM;
+  cur->n_rows = 0;
+
+  for (int i = 0; rc == SQLITE_OK && i < n_series; i++) {
+    SeriesBuf *s = &series[i];
+    const char *status = NULL;
+    if (s->non_numeric)
+      status = "non_numeric";
+    else if (s->n < FORECAST_MIN_HISTORY)
+      status = "insufficient_history";
+    if (status) {
+      BtRow *r = &cur->rows[cur->n_rows++];
+      memset(r, 0, sizeof(*r));
+      r->series_key = sqlite3_mprintf("%s", s->key);
+      r->status = status;
+      continue;
+    }
+    series_sort(s);
+    int truncated = 0;
+    f64 *y = s->val;
+    i64 *ts = s->ts;
+    int n = s->n;
+    if (opts.context_limit > 0 && n > opts.context_limit) {
+      y += n - opts.context_limit;
+      ts += n - opts.context_limit;
+      n = opts.context_limit;
+      truncated = 1;
+    }
+
+    predict0_ts_model use_model = fixed_model;
+    const char *use_id = fixed_id;
+    f64 scale = naive_scale(y, n);
+    if (is_auto) {
+      int bi = ts_auto_select(y, ts, n, horizon, opts.gap, folds_req, scale, act,
+                              fcst);
+      if (bi <= -2) {
+        rc = SQLITE_NOMEM;
+        break;
+      }
+      use_model = bi >= 0 ? TS_MODELS[bi].run : model_theta;
+      use_id = bi >= 0 ? TS_MODELS[bi].id : "theta-classic";
+    }
+    int nf = ts_backtest(use_model, y, ts, n, horizon, opts.gap, folds_req, act,
+                         fcst, sig, cutoff_ms);
+    if (nf <= -2) {
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    if (nf == 0) { /* too short to form a single fold */
+      BtRow *r = &cur->rows[cur->n_rows++];
+      memset(r, 0, sizeof(*r));
+      r->series_key = sqlite3_mprintf("%s", s->key);
+      r->status = "insufficient_history";
+      continue;
+    }
+    for (int f = 0; f < nf; f++) {
+      const f64 *fa = act + (size_t)f * horizon;
+      const f64 *ff = fcst + (size_t)f * horizon;
+      const f64 *fs = sig + (size_t)f * horizon;
+      BtRow *r = &cur->rows[cur->n_rows++];
+      memset(r, 0, sizeof(*r));
+      r->series_key = sqlite3_mprintf("%s", s->key);
+      r->fold = f;
+      predict0_format_timestamp(cutoff_ms[f], r->cutoff, sizeof(r->cutoff));
+      r->model = use_id;
+      r->n = horizon;
+      r->mae = metric_mae(fa, ff, horizon);
+      r->rmse = metric_rmse(fa, ff, horizon);
+      r->mase = scale > 0 ? r->mae / scale : 0;
+      r->smape = metric_smape(fa, ff, horizon);
+      r->has_metrics = 1;
+      r->status = truncated ? "truncated" : "ok";
+      f64 cov = 0, wid = 0;
+      if (!opts.interval_conformal) {
+        for (int h = 0; h < horizon; h++) {
+          f64 lo = ff[h] - z * fs[h], hi = ff[h] + z * fs[h];
+          wid += hi - lo;
+          if (fa[h] >= lo && fa[h] <= hi)
+            cov += 1;
+        }
+        r->coverage = cov / horizon;
+        r->width = wid / horizon;
+        r->has_band = 1;
+      } else if (nf >= CONFORMAL_MIN_FOLDS) { /* leave-fold-out conformal band */
+        for (int h = 0; h < horizon; h++) {
+          f64 q = bt_lofo_q(act, fcst, nf, horizon, h, f, opts.confidence, col);
+          f64 lo = ff[h] - q, hi = ff[h] + q;
+          wid += hi - lo;
+          if (fa[h] >= lo && fa[h] <= hi)
+            cov += 1;
+        }
+        r->coverage = cov / horizon;
+        r->width = wid / horizon;
+        r->has_band = 1;
+      }
+    }
+  }
+
+  sqlite3_free(act);
+  sqlite3_free(fcst);
+  sqlite3_free(sig);
+  sqlite3_free(col);
+  sqlite3_free(cutoff_ms);
+
+  if (rc != SQLITE_OK) {
+    BT_FREE_SERIES();
+    bt_rows_free(cur);
+    return rc;
+  }
+
+  if (opts.receipt) {
+    char *rerr = NULL;
+    BtRow **order =
+        sqlite3_malloc(sizeof(BtRow *) * (cur->n_rows ? cur->n_rows : 1));
+    if (!order) {
+      BT_FREE_SERIES();
+      bt_rows_free(cur);
+      return SQLITE_NOMEM;
+    }
+    for (int i = 0; i < cur->n_rows; i++)
+      order[i] = &cur->rows[i];
+    qsort(order, (usize)cur->n_rows, sizeof(BtRow *), bt_row_cmp);
+    predict0_hasher h;
+    predict0_hash_init(&h);
+    for (int i = 0; i < cur->n_rows; i++) {
+      BtRow *r = order[i];
+      predict0_hash_text(&h, r->series_key);
+      if (r->has_metrics) {
+        predict0_hash_int(&h, r->fold);
+        predict0_hash_text(&h, r->cutoff);
+        predict0_hash_text(&h, r->model);
+        predict0_hash_int(&h, r->n);
+        predict0_hash_real(&h, r->mae);
+        predict0_hash_real(&h, r->rmse);
+        predict0_hash_real(&h, r->mase);
+        predict0_hash_real(&h, r->smape);
+        if (r->has_band) {
+          predict0_hash_real(&h, r->coverage);
+          predict0_hash_real(&h, r->width);
+        } else {
+          predict0_hash_null(&h);
+          predict0_hash_null(&h);
+        }
+      } else {
+        for (int k = 0; k < 10; k++)
+          predict0_hash_null(&h);
+      }
+      predict0_hash_row_end(&h);
+    }
+    sqlite3_free(order);
+    char result_hash[PREDICT_HEX_BUFSIZE];
+    predict0_hash_hex(&h, result_hash);
+
+    char group_json[600] = "";
+    if (opts.n_group_cols) {
+      usize gl = 0;
+      gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl, "[");
+      for (int g = 0; g < opts.n_group_cols && gl < sizeof(group_json) - 4; g++)
+        gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl,
+                              "%s\"%s\"", g ? "," : "", opts.group_cols[g]);
+      snprintf(group_json + gl, sizeof(group_json) - gl, "]");
+    }
+    sqlite3_stmt *pj = NULL;
+    char *params = NULL;
+    if (sqlite3_prepare_v2(
+            db,
+            "SELECT json_object('confidence_level', ?1, 'context_limit', ?2,"
+            " 'folds', ?3, 'gap', ?4,"
+            " 'group_cols', CASE WHEN ?5 = '' THEN NULL ELSE json(?5) END,"
+            " 'horizon', ?6, 'interval_method', ?7, 'model', ?8,"
+            " 'receipt', 1, 'time_col', ?9, 'value_col', ?10)",
+            -1, &pj, NULL) == SQLITE_OK) {
+      sqlite3_bind_double(pj, 1, opts.confidence);
+      sqlite3_bind_int(pj, 2, opts.context_limit);
+      if (opts.folds > 0)
+        sqlite3_bind_int(pj, 3, opts.folds);
+      else
+        sqlite3_bind_null(pj, 3);
+      if (opts.gap > 0)
+        sqlite3_bind_int(pj, 4, opts.gap);
+      else
+        sqlite3_bind_null(pj, 4);
+      sqlite3_bind_text(pj, 5, group_json, -1, SQLITE_STATIC);
+      sqlite3_bind_int(pj, 6, horizon);
+      sqlite3_bind_text(pj, 7, opts.interval_conformal ? "conformal" : "residual",
+                        -1, SQLITE_STATIC);
+      sqlite3_bind_text(pj, 8, fixed_id, -1, SQLITE_STATIC);
+      if (resolved_time)
+        sqlite3_bind_text(pj, 9, resolved_time, -1, SQLITE_STATIC);
+      if (resolved_value)
+        sqlite3_bind_text(pj, 10, resolved_value, -1, SQLITE_STATIC);
+      if (sqlite3_step(pj) == SQLITE_ROW)
+        params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
+      sqlite3_finalize(pj);
+    }
+    if (!params) {
+      BT_FREE_SERIES();
+      bt_rows_free(cur);
+      return bt_error(cur, PREDICT_ERR_RESOURCE, "could not canonicalize params",
+                      NULL);
+    }
+    char receipt_id[PREDICT_ULID_BUFSIZE];
+    int irc = predict0_emit_receipt(db, "backtest", fixed_id, params, query,
+                                    result_hash, receipt_id, &rerr);
+    sqlite3_free(params);
+    if (irc != SQLITE_OK) {
+      sqlite3_free(vtab->base.zErrMsg);
+      vtab->base.zErrMsg = rerr;
+      BT_FREE_SERIES();
+      bt_rows_free(cur);
+      return SQLITE_ERROR;
+    }
+    for (int i = 0; i < cur->n_rows; i++)
+      memcpy(cur->rows[i].receipt_id, receipt_id, sizeof(receipt_id));
+  }
+
+  BT_FREE_SERIES();
+#undef BT_FREE_SERIES
+  cur->i = 0;
+  return SQLITE_OK;
+}
+
+static int bt_next(sqlite3_vtab_cursor *pCur) {
+  ((bt_cursor *)pCur)->i++;
+  return SQLITE_OK;
+}
+
+static int bt_eof(sqlite3_vtab_cursor *pCur) {
+  bt_cursor *c = (bt_cursor *)pCur;
+  return c->i >= c->n_rows;
+}
+
+static int bt_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col) {
+  bt_cursor *c = (bt_cursor *)pCur;
+  BtRow *r = &c->rows[c->i];
+  switch (col) {
+  case BT_COL_SERIES_KEY:
+    sqlite3_result_text(ctx, r->series_key ? r->series_key : "", -1,
+                        SQLITE_TRANSIENT);
+    break;
+  case BT_COL_FOLD:
+    if (r->has_metrics)
+      sqlite3_result_int(ctx, r->fold);
+    break;
+  case BT_COL_CUTOFF:
+    if (r->has_metrics)
+      sqlite3_result_text(ctx, r->cutoff, -1, SQLITE_TRANSIENT);
+    break;
+  case BT_COL_MODEL:
+    if (r->has_metrics)
+      sqlite3_result_text(ctx, r->model, -1, SQLITE_STATIC);
+    break;
+  case BT_COL_N:
+    if (r->has_metrics)
+      sqlite3_result_int(ctx, r->n);
+    break;
+  case BT_COL_MAE:
+    if (r->has_metrics)
+      sqlite3_result_double(ctx, r->mae);
+    break;
+  case BT_COL_RMSE:
+    if (r->has_metrics)
+      sqlite3_result_double(ctx, r->rmse);
+    break;
+  case BT_COL_MASE:
+    if (r->has_metrics)
+      sqlite3_result_double(ctx, r->mase);
+    break;
+  case BT_COL_SMAPE:
+    if (r->has_metrics)
+      sqlite3_result_double(ctx, r->smape);
+    break;
+  case BT_COL_COVERAGE:
+    if (r->has_band)
+      sqlite3_result_double(ctx, r->coverage);
+    break;
+  case BT_COL_WIDTH:
+    if (r->has_band)
+      sqlite3_result_double(ctx, r->width);
+    break;
+  case BT_COL_STATUS:
+    sqlite3_result_text(ctx, r->status, -1, SQLITE_STATIC);
+    break;
+  case BT_COL_RECEIPT:
+    if (r->receipt_id[0])
+      sqlite3_result_text(ctx, r->receipt_id, -1, SQLITE_TRANSIENT);
+    break;
+  default:
+    break;
+  }
+  return SQLITE_OK;
+}
+
+static int bt_rowid(sqlite3_vtab_cursor *pCur, sqlite3_int64 *pRowid) {
+  *pRowid = ((bt_cursor *)pCur)->i;
+  return SQLITE_OK;
+}
+
+static sqlite3_module backtestModule = {
+    /* iVersion    */ 0,
+    /* xCreate     */ NULL,
+    /* xConnect    */ bt_connect,
+    /* xBestIndex  */ bt_best_index,
+    /* xDisconnect */ bt_disconnect,
+    /* xDestroy    */ NULL,
+    /* xOpen       */ bt_open,
+    /* xClose      */ bt_close,
+    /* xFilter     */ bt_filter,
+    /* xNext       */ bt_next,
+    /* xEof        */ bt_eof,
+    /* xColumn     */ bt_column,
+    /* xRowid      */ bt_rowid,
+    /* xUpdate     */ NULL,
+    /* xBegin      */ NULL,
+    /* xSync       */ NULL,
+    /* xCommit     */ NULL,
+    /* xRollback   */ NULL,
+    /* xFindMethod */ NULL,
+    /* xRename     */ NULL,
+    /* xSavepoint  */ NULL,
+    /* xRelease    */ NULL,
+    /* xRollbackTo */ NULL,
+    /* xShadowName */ NULL,
+    /* xIntegrity  */ NULL};
+
+#pragma endregion
+
 int predict0_forecast_init(sqlite3 *db) {
   int rc = sqlite3_create_module(db, "forecast", &forecastModule, NULL);
   if (rc != SQLITE_OK)
     return rc;
-  return sqlite3_create_module(db, "detect_anomalies", &anomModule, NULL);
+  rc = sqlite3_create_module(db, "detect_anomalies", &anomModule, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  return sqlite3_create_module(db, "backtest", &backtestModule, NULL);
 }
