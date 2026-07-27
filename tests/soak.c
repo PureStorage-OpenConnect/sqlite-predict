@@ -114,6 +114,18 @@ int main(void) {
                   1))
     goto done_fail;
 
+  /* distill a native forecast student (window mode, no onnx teacher) so the
+   * sanitizers cover the forecast-student serve path and its use as an auto
+   * candidate: resolve_candidates load/free + fcst_point + fcst_run */
+  run_discard(db,
+              "SELECT model_id FROM distill_forecast("
+              "'WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n"
+              " WHERE i<300) SELECT (i+0)%16,(i+1)%16,(i+2)%16,(i+3)%16,"
+              "(i+4)%16,(i+5)%16,(i+6)%16,(i+7)%16,(i+8)%16,(i+9)%16 FROM n',"
+              " '{\"context\":8,\"horizon\":2,\"student_id\":\"soak_fcst\","
+              "\"epochs\":50}')",
+              1);
+
   for (int i = 0; i < 50; i++) {
     if (run_discard(db,
                     "SELECT * FROM forecast('SELECT ts, value FROM series',"
@@ -233,6 +245,20 @@ int main(void) {
                 0);
     run_discard(db, "SELECT * FROM detect_anomalies('SELECT ts, value FROM"
                     " series', '{\"model\":\"tsb\"}')",
+                0);
+
+    /* forecast student: direct serve, and as an auto candidate (exercises
+     * resolve_candidates student load/free + fcst_point + fcst_run) */
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 2,"
+                    " '{\"model\":\"soak_fcst\",\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 2,"
+                    " '{\"model\":\"auto\",\"candidates\":[\"theta-classic\","
+                    "\"soak_fcst\"],\"receipt\":0}')",
+                1);
+    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 2,"
+                    " '{\"model\":\"auto\",\"candidates\":[\"soak_fcst\"],"
+                    "\"interval_method\":\"conformal\"}')",
                 0);
 
     /* error paths every iteration too — including every collect_series

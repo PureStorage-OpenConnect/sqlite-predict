@@ -329,3 +329,84 @@ def test_candidates_conformal_with_stat_models_ok(db):
                            "candidates": ["theta-classic", "stub-seasonal-naive"],
                            "interval_method": "conformal"}))
     assert len(out) == 6 and all(lo <= hi for lo, hi in out)
+
+
+# ------------------------- distilled student: distributable + auto candidate
+
+# A distilled forecast student is created and served entirely in the
+# zero-dependency core; the onnx runtime is only needed for a live-FM *teacher*.
+# Here the training query supplies the future columns directly (a perfect
+# teacher baked into the data), so no onnx is involved.
+
+_LS, _HS, _PS = 32, 8, 16
+
+
+def _wave(t):
+    import math
+    return (10.0 + 5.0 * math.sin(2 * math.pi * t / _PS)
+            + 2.0 * math.sin(2 * math.pi * t / (_PS * 2)))
+
+
+def _distill_student(db, student_id="stud", horizon=_HS):
+    ncol = _LS + horizon
+    db.execute("CREATE TABLE w(%s)" % ",".join("c%d REAL" % i for i in range(ncol)))
+    db.executemany(
+        "INSERT INTO w VALUES (%s)" % ",".join("?" * ncol),
+        [[_wave(k + i) for i in range(_LS)]
+         + [_wave(k + _LS + j) for j in range(horizon)] for k in range(300)])
+    cols = ",".join("c%d" % i for i in range(ncol))
+    db.execute("SELECT model_id FROM distill_forecast(?, json(?))",
+               ("SELECT %s FROM w" % cols,
+                json.dumps({"context": _LS, "horizon": horizon,
+                            "student_id": student_id, "hidden": 32,
+                            "epochs": 200}))).fetchone()
+
+
+def _wave_series(db, n=64, base=1000):
+    db.execute("CREATE TABLE s(ts TEXT, value REAL)")
+    db.executemany(
+        "INSERT INTO s VALUES (?,?)",
+        [(f"2020-01-01T{i // 60:02d}:{i % 60:02d}:00", _wave(base + i))
+         for i in range(n)])
+
+
+def test_distilled_student_competes_as_auto_candidate(db):
+    """No onnx: a student distilled from its own target columns competes in the
+    auto pool alongside the baselines, and the run replays deterministically."""
+    _distill_student(db, "stud")
+    _wave_series(db)
+    out = rows(db, "SELECT step, forecast, receipt_id FROM forecast(?, 6, ?)"
+                   " ORDER BY step",
+               "SELECT ts, value FROM s",
+               json.dumps({"model": "auto", "candidates": ["theta-classic", "stud"]}))
+    assert len(out) == 6
+    assert rows(db, "SELECT match FROM predict_replay(?)", out[0][2])[0][0] == 1
+
+
+def test_distilled_student_is_distributable(db):
+    """Once distilled the student is a portable native row (~kilobytes): copy it
+    into a fresh database with no distillation step and it serves in the
+    zero-dependency core."""
+    import os
+    _distill_student(db, "stud")
+    src = rows(db, "SELECT model_id, kind, runtime, weights, content_hash, license"
+                   " FROM _predict_models WHERE model_id='stud'")[0]
+
+    db2 = sqlite3.connect(":memory:")
+    db2.enable_load_extension(True)
+    db2.load_extension(os.path.join(os.path.dirname(__file__), "..", "dist",
+                                    "predict0"))
+    try:
+        _wave_series(db2)
+        # a forecast ensures the registry tables exist, then transplant the row
+        db2.execute("SELECT count(*) FROM forecast('SELECT ts, value FROM s', 2)")
+        db2.execute(
+            "INSERT INTO _predict_models"
+            " (model_id, kind, runtime, weights, content_hash, license)"
+            " VALUES (?,?,?,?,?,?)", src)
+        n = db2.execute(
+            "SELECT count(*) FROM forecast('SELECT ts, value FROM s', 4,"
+            " '{\"model\":\"stud\",\"receipt\":0}')").fetchone()[0]
+        assert n == 4
+    finally:
+        db2.close()
