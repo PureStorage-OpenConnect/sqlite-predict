@@ -35,6 +35,11 @@ __pycache__/
 # local-only working files (internal strategy, private notes); never published
 /.local/
 
+# secrets — never commit tokens/keys
+.env
+.env.local
+.env.*.local
+
 # python package (generated amalgamation + build artifacts)
 bindings/python/src/
 bindings/python/build/
