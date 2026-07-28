@@ -328,3 +328,13 @@ def test_auto_stays_pure_without_a_registry(db):
     assert doc["model"] in ("theta-classic", "stub-seasonal-naive", "tsb")
     assert db.execute("SELECT count(*) FROM sqlite_master WHERE name LIKE"
                       " '_predict%'").fetchone()[0] == 0
+
+
+def test_distill_forecast_rejects_unknown_option_key(db):
+    # the fail-loud options contract applies to distill_forecast too
+    ncol = _load_windows(db)
+    with pytest.raises(sqlite3.OperationalError, match="OPTIONS"):
+        db.execute(
+            f"SELECT * FROM distill_forecast('SELECT {_cols(ncol)} FROM w',"
+            f" json_object('context',{L},'horizon',{H},"
+            f"'student_id','x','bogus',1))").fetchall()

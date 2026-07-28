@@ -5,9 +5,7 @@ description: Every option each function accepts, passed as a trailing JSON objec
 
 Options are a single JSON object in the last argument. Unknown keys and
 wrong-typed values are rejected with `PREDICT_ERR_OPTIONS`, so a typo fails loud
-rather than being ignored. `distill_forecast` is the one exception today: it
-reads only its known keys and ignores anything else, so check its spelling
-yourself.
+rather than being ignored.
 
 ## forecast
 

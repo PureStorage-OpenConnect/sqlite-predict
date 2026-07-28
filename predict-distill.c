@@ -1986,6 +1986,23 @@ done:
 }
 #endif /* SQLITE_PREDICT_ONNX */
 
+/* distill_forecast option keys. Values are extracted with json_extract
+ * below; this closed list exists so an unknown or misspelled key fails
+ * loudly (the same contract as every other operation) instead of being
+ * silently ignored. */
+static const char *const FCST_DIST_OPTION_KEYS[] = {
+    "context", "horizon", "student_id", "hidden",
+    "epochs",  "lr",      "teacher",    "quantiles", NULL};
+
+static int fdist_opt_validate_cb(void *ctx, const char *key,
+                                 sqlite3_value *value, char **errmsg) {
+  UNUSED_PARAMETER(ctx);
+  UNUSED_PARAMETER(key);
+  UNUSED_PARAMETER(value);
+  UNUSED_PARAMETER(errmsg);
+  return 0; /* keys validated by the parser; values read via json_extract */
+}
+
 /* ---- distill_forecast vtab ---- */
 
 #define FD_MODEL 0
@@ -2110,6 +2127,17 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (!tq)
     FD_FAIL("%s: train_query is required", PREDICT_ERR_SCHEMA);
   {
+    /* reject unknown option keys before extracting the known ones */
+    char *operr = NULL;
+    if (predict0_options_parse(db, options, FCST_DIST_OPTION_KEYS,
+                               fdist_opt_validate_cb, NULL, &operr)) {
+      sqlite3_free(vtab->base.zErrMsg);
+      vtab->base.zErrMsg = operr;
+      sqlite3_free(student_id);
+      sqlite3_free(levels);
+      sqlite3_free(teacher);
+      return SQLITE_ERROR;
+    }
     sqlite3_stmt *op = NULL;
     if (sqlite3_prepare_v2(
             db,

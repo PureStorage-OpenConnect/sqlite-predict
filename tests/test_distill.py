@@ -436,3 +436,17 @@ def test_corrupt_student_blob_errors_not_crashes(db):
             db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
                        " json_object('model','bad'))").fetchall()
         assert "PREDICT_ERR" in str(e.value)
+
+
+def test_student_rejects_train_query(db):
+    # a student carries its training in its blob: a train_query alongside
+    # it would be dead weight, so it is rejected, never silently ignored
+    db.execute("CREATE TABLE tt(f1 REAL, f2 REAL, label TEXT)")
+    db.executemany("INSERT INTO tt VALUES (?,?,?)",
+                   [(i * 0.3, (i * 7) % 5, "c%d" % (i % 2)) for i in range(60)])
+    db.execute("SELECT * FROM distill_predict('SELECT f1, f2, label FROM tt',"
+               " '{\"target\":\"label\",\"student_id\":\"guard-s\"}')").fetchone()
+    with pytest.raises(sqlite3.OperationalError, match="no train_query"):
+        db.execute("SELECT * FROM predict('SELECT f1, f2, label FROM tt',"
+                   " 'SELECT rowid, f1, f2 FROM tt',"
+                   " '{\"model\":\"guard-s\"}')").fetchall()

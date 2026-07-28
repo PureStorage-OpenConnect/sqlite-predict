@@ -27,8 +27,8 @@ SELECT row_ref, prediction, confidence FROM predict(NULL,
 
 The `NULL` first argument is the signature of serving a student: `predict`
 normally takes a training query for in-context models, but a student carries
-its training inside its blob, so pass `NULL`; a query in that position is
-not read when a student serves the call.
+its training inside its blob, so passing a query alongside a student is
+rejected (`PREDICT_ERR_OPTIONS`) rather than silently ignored.
 
 `student_kind` is `tree` (a single CART), `gbt` (a gradient-boosted forest
 with second-order leaves, which matches or beats tuned XGBoost on most

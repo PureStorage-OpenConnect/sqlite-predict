@@ -2532,7 +2532,7 @@ static int bt_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (!is_auto && !fixed_model) {
     int rc = bt_error(cur, PREDICT_ERR_MODEL_NOT_FOUND,
                       "backtest() supports the statistical models "
-                      "(theta-classic, stub-seasonal-naive) or auto: ",
+                      "(theta-classic, stub-seasonal-naive, tsb) or auto: ",
                       opts.model);
     forecast_opts_free(&opts);
     return rc;

@@ -395,6 +395,16 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       return rc;
     }
     if (m.runtime && strcmp(m.runtime, "tree") == 0) {
+      if (train_sql) {
+        /* a student carries its training in its blob; a train_query
+         * here would be silently ignored, so reject it loudly */
+        predict0_model_row_free(&m);
+        rc = pr_error(cur, PREDICT_ERR_OPTIONS,
+                      "a distilled student takes no train_query; pass NULL: ",
+                      model_id);
+        pred_opts_free(&opts);
+        return rc;
+      }
       rc = run_student(cur, db, model_id, apply_sql, &m, &opts);
     } else if (m.runtime && strcmp(m.runtime, "onnx") == 0) {
 #ifdef SQLITE_PREDICT_ONNX
