@@ -19,6 +19,11 @@ SELECT * FROM forecast('SELECT ts, value FROM readings', 24);
 -- ┌────────────┬──────┬──────────────────────┬──────────┬───────┬───────┬────────┬──────────────┐
 -- │ series_key │ step │  forecast_timestamp  │ forecast │  lo   │  hi   │ status │  receipt_id  │
 -- └────────────┴──────┴──────────────────────┴──────────┴───────┴───────┴────────┴──────────────┘
+
+-- or as an aggregate: plain SQL supplies the rows, GROUP BY splits the
+-- series, and each group returns a JSON document. This is the form ORMs
+-- and query builders compose (Drizzle, SQLAlchemy, Diesel).
+SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 ```
 
 None of this ships your data to a cloud model. It runs in-process, on CPU, in
@@ -89,6 +94,15 @@ toolbox: sqlite-vec gave SQLite vector search; this gives it prediction.
 filter, and materialize. Options are a trailing JSON object
 (`'{"group_cols":["region"],"confidence_level":0.9}'`). The interface
 deliberately mirrors BigQuery's `AI.FORECAST`: rows in, rows out.
+
+`forecast` and `detect_anomalies` also register as **aggregate functions**
+under the same names, for callers that compose SQL programmatically: the
+statement supplies the rows (`WHERE`, joins, and bound parameters all work),
+`GROUP BY` replaces `group_cols`, and the receipt embeds the input series so
+it replays even after the source table changes. Expand the returned JSON
+document back to typed rows with `forecast_rows()` / `anomaly_rows()`, or just
+`JSON.parse` it in your app. See [Using with
+ORMs](https://purestorage-openconnect.github.io/sqlite-predict/guides/orms/).
 
 ### Calibrated intervals, auto-selection, and backtesting
 

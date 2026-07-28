@@ -31,4 +31,33 @@ This is what makes an agent's predictions **auditable**: the agent cites the
 receipt id, and anyone can reproduce the number later, or detect that the
 underlying data moved.
 
-Pass `'{"receipt": 0}'` to skip receipt writing on hot paths.
+## Inline-series receipts (the aggregate form)
+
+The [aggregate form](../operations/#two-forms-table-valued-and-aggregate) has
+no query text to re-run, so its receipts embed the input series itself
+(`input_data`), anchored by a digest of that data (`anchor_kind =
+'inline-series'`). That flips the durability trade:
+
+| | query-anchored (table-valued) | inline-series (aggregate) |
+| --- | --- | --- |
+| replay re-runs | the stored query against anchored DB state | the model on the embedded rows |
+| source table changed since | `PREDICT_ERR_ANCHOR_UNAVAILABLE` | **still replays, match = 1** |
+| receipt contains your data | no (query text only) | yes (the numeric series) |
+
+Both behaviors are correct answers to different questions: the query-anchored
+receipt proves "this exact database state produced this number"; the inline
+receipt proves "these exact inputs produced this number" and keeps proving it
+after the table churns. Because the receipt holds a copy of the series, treat
+`_predict_receipts` at the same sensitivity as the data itself, and prune it
+on the usual schedule.
+
+A receipt is written per served group; degraded groups (`insufficient_history`,
+`non_numeric`) return `receipt_id` null since there is no model execution to
+attest.
+
+## Skipping receipts
+
+Pass `'{"receipt": 0}'` to skip receipt writing on hot read paths. On a
+**read-only database** (replicas, `mode=ro` connections), calls that would
+write a receipt fail loudly and name this option as the fix; with it, serving
+works read-only.

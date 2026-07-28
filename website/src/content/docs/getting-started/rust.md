@@ -38,8 +38,15 @@ fn main() -> rusqlite::Result<()> {
     for row in rows {
         println!("{:?}", row?);
     }
+
+    // the aggregate form: plain SQL supplies the rows (WHERE, joins, bound
+    // params compose), and each group returns one JSON document
+    let doc: String = db.query_row(
+        "select forecast(ts, value, 6) from readings", [], |r| r.get(0))?;
+    println!("{doc}");
     Ok(())
 }
 ```
 
-Next: [Operations](../../guides/operations/).
+Next: [Operations](../../guides/operations/), or
+[Using with ORMs](../../guides/orms/) for the Diesel pattern.

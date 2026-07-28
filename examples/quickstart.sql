@@ -40,3 +40,23 @@ SELECT count(*) AS forecasted
 FROM forecast('SELECT ts, value FROM readings', 12);
 SELECT match, detail FROM predict_replay(
   (SELECT receipt_id FROM _predict_receipts ORDER BY created_at DESC LIMIT 1));
+
+.print '\n== the aggregate form: plain SQL supplies the rows (the ORM path) =='
+-- forecast() also works as an aggregate in expression position: WHERE,
+-- joins, and GROUP BY compose, and each group returns one JSON document.
+-- Its receipt embeds the input series ('inline-series'), so it replays
+-- even after the source table changes.
+SELECT json_extract(forecast(ts, value, 6), '$.status')  AS status,
+       json_extract(forecast(ts, value, 6), '$.model')   AS model
+FROM readings;
+
+-- expand the document back to typed rows in SQL
+SELECT r.step, r.forecast_timestamp, round(r.forecast, 1) AS forecast
+FROM forecast_rows((SELECT forecast(ts, value, 6, '{"receipt":0}')
+                    FROM readings)) AS r;
+
+.print '\n== inline receipts survive source churn: mutate, then replay =='
+DELETE FROM readings WHERE rowid % 5 = 0;
+SELECT match, detail FROM predict_replay(
+  (SELECT receipt_id FROM _predict_receipts
+   WHERE anchor_kind = 'inline-series' ORDER BY receipt_id DESC LIMIT 1));

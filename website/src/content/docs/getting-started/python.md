@@ -39,8 +39,21 @@ for step, fc, lo, hi in db.execute(
     print(step, round(fc, 1), round(lo, 1), round(hi, 1))
 ```
 
+The same call also exists as an **aggregate**, where your statement supplies
+the rows and the result is one JSON document per group. This is the form to
+compose from SQLAlchemy and friends:
+
+```python
+import json
+
+doc = json.loads(db.execute(
+    "select forecast(ts, value, 6) from readings").fetchone()[0])
+print(doc["status"], doc["rows"][0])
+```
+
 `sqlite_predict.loadable_path()` returns the path to the loadable if you need to
 load it into another connection library yourself.
 
-Next: [Operations](../../guides/operations/) for what else you can call, or
+Next: [Operations](../../guides/operations/) for what else you can call,
+[Using with ORMs](../../guides/orms/) for SQLAlchemy composition, or
 [Auto-selection & conformal intervals](../../guides/auto-and-conformal/).

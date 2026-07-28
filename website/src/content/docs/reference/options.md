@@ -32,6 +32,21 @@ above, plus:
 | --- | --- | --- | --- |
 | `anomaly_prob_threshold` | number (0,1) | 0.99 | Probability above which a point is flagged. |
 
+## The aggregate forms
+
+The [aggregate forms](../functions/#aggregate-forms) of `forecast` and
+`detect_anomalies` take the same options **minus the query-shape keys**:
+`time_col`, `value_col`, and `group_cols` are rejected with
+`PREDICT_ERR_OPTIONS`, because the argument positions carry the columns and
+`GROUP BY` carries the series split. Everything else applies unchanged
+(`model`, `confidence_level` / `anomaly_prob_threshold`, `interval_method`,
+`folds`, `gap`, `candidates`, `context_limit`, `receipt`).
+
+Two aggregate-only rules: the `options` argument (and `horizon`, for
+`forecast`) must be the same value on every row of a group, and a `SELECT`
+string passed as the first argument is redirected with an error pointing at
+the table-valued form.
+
 ## backtest
 
 `time_col`, `value_col`, `group_cols`, `confidence_level`, `context_limit`,

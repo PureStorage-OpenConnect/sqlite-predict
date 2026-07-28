@@ -12,10 +12,10 @@ programmatically.
 
 | Code | Raised when |
 | --- | --- |
-| `PREDICT_ERR_OPTIONS` | Unknown option key, wrong type, or out-of-range value. |
+| `PREDICT_ERR_OPTIONS` | Unknown option key, wrong type, out-of-range value, or (aggregate form) options varying within a group / a query-shape key. |
 | `PREDICT_ERR_QUERY_NOT_READONLY` | The inner query is not a read-only `SELECT`. |
-| `PREDICT_ERR_SCHEMA` | The query's columns can't be resolved to time/value/target. |
-| `PREDICT_ERR_HORIZON` | Horizon is 0, negative, or above the maximum. |
+| `PREDICT_ERR_SCHEMA` | The query's columns can't be resolved to time/value/target, an expansion function got a malformed document, or a query string was passed to an aggregate form. |
+| `PREDICT_ERR_HORIZON` | Horizon is 0, negative, above the maximum, or (aggregate form) varying within a group. |
 | `PREDICT_ERR_THRESHOLD` | An anomaly threshold is outside (0,1). |
 | `PREDICT_ERR_TARGET` | The `target` column is missing or invalid. |
 | `PREDICT_ERR_TASK` | The task can't be inferred or conflicts with the data. |
@@ -39,7 +39,7 @@ programmatically.
 | Code | Raised when |
 | --- | --- |
 | `PREDICT_ERR_RECEIPT_NOT_FOUND` | `predict_replay` given an unknown receipt id. |
-| `PREDICT_ERR_ANCHOR_UNAVAILABLE` | The anchored data has changed; replay can't be trusted. |
+| `PREDICT_ERR_ANCHOR_UNAVAILABLE` | The anchored data has changed (query-anchored receipts) or an inline-series receipt's embedded data fails its digest check; replay can't be trusted. |
 | `PREDICT_ERR_REPLAY_MISMATCH` | The replayed result hash differs from the original. |
 
 ## Resources

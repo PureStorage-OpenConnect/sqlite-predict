@@ -27,6 +27,10 @@ can cite the number and an auditor can reproduce it byte-for-byte.
 -- forecast a metric 24 steps ahead. rows in, rows out.
 SELECT step, forecast, lower_bound, upper_bound
 FROM forecast('SELECT ts, value FROM readings', 24);
+
+-- or as an aggregate: plain SQL supplies the rows, GROUP BY splits
+-- the series. This is the form ORMs and query builders compose.
+SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 ```
 
 <CardGrid>

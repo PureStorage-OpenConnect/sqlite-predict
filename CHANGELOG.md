@@ -8,6 +8,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Aggregate forms of `forecast` and `detect_anomalies`** (RFC 0005 §4.2.8),
+  registered under the same names and resolved by position: FROM clause =
+  table-valued, expression position = aggregate. The statement supplies the
+  rows (`forecast(ts, value, horizon[, options])`), so WHERE / joins / bound
+  parameters compose and `GROUP BY` replaces `group_cols`; input rows are
+  sorted by `ts` internally, killing the ORDER BY footgun. Each group returns
+  one JSON document (`model`, `receipt_id`, `status`, `rows`), expandable back
+  to typed rows with the new `forecast_rows()` / `anomaly_rows()` table-valued
+  functions. This is the ORM-native interface: Drizzle and SQLAlchemy smoke
+  tests run in CI, and a "Using with ORMs" guide covers Drizzle, SQLAlchemy,
+  Diesel, Prisma, and the `_predict_*` migration-diff exclusions.
+- **Inline-series receipts.** Aggregate-form receipts embed the input series
+  (`input_data`, `anchor_kind='inline-series'`, anchored by a digest of the
+  embedded rows), because no query text exists to re-derive them. They replay
+  independent of database state: `predict_replay` reproduces the result after
+  the source table has churned, which query-anchored receipts cannot.
+  Conformance invariants, both tested: an aggregate call and a single-series
+  table-valued call over identical rows produce identical result hashes, and
+  an inline receipt replays with match = 1 after source mutation. Receipts
+  are written only for series the model actually served; degraded series
+  return `receipt_id` null. The aggregates register `SQLITE_DIRECTONLY` so
+  the receipt side effect cannot fire from views or triggers.
+
+- **`_predict_receipts` schema change** (breaking, pre-alpha): `input_sql` is
+  now nullable, `input_data` added, `anchor_kind` CHECK gains
+  `'inline-series'`, and exactly one of `input_sql`/`input_data` must be set.
+  Databases created by earlier alphas keep working for the table-valued forms
+  (the new column is added idempotently), but aggregate-form receipts on an
+  old table fail its old CHECK; drop `_predict_receipts` to upgrade.
 - `forecast()`, `detect_anomalies()`, `predict()`, `distill_predict()`, and
   `backtest()` table-valued functions with a trailing JSON options argument.
 - **Auto model selection, conformal intervals, and `backtest()`.**

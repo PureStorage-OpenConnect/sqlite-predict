@@ -17,6 +17,29 @@ trailing JSON object, e.g. `'{"group_cols":["region"],"confidence_level":0.9}'`.
 | `distill_forecast(train_query [, options])` | Compress a forecast model into a student | a registered native forecast model |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag from re-running the recorded call |
 
+## Two forms: table-valued and aggregate
+
+`forecast` and `detect_anomalies` each have two forms under one name, resolved
+by where the call appears:
+
+```sql
+-- table-valued (FROM position): quick sessions, query-anchored receipts
+SELECT * FROM forecast('SELECT ts, value FROM readings', 24);
+
+-- aggregate (expression position): the statement supplies the rows
+SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
+```
+
+**Use the table-valued form** for CLI one-liners and when you want the receipt
+anchored to a re-runnable query against database state. **Use the aggregate
+form** from application code and ORMs: rows flow in through ordinary SQL (with
+`WHERE`, joins, and bound parameters), `GROUP BY` replaces `group_cols`, input
+order never matters (it sorts by `ts` internally), and the receipt embeds the
+input series so it [replays even after the source table
+changes](../receipts/#inline-series-receipts-the-aggregate-form). The aggregate
+returns one JSON document per group; parse it in your app or expand it with
+`forecast_rows()` / `anomaly_rows()`. See [Using with ORMs](../orms/).
+
 ## Column inference
 
 `forecast()` and `detect_anomalies()` infer the time column (an integer epoch or

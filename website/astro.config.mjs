@@ -55,6 +55,7 @@ export default defineConfig({
               link: "/guides/auto-and-conformal/",
             },
             { label: "Backtesting", link: "/guides/backtesting/" },
+            { label: "Using with ORMs", link: "/guides/orms/" },
             { label: "Receipts & replay", link: "/guides/receipts/" },
             { label: "Distillation", link: "/guides/distillation/" },
           ],
