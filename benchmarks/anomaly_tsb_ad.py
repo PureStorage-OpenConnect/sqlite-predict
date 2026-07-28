@@ -54,7 +54,7 @@ def score(vals):
     opts = "'model','%s'," % MODEL if MODEL else ""
     rows = db.execute(
         "SELECT anomaly_probability FROM detect_anomalies("
-        "'SELECT ts,value FROM a ORDER BY rn', json_object(%s'receipt',0))" % opts
+        "'SELECT ts,value FROM a ORDER BY rn', json_object(%s))" % opts
     ).fetchall()
     return np.array([r[0] if r[0] is not None else 0.0 for r in rows], float)
 

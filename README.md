@@ -211,10 +211,12 @@ derived from its teacher, and some model licenses restrict that: TabFM's
 non-commercial license, for example, permits testing and evaluation (which
 is what our benchmarks are) but expressly excludes distilling it for
 commercial use or deploying its outputs in production. Chronos is
-Apache-2.0; TabPFN's Prior Labs License permits distillation, including
+Apache-2.0. TabPFN is version-dependent: the TabPFN-2 weights are under
+the Prior Labs License, which permits distillation, including
 commercially, if you attribute ("Built with PriorLabs-TabPFN" and a
-TabPFN-prefixed model name) when you distribute the student; your own
-labels or models carry no such limits. The
+TabPFN-prefixed model name) when you distribute the student, while the
+later TabPFN-2.5/2.6/3 weights are non-commercial. Your own labels or
+models carry no such limits. The
 extension's license gate (`accept_license`) makes a restrictively-licensed
 teacher an explicit opt-in rather than an accident, but checking that your
 use fits the teacher's license is on you.

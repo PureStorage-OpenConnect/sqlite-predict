@@ -137,7 +137,7 @@ def distill_one(rows, feats, base, target_idx, std, nfeat):
                    [[k] + list(map(float, f)) for k, f in enumerate(feats)])
     out = db.execute(
         f"SELECT row_ref, prediction FROM predict(NULL, 'SELECT id, {fl} FROM"
-        f" te', json_object('model','s','receipt',0)) ORDER BY row_ref").fetchall()
+        f" te', json_object('model','s')) ORDER BY row_ref").fetchall()
     db.close()
     return np.array([float(r[1]) for r in out]) * std + base, blob
 

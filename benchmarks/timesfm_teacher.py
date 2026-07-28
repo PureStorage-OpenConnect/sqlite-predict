@@ -79,7 +79,7 @@ def serve(model):
                        [(t.isoformat(), float(v)) for t, v in zip(idx, hist)])
         fc = [r[0] for r in db.execute(
             "SELECT forecast FROM forecast('SELECT ts,value FROM q',?,"
-            "json_object('model',?,'confidence_level',0.8,'receipt',0))",
+            "json_object('model',?,'confidence_level',0.8))",
             (H, model)).fetchall()]
         out.append(mase(np.array(fc), truth[:len(fc)], hist, M))
     return float(np.mean(out))
@@ -94,7 +94,7 @@ db.execute("CREATE TABLE s(series_key INTEGER, t INTEGER, value REAL)")
 db.executemany("INSERT INTO s VALUES (?,?,?)", rows)
 t0 = time.time()
 opts = json.dumps({"teacher": "timesfm-onnx", "context": L, "horizon": H,
-                   "student_id": "tf", "epochs": EPOCHS, "receipt": 0})
+                   "student_id": "tf", "epochs": EPOCHS})
 mid, trows = db.execute(
     "SELECT model_id, train_rows FROM distill_forecast("
     "'SELECT series_key, value FROM s ORDER BY series_key, t', json(?))",

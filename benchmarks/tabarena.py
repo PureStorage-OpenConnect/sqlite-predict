@@ -244,7 +244,7 @@ def run_ours_distill_teacher(Xtr, teacher_tr, Xte, task, kind="gbt"):
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
         f"SELECT row_ref, prediction FROM predict(NULL, 'SELECT id, {feats}"
-        f" FROM te', json_object('model','s','receipt',0)) ORDER BY row_ref"
+        f" FROM te', json_object('model','s')) ORDER BY row_ref"
     ).fetchall()
     db.close()
     return [r[1] for r in rows], blob, hold
@@ -280,7 +280,7 @@ def run_ours_distill_soft(Xtr, ytr, proba, classes, Xte, kind="gbt"):
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
         f"SELECT row_ref, prediction FROM predict(NULL,'SELECT id, {fl} FROM"
-        f" te', json_object('model','s','receipt',0)) ORDER BY row_ref"
+        f" te', json_object('model','s')) ORDER BY row_ref"
     ).fetchall()
     db.close()
     return [r[1] for r in rows], blob, hold
@@ -330,7 +330,7 @@ def run_ours_knn5(Xtr, ytr, Xte, task):
     rows = db.execute(
         f"SELECT row_ref, prediction FROM predict('SELECT {feats}, label FROM"
         f" tr', 'SELECT id, {feats} FROM te', json_object('target','label',"
-        f"'task',?,'receipt',0)) ORDER BY row_ref",
+        f"'task',?)) ORDER BY row_ref",
         ("classify" if task == "cls" else "regress",)).fetchall()
     db.close()
     return [r[1] for r in rows]
@@ -350,7 +350,7 @@ def run_ours_distill(Xtr, ytr, Xte, task, kind="tree"):
                       " model_id='s'").fetchone()[0]
     rows = db.execute(
         f"SELECT row_ref, prediction FROM predict(NULL, 'SELECT id, {feats}"
-        f" FROM te', json_object('model','s','receipt',0)) ORDER BY row_ref"
+        f" FROM te', json_object('model','s')) ORDER BY row_ref"
     ).fetchall()
     db.close()
     return [r[1] for r in rows], blob, hold

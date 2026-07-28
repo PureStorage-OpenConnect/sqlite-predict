@@ -74,7 +74,7 @@ def main():
     db.executemany(f"INSERT INTO w VALUES ({','.join('?' * ncol)})",
                    [list(map(float, r)) for r in rows])
     cols = ",".join(f"c{i}" for i in range(ncol))
-    opts = json.dumps({"context": L, "horizon": H, "student_id": "f", "receipt": 0})
+    opts = json.dumps({"context": L, "horizon": H, "student_id": "f"})
     t0 = time.time()
     mid, trows, rmse = db.execute(
         f"SELECT model_id, train_rows, train_rmse FROM distill_forecast("
@@ -84,7 +84,7 @@ def main():
     print(f"distilled '{mid}' on {trows} windows in {time.time()-t0:.0f}s "
           f"(holdout rmse {rmse:.3f}, blob {blob} B)")
 
-    sopts = json.dumps({"model": "f", "receipt": 0})
+    sopts = json.dumps({"model": "f"})
     native, snaive, chronos = [], [], []
     for tb in tests:
         hist, truth = tb["hist"], tb["truth"]

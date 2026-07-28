@@ -55,7 +55,7 @@ def run_extension_model(model, train, horizon):
     db.enable_load_extension(True)
     db.load_extension(EXT)
     syn.load_into(db, train)
-    opts = json.dumps({"model": model, "receipt": 0})
+    opts = json.dumps({"model": model})
     t0 = time.perf_counter()
     rows = db.execute(
         "SELECT forecast, lower_bound, upper_bound FROM"

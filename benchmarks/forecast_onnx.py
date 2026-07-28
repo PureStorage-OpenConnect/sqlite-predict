@@ -74,7 +74,7 @@ def main():
         r = np.array(db.execute(
             "SELECT forecast, lower_bound, upper_bound FROM forecast("
             "'SELECT ts, value FROM s', ?, json_object('model','chronos-onnx',"
-            "'confidence_level',0.8,'receipt',0))", (H,)).fetchall())
+            "'confidence_level',0.8))", (H,)).fetchall())
         onx["mase"].append(mase(r[:, 0], truth, hist, M))
         c, wk = cov_winkler(r[:, 1], r[:, 2], truth, alpha=0.2)
         onx["cov"].append(c)

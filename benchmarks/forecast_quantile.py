@@ -86,7 +86,7 @@ def main():
                    [list(map(float, r)) for r in rows])
     cols = ",".join(f"c{i}" for i in range(ncol))
     opts = json.dumps({"context": L, "horizon": H, "student_id": "qf",
-                       "receipt": 0, "quantiles": QLEV})
+                       "quantiles": QLEV})
     t0 = time.time()
     mid, tr, rmse = db.execute(
         f"SELECT model_id, train_rows, train_rmse FROM distill_forecast("
@@ -100,7 +100,7 @@ def main():
         idx = pd.date_range("2020-01-01", periods=len(hist), freq="h")
         db.executemany("INSERT INTO s VALUES (?,?)",
                        [(t.isoformat(), float(v)) for t, v in zip(idx, hist)])
-        o = json.dumps({"model": "qf", "confidence_level": conf, "receipt": 0})
+        o = json.dumps({"model": "qf", "confidence_level": conf})
         return np.array(db.execute(
             "SELECT forecast, lower_bound, upper_bound FROM forecast("
             "'SELECT ts, value FROM s', ?, ?)", (H, o)).fetchall())

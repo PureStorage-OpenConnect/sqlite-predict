@@ -81,7 +81,7 @@ def run_ext(model, hist, start, freq, h):
     idx = pd.period_range(start=start, periods=len(hist), freq=freq).to_timestamp()
     db.executemany("INSERT INTO series VALUES (?,?)",
                    [(t.isoformat(), float(v)) for t, v in zip(idx, hist)])
-    opts = json.dumps({"model": model, "confidence_level": 0.95, "receipt": 0})
+    opts = json.dumps({"model": model, "confidence_level": 0.95})
     rows = db.execute(
         "SELECT forecast, lower_bound, upper_bound FROM forecast('SELECT ts,"
         " value FROM series', ?, ?)", (h, opts)).fetchall()

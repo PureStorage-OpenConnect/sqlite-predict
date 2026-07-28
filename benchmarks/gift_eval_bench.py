@@ -113,7 +113,7 @@ def train_student(db, name, ys, H, m, L, si_eval):
     except sqlite3.OperationalError:
         pass
     opts = json.dumps({"context": L, "horizon": H, "student_id": "qf",
-                       "receipt": 0, "quantiles": QLEV, "epochs": 800})
+                       "quantiles": QLEV, "epochs": 800})
     db.execute(f"SELECT model_id FROM distill_forecast('SELECT {cols} FROM w',"
                " json(?))", (opts,)).fetchone()
     return True
@@ -128,7 +128,7 @@ def serve_student(db, hist, H):
     dec = np.zeros((H, Q))
     for conf, (a, b) in [(0.8, (0, 8)), (0.6, (1, 7)), (0.4, (2, 6)),
                          (0.2, (3, 5))]:
-        o = json.dumps({"model": "qf", "confidence_level": conf, "receipt": 0})
+        o = json.dumps({"model": "qf", "confidence_level": conf})
         r = np.array(db.execute("SELECT forecast, lower_bound, upper_bound FROM"
                                 " forecast('SELECT ts, value FROM s', ?, ?)",
                                 (H, o)).fetchall())
