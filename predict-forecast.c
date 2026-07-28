@@ -1519,6 +1519,458 @@ static int collect_series(sqlite3 *db, const char *query,
 #undef COLLECT_FAIL
 }
 
+/* Resolved backing-model context for one forecast call. Shared by the
+ * query form (fc_filter) and the aggregate form; resolution, serving,
+ * hashing, and params-building below are the one implementation of the
+ * pipeline both forms run after their rows are collected. */
+typedef struct {
+  int is_auto;
+  predict0_ts_model model; /* NULL for auto/student/onnx */
+  ForecastStudent fstudent;
+  int have_fstudent;
+  int have_onnx;
+#ifdef SQLITE_PREDICT_ONNX
+  predict0_model_row onnx_row;
+#endif
+  Candidate *cands;
+  int n_cands;
+} FcModels;
+
+static void fc_models_free(FcModels *mc) {
+  for (int ci = 0; ci < mc->n_cands; ci++)
+    if (mc->cands[ci].is_student)
+      fcst_student_free(&mc->cands[ci].student);
+  sqlite3_free(mc->cands);
+  if (mc->have_fstudent)
+    fcst_student_free(&mc->fstudent);
+#ifdef SQLITE_PREDICT_ONNX
+  if (mc->have_onnx)
+    predict0_model_row_free(&mc->onnx_row);
+#endif
+  memset(mc, 0, sizeof(*mc));
+}
+
+/* Resolve opts->model (+ any candidates pool) into an FcModels. On
+ * failure frees partial state and sets *errmsg ("CODE: detail"). */
+static int fc_resolve_models(sqlite3 *db, const ForecastOpts *opts,
+                             int horizon, FcModels *mc, char **errmsg) {
+  memset(mc, 0, sizeof(*mc));
+  mc->is_auto = opts->model && strcmp(opts->model, "auto") == 0;
+  mc->model = mc->is_auto ? NULL : resolve_ts_model(opts->model);
+  if (!mc->is_auto && !mc->model) {
+    /* not a bundled model: maybe a registered forecast student (PSFCST) */
+    char *lerr = NULL;
+    int lr = load_fcst_student(db, opts->model, &mc->fstudent, &lerr);
+    sqlite3_free(lerr);
+    if (lr < 0) {
+      *errmsg = sqlite3_mprintf("%s: invalid forecast student: %s",
+                                PREDICT_ERR_SCHEMA, opts->model);
+      return SQLITE_ERROR;
+    }
+    if (lr == 1) {
+      mc->have_fstudent = 1;
+      if (horizon > mc->fstudent.horizon) {
+        fc_models_free(mc);
+        *errmsg = sqlite3_mprintf(
+            "%s: horizon exceeds the forecast student's trained horizon",
+            PREDICT_ERR_HORIZON);
+        return SQLITE_ERROR;
+      }
+    } else { /* not a native student: maybe a registered onnx forecast model */
+      predict0_model_row row;
+      int rl = predict0_registry_lookup(db, opts->model, &row);
+      int is_onnx = rl == 0 && row.runtime && strcmp(row.runtime, "onnx") == 0;
+      if (!is_onnx) {
+        if (rl == 0)
+          predict0_model_row_free(&row);
+        *errmsg = sqlite3_mprintf("%s: no such model: %s",
+                                  PREDICT_ERR_MODEL_NOT_FOUND, opts->model);
+        return SQLITE_ERROR;
+      }
+#ifdef SQLITE_PREDICT_ONNX
+      mc->onnx_row = row; /* ownership; freed by fc_models_free */
+      mc->have_onnx = 1;
+#else
+      predict0_model_row_free(&row);
+      *errmsg =
+          sqlite3_mprintf("%s: onnx runtime is not in this build: %s",
+                          PREDICT_ERR_RUNTIME_UNAVAILABLE, opts->model);
+      return SQLITE_ERROR;
+#endif
+    }
+  }
+
+  if (opts->interval_conformal && (mc->have_fstudent || mc->have_onnx)) {
+    fc_models_free(mc);
+    *errmsg = sqlite3_mprintf(
+        "%s: interval_method='conformal' is only supported for the "
+        "statistical models (theta-classic, stub-seasonal-naive, auto)",
+        PREDICT_ERR_OPTIONS);
+    return SQLITE_ERROR;
+  }
+
+  /* auto over an explicit candidate set: resolve the statistical models +
+   * distilled forecast students (validated) */
+  if (opts->n_candidates > 0) {
+    if (!mc->is_auto) {
+      fc_models_free(mc);
+      *errmsg = sqlite3_mprintf("%s: candidates requires model=\"auto\"",
+                                PREDICT_ERR_OPTIONS);
+      return SQLITE_ERROR;
+    }
+    int crc =
+        resolve_candidates(db, opts, horizon, &mc->cands, &mc->n_cands, errmsg);
+    if (crc != SQLITE_OK) {
+      mc->n_cands = 0;
+      mc->cands = NULL;
+      fc_models_free(mc);
+      return crc;
+    }
+  }
+  return SQLITE_OK;
+}
+
+/* the receipt's model_id for a resolved forecast call */
+static const char *fc_model_id(const ForecastOpts *opts, const FcModels *mc) {
+  if (mc->is_auto)
+    return "auto";
+  if (mc->have_fstudent || mc->have_onnx)
+    return opts->model;
+  return resolve_ts_model_id(opts->model);
+}
+
+/* Forecast every collected series into ForecastRow output rows
+ * (sqlite3_malloc'd into *rows_out). Returns SQLITE_OK, SQLITE_NOMEM,
+ * or an error with *serve_err set ("CODE: detail", a registered model
+ * failing mid-serve); on any failure the partial rows are freed here
+ * and *rows_out is NULL. */
+static int fc_run_series(sqlite3 *db, SeriesBuf *series, int n_series,
+                         int horizon, const ForecastOpts *opts, FcModels *mc,
+                         ForecastRow **rows_out, int *n_rows_out,
+                         char **serve_err) {
+  UNUSED_PARAMETER(db); /* used by the onnx serving branch only */
+  *rows_out = NULL;
+  *n_rows_out = 0;
+  *serve_err = NULL;
+  int rc = SQLITE_OK;
+
+  f64 z = predict0_norm_quantile(0.5 + opts->confidence / 2);
+  int max_rows = 0;
+  for (int i = 0; i < n_series; i++)
+    max_rows += series[i].non_numeric || series[i].n < FORECAST_MIN_HISTORY
+                    ? 1
+                    : horizon;
+
+  ForecastRow *rows =
+      sqlite3_malloc(sizeof(ForecastRow) * (max_rows ? max_rows : 1));
+  int n_rows = 0;
+  if (!rows)
+    rc = SQLITE_NOMEM;
+
+  f64 *fc = sqlite3_malloc(sizeof(f64) * horizon);
+  f64 *sg = sqlite3_malloc(sizeof(f64) * horizon);
+  f64 *lo = sqlite3_malloc(sizeof(f64) * horizon);
+  f64 *hi = sqlite3_malloc(sizeof(f64) * horizon);
+
+  /* rolling-origin scratch: bt_* for default auto-selection and conformal,
+   * cand_fc for candidate-set selection */
+  int folds_req = opts->folds > 0 ? opts->folds : FORECAST_DEFAULT_FOLDS;
+  int need_bt =
+      (mc->is_auto && opts->n_candidates == 0) || opts->interval_conformal;
+  f64 *bt_act = NULL, *bt_fcst = NULL, *bt_col = NULL, *bt_q = NULL;
+  if (need_bt) {
+    bt_act = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
+    bt_fcst = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
+    bt_col = sqlite3_malloc(sizeof(f64) * folds_req);
+    bt_q = sqlite3_malloc(sizeof(f64) * horizon);
+    if (!bt_act || !bt_fcst || !bt_col || !bt_q)
+      rc = SQLITE_NOMEM;
+  }
+  f64 *cand_fc = NULL;
+  if (mc->n_cands > 0) {
+    cand_fc = sqlite3_malloc(sizeof(f64) * ((size_t)opts->gap + horizon));
+    if (!cand_fc)
+      rc = SQLITE_NOMEM;
+  }
+
+  for (int i = 0; rows && fc && sg && lo && hi &&
+                  (!need_bt || (bt_act && bt_fcst && bt_col && bt_q)) &&
+                  (mc->n_cands == 0 || cand_fc) && i < n_series;
+       i++) {
+    SeriesBuf *s = &series[i];
+    const char *status = NULL;
+    if (s->non_numeric)
+      status = "non_numeric";
+    else if (s->n < FORECAST_MIN_HISTORY)
+      status = "insufficient_history";
+
+    if (status) {
+      ForecastRow *r = &rows[n_rows++];
+      memset(r, 0, sizeof(*r));
+      r->series_key = sqlite3_mprintf("%s", s->key);
+      r->status = status;
+      continue;
+    }
+
+    series_sort(s);
+    int truncated = 0;
+    f64 *y = s->val;
+    i64 *ts = s->ts;
+    int n = s->n;
+    if (opts->context_limit > 0 && n > opts->context_limit) {
+      y += n - opts->context_limit;
+      ts += n - opts->context_limit;
+      n = opts->context_limit;
+      truncated = 1;
+    }
+
+    /* median step from sorted timestamps */
+    i64 step_ms = PREDICT_MS_PER_HOUR;
+    if (n > 1) {
+      i64 span = ts[n - 1] - ts[0];
+      step_ms = span > 0 ? span / (n - 1) : PREDICT_MS_PER_HOUR;
+    }
+
+    if (mc->have_fstudent) {
+      if (fcst_run(&mc->fstudent, y, n, horizon, opts->confidence, fc, lo,
+                   hi) != SQLITE_OK)
+        rc = SQLITE_NOMEM;
+    } else if (mc->have_onnx) {
+#ifdef SQLITE_PREDICT_ONNX
+      predict0_backend_opts bopts = {NULL, NULL, NULL, 0};
+      int orc =
+          predict0_onnx_forecast(db, &mc->onnx_row, &bopts, y, n, horizon,
+                                 opts->confidence, fc, lo, hi, serve_err);
+      if (orc != SQLITE_OK) {
+        rc = orc;
+        break; /* serve_err carries the message */
+      }
+#endif
+    } else {
+      predict0_ts_model use_model = mc->model;
+      const ForecastStudent *win_student = NULL;
+      if (mc->is_auto && mc->n_cands > 0) {
+        /* rank the explicit candidate set (stat models + students) per series */
+        int best = -1;
+        f64 best_mae = 0;
+        for (int ci = 0; ci < mc->n_cands; ci++) {
+          int cnf = 0;
+          f64 mae = candidate_mae(&mc->cands[ci], y, n, horizon, opts->gap,
+                                  folds_req, cand_fc, &cnf);
+          if (mae < 0) {
+            rc = SQLITE_NOMEM;
+            break;
+          }
+          if (cnf == 0)
+            continue; /* candidate could not be backtested on this series */
+          if (best < 0 || mae < best_mae) {
+            best = ci;
+            best_mae = mae;
+          }
+        }
+        if (rc != SQLITE_OK)
+          break;
+        if (best < 0) { /* no candidate had a usable fold */
+          ForecastRow *r = &rows[n_rows++];
+          memset(r, 0, sizeof(*r));
+          r->series_key = sqlite3_mprintf("%s", s->key);
+          r->status = "insufficient_history";
+          continue;
+        }
+        if (mc->cands[best].is_student)
+          win_student = &mc->cands[best].student;
+        else
+          use_model = mc->cands[best].stat;
+      } else if (mc->is_auto) {
+        int bi = ts_auto_select(y, ts, n, horizon, opts->gap, folds_req,
+                                naive_scale(y, n), bt_act, bt_fcst);
+        if (bi <= -2) { /* negative SQLITE code (OOM) */
+          rc = SQLITE_NOMEM;
+          break;
+        }
+        /* bi == -1: series too short to backtest -> default to theta */
+        use_model = bi >= 0 ? TS_MODELS[bi].run : model_theta;
+      }
+      if (win_student) {
+        if (fcst_run(win_student, y, n, horizon, opts->confidence, fc, lo,
+                     hi) != SQLITE_OK) {
+          rc = SQLITE_NOMEM;
+          break;
+        }
+      } else if (opts->interval_conformal) {
+        int nf = ts_conformal_q(use_model, y, ts, n, horizon, opts->gap,
+                                folds_req, opts->confidence, bt_act, bt_fcst,
+                                bt_col, bt_q);
+        if (nf <= -2) {
+          rc = SQLITE_NOMEM;
+          break;
+        }
+        if (nf < CONFORMAL_MIN_FOLDS) { /* cannot calibrate honestly */
+          ForecastRow *r = &rows[n_rows++];
+          memset(r, 0, sizeof(*r));
+          r->series_key = sqlite3_mprintf("%s", s->key);
+          r->status = "insufficient_history";
+          continue;
+        }
+        use_model(y, n, horizon, fc, NULL); /* point-only */
+        for (int h = 0; h < horizon; h++) {
+          lo[h] = fc[h] - bt_q[h];
+          hi[h] = fc[h] + bt_q[h];
+        }
+      } else {
+        use_model(y, n, horizon, fc, sg);
+        for (int h = 0; h < horizon; h++) { /* symmetric Gaussian interval */
+          lo[h] = fc[h] - z * sg[h];
+          hi[h] = fc[h] + z * sg[h];
+        }
+      }
+    }
+    for (int h = 1; h <= horizon; h++) {
+      ForecastRow *r = &rows[n_rows++];
+      memset(r, 0, sizeof(*r));
+      r->series_key = sqlite3_mprintf("%s", s->key);
+      r->step = h;
+      predict0_format_timestamp(ts[n - 1] + step_ms * h, r->ts, sizeof(r->ts));
+      r->forecast = fc[h - 1];
+      r->lower = lo[h - 1];
+      r->upper = hi[h - 1];
+      r->status = truncated ? "truncated" : "ok";
+      r->has_values = 1;
+    }
+  }
+
+  sqlite3_free(fc);
+  sqlite3_free(sg);
+  sqlite3_free(lo);
+  sqlite3_free(hi);
+  sqlite3_free(bt_act);
+  sqlite3_free(bt_fcst);
+  sqlite3_free(bt_col);
+  sqlite3_free(bt_q);
+  sqlite3_free(cand_fc);
+
+  if (rc != SQLITE_OK || *serve_err) {
+    for (int i = 0; i < n_rows; i++)
+      sqlite3_free(rows[i].series_key);
+    sqlite3_free(rows);
+    return rc == SQLITE_OK ? SQLITE_ERROR : rc;
+  }
+  *rows_out = rows;
+  *n_rows_out = n_rows;
+  return SQLITE_OK;
+}
+
+/* RFC §4.1.3 result hash over rows sorted by (series_key, step).
+ * Returns SQLITE_OK or SQLITE_NOMEM. */
+static int fc_result_hash(ForecastRow *rows, int n_rows,
+                          char out[PREDICT_HEX_BUFSIZE]) {
+  ForecastRow **order =
+      sqlite3_malloc(sizeof(ForecastRow *) * (n_rows ? n_rows : 1));
+  if (!order)
+    return SQLITE_NOMEM;
+  for (int i = 0; i < n_rows; i++)
+    order[i] = &rows[i];
+  qsort(order, (usize)n_rows, sizeof(ForecastRow *), forecast_row_cmp);
+  predict0_hasher h;
+  predict0_hash_init(&h);
+  for (int i = 0; i < n_rows; i++) {
+    ForecastRow *r = order[i];
+    predict0_hash_text(&h, r->series_key);
+    if (r->has_values) {
+      predict0_hash_int(&h, r->step);
+      predict0_hash_text(&h, r->ts);
+      predict0_hash_real(&h, r->forecast);
+      predict0_hash_real(&h, r->lower);
+      predict0_hash_real(&h, r->upper);
+    } else {
+      for (int k = 0; k < 5; k++)
+        predict0_hash_null(&h);
+    }
+    predict0_hash_row_end(&h);
+  }
+  sqlite3_free(order);
+  predict0_hash_hex(&h, out);
+  return SQLITE_OK;
+}
+
+/* Canonical receipt params via json_object (keys alphabetical).
+ * agg_form omits the query-shape keys (time_col/value_col/group_cols),
+ * which do not exist in the aggregate form (RFC §4.2.8). Returns a
+ * sqlite3_malloc'd JSON string or NULL. */
+static char *fc_build_params(sqlite3 *db, const ForecastOpts *opts,
+                             int horizon, const char *model_id,
+                             const char *time_col, const char *value_col,
+                             int agg_form) {
+  char group_json[600] = "";
+  if (opts->n_group_cols) {
+    usize gl = 0;
+    gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl, "[");
+    for (int g = 0; g < opts->n_group_cols && gl < sizeof(group_json) - 4; g++)
+      gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl,
+                            "%s\"%s\"", g ? "," : "", opts->group_cols[g]);
+    snprintf(group_json + gl, sizeof(group_json) - gl, "]");
+  }
+  char cand_json[600] = "";
+  if (opts->n_candidates) {
+    usize cl = 0;
+    cl += (usize)snprintf(cand_json + cl, sizeof(cand_json) - cl, "[");
+    for (int g = 0; g < opts->n_candidates && cl < sizeof(cand_json) - 4; g++)
+      cl += (usize)snprintf(cand_json + cl, sizeof(cand_json) - cl, "%s\"%s\"",
+                            g ? "," : "", opts->candidates[g]);
+    snprintf(cand_json + cl, sizeof(cand_json) - cl, "]");
+  }
+  sqlite3_stmt *pj = NULL;
+  char *params = NULL;
+  const char *sql =
+      agg_form
+          ? "SELECT json_object("
+            " 'candidates', CASE WHEN ?11 = '' THEN NULL ELSE json(?11) END,"
+            " 'confidence_level', ?1, 'context_limit', ?2,"
+            " 'folds', ?3, 'gap', ?4,"
+            " 'horizon', ?6, 'interval_method', ?7, 'model', ?8,"
+            " 'receipt', 1)"
+          : "SELECT json_object("
+            " 'candidates', CASE WHEN ?11 = '' THEN NULL ELSE json(?11) END,"
+            " 'confidence_level', ?1, 'context_limit', ?2,"
+            " 'folds', ?3, 'gap', ?4,"
+            " 'group_cols', CASE WHEN ?5 = '' THEN NULL ELSE json(?5) END,"
+            " 'horizon', ?6, 'interval_method', ?7, 'model', ?8,"
+            " 'receipt', 1, 'time_col', ?9, 'value_col', ?10)";
+  if (sqlite3_prepare_v2(db, sql, -1, &pj, NULL) == SQLITE_OK) {
+    sqlite3_bind_double(pj, 1, opts->confidence);
+    if (opts->context_limit > 0)
+      sqlite3_bind_int(pj, 2, opts->context_limit);
+    else
+      sqlite3_bind_null(pj, 2);
+    if (opts->folds > 0)
+      sqlite3_bind_int(pj, 3, opts->folds);
+    else
+      sqlite3_bind_null(pj, 3);
+    if (opts->gap > 0)
+      sqlite3_bind_int(pj, 4, opts->gap);
+    else
+      sqlite3_bind_null(pj, 4);
+    if (!agg_form)
+      sqlite3_bind_text(pj, 5, group_json, -1, SQLITE_STATIC);
+    sqlite3_bind_int(pj, 6, horizon);
+    sqlite3_bind_text(pj, 7,
+                      opts->interval_conformal ? "conformal" : "residual", -1,
+                      SQLITE_STATIC);
+    sqlite3_bind_text(pj, 8, model_id, -1, SQLITE_STATIC);
+    if (!agg_form) {
+      if (time_col)
+        sqlite3_bind_text(pj, 9, time_col, -1, SQLITE_STATIC);
+      if (value_col)
+        sqlite3_bind_text(pj, 10, value_col, -1, SQLITE_STATIC);
+    }
+    sqlite3_bind_text(pj, 11, cand_json, -1, SQLITE_STATIC);
+    if (sqlite3_step(pj) == SQLITE_ROW)
+      params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
+    sqlite3_finalize(pj);
+  }
+  return params;
+}
+
 static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                      const char *idxStr, int argc, sqlite3_value **argv) {
   UNUSED_PARAMETER(idxNum);
@@ -1561,96 +2013,13 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     return SQLITE_ERROR;
   }
 
-  int is_auto = opts.model && strcmp(opts.model, "auto") == 0;
-  predict0_ts_model model = is_auto ? NULL : resolve_ts_model(opts.model);
-  ForecastStudent fstudent;
-  int have_fstudent = 0, have_onnx = 0;
-  char *serve_err = NULL; /* an error surfaced from serving a registered model */
-#ifdef SQLITE_PREDICT_ONNX
-  predict0_model_row onnx_row;
-#endif
-  if (!is_auto && !model) {
-    /* not a bundled model: maybe a registered forecast student (PSFCST) */
-    char *lerr = NULL;
-    int lr = load_fcst_student(db, opts.model, &fstudent, &lerr);
-    if (lr < 0) {
-      int rc = fc_error(cur, PREDICT_ERR_SCHEMA, "invalid forecast student: ",
-                        opts.model);
-      sqlite3_free(lerr);
-      forecast_opts_free(&opts);
-      return rc;
-    }
-    if (lr == 1) {
-      have_fstudent = 1;
-      if (horizon > fstudent.horizon) {
-        fcst_student_free(&fstudent);
-        int rc =
-            fc_error(cur, PREDICT_ERR_HORIZON,
-                     "horizon exceeds the forecast student's trained horizon",
-                     NULL);
-        forecast_opts_free(&opts);
-        return rc;
-      }
-    } else { /* not a native student: maybe a registered onnx forecast model */
-      predict0_model_row row;
-      int rl = predict0_registry_lookup(db, opts.model, &row);
-      int is_onnx = rl == 0 && row.runtime && strcmp(row.runtime, "onnx") == 0;
-      if (!is_onnx) {
-        if (rl == 0)
-          predict0_model_row_free(&row);
-        int rc = fc_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
-                          opts.model);
-        forecast_opts_free(&opts);
-        return rc;
-      }
-#ifdef SQLITE_PREDICT_ONNX
-      onnx_row = row; /* ownership; freed after the serving loop */
-      have_onnx = 1;
-#else
-      predict0_model_row_free(&row);
-      int rc = fc_error(cur, PREDICT_ERR_RUNTIME_UNAVAILABLE,
-                        "onnx runtime is not in this build: ", opts.model);
-      forecast_opts_free(&opts);
-      return rc;
-#endif
-    }
-  }
-
-  if (opts.interval_conformal && (have_fstudent || have_onnx)) {
-    if (have_fstudent)
-      fcst_student_free(&fstudent);
-#ifdef SQLITE_PREDICT_ONNX
-    if (have_onnx)
-      predict0_model_row_free(&onnx_row);
-#endif
-    int rc = fc_error(
-        cur, PREDICT_ERR_OPTIONS,
-        "interval_method='conformal' is only supported for the statistical "
-        "models (theta-classic, stub-seasonal-naive, auto)",
-        NULL);
+  FcModels mc;
+  char *mrerr = NULL;
+  if (fc_resolve_models(db, &opts, horizon, &mc, &mrerr) != SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = mrerr;
     forecast_opts_free(&opts);
-    return rc;
-  }
-
-  /* auto over an explicit candidate set: resolve the statistical models +
-   * distilled forecast students (validated) before collecting the series */
-  Candidate *cands = NULL;
-  int n_cands = 0;
-  if (opts.n_candidates > 0) {
-    if (!is_auto) {
-      int rc = fc_error(cur, PREDICT_ERR_OPTIONS,
-                        "candidates requires model=\"auto\"", NULL);
-      forecast_opts_free(&opts);
-      return rc;
-    }
-    char *cverr = NULL;
-    int crc = resolve_candidates(db, &opts, horizon, &cands, &n_cands, &cverr);
-    if (crc != SQLITE_OK) {
-      sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = cverr;
-      forecast_opts_free(&opts);
-      return crc;
-    }
+    return SQLITE_ERROR;
   }
 
   /* prepare + collect the series (shared with detect_anomalies) */
@@ -1663,337 +2032,41 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   if (rc != SQLITE_OK) {
     sqlite3_free(vtab->base.zErrMsg);
     vtab->base.zErrMsg = cerr;
-    for (int ci = 0; ci < n_cands; ci++)
-      if (cands[ci].is_student)
-        fcst_student_free(&cands[ci].student);
-    sqlite3_free(cands);
+    fc_models_free(&mc);
     forecast_opts_free(&opts);
     return rc;
   }
 
-  /* forecast every series into cursor rows */
-  f64 z = predict0_norm_quantile(0.5 + opts.confidence / 2);
-  int max_rows = 0;
-  for (int i = 0; i < n_series; i++)
-    max_rows += series[i].non_numeric || series[i].n < FORECAST_MIN_HISTORY
-                    ? 1
-                    : horizon;
-  if (n_series == 0)
-    max_rows = 0;
+  /* forecast every series into cursor rows; model_id is resolved before
+   * the models are freed (it points at a static id or opts.model) */
+  const char *model_id = fc_model_id(&opts, &mc);
+  char *serve_err = NULL;
+  rc = fc_run_series(db, series, n_series, horizon, &opts, &mc, &cur->rows,
+                     &cur->n_rows, &serve_err);
+  fc_models_free(&mc);
+  series_array_free(series, n_series);
 
-  cur->rows = sqlite3_malloc(sizeof(ForecastRow) * (max_rows ? max_rows : 1));
-  if (!cur->rows)
-    rc = SQLITE_NOMEM;
-  cur->n_rows = 0;
-
-  f64 *fc = sqlite3_malloc(sizeof(f64) * horizon);
-  f64 *sg = sqlite3_malloc(sizeof(f64) * horizon);
-  f64 *lo = sqlite3_malloc(sizeof(f64) * horizon);
-  f64 *hi = sqlite3_malloc(sizeof(f64) * horizon);
-
-  /* rolling-origin scratch: bt_* for default auto-selection and conformal,
-   * cand_fc for candidate-set selection */
-  int folds_req = opts.folds > 0 ? opts.folds : FORECAST_DEFAULT_FOLDS;
-  int need_bt = (is_auto && opts.n_candidates == 0) || opts.interval_conformal;
-  f64 *bt_act = NULL, *bt_fcst = NULL, *bt_col = NULL, *bt_q = NULL;
-  if (need_bt) {
-    bt_act = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
-    bt_fcst = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
-    bt_col = sqlite3_malloc(sizeof(f64) * folds_req);
-    bt_q = sqlite3_malloc(sizeof(f64) * horizon);
-    if (!bt_act || !bt_fcst || !bt_col || !bt_q)
-      rc = SQLITE_NOMEM;
-  }
-  f64 *cand_fc = NULL;
-  if (n_cands > 0) {
-    cand_fc = sqlite3_malloc(sizeof(f64) * ((size_t)opts.gap + horizon));
-    if (!cand_fc)
-      rc = SQLITE_NOMEM;
-  }
-
-  for (int i = 0; cur->rows && fc && sg && lo && hi &&
-                  (!need_bt || (bt_act && bt_fcst && bt_col && bt_q)) &&
-                  (n_cands == 0 || cand_fc) && i < n_series;
-       i++) {
-    SeriesBuf *s = &series[i];
-    const char *status = NULL;
-    if (s->non_numeric)
-      status = "non_numeric";
-    else if (s->n < FORECAST_MIN_HISTORY)
-      status = "insufficient_history";
-
-    if (status) {
-      ForecastRow *r = &cur->rows[cur->n_rows++];
-      memset(r, 0, sizeof(*r));
-      r->series_key = sqlite3_mprintf("%s", s->key);
-      r->status = status;
-      continue;
+  if (rc != SQLITE_OK) {
+    if (serve_err) { /* a registered model failed mid-serve */
+      sqlite3_free(vtab->base.zErrMsg);
+      vtab->base.zErrMsg = serve_err;
     }
-
-    series_sort(s);
-    int truncated = 0;
-    f64 *y = s->val;
-    i64 *ts = s->ts;
-    int n = s->n;
-    if (n > opts.context_limit) {
-      y += n - opts.context_limit;
-      ts += n - opts.context_limit;
-      n = opts.context_limit;
-      truncated = 1;
-    }
-
-    /* median step from sorted timestamps */
-    i64 step_ms = PREDICT_MS_PER_HOUR;
-    if (n > 1) {
-      i64 span = ts[n - 1] - ts[0];
-      step_ms = span > 0 ? span / (n - 1) : PREDICT_MS_PER_HOUR;
-    }
-
-    if (have_fstudent) {
-      if (fcst_run(&fstudent, y, n, horizon, opts.confidence, fc, lo, hi) !=
-          SQLITE_OK)
-        rc = SQLITE_NOMEM;
-    } else if (have_onnx) {
-#ifdef SQLITE_PREDICT_ONNX
-      predict0_backend_opts bopts = {NULL, NULL, NULL, 0};
-      int orc = predict0_onnx_forecast(db, &onnx_row, &bopts, y, n, horizon,
-                                       opts.confidence, fc, lo, hi, &serve_err);
-      if (orc != SQLITE_OK) {
-        rc = orc;
-        break; /* serve_err carries the message; surfaced after cleanup */
-      }
-#endif
-    } else {
-      predict0_ts_model use_model = model;
-      const ForecastStudent *win_student = NULL;
-      if (is_auto && n_cands > 0) {
-        /* rank the explicit candidate set (stat models + students) per series */
-        int best = -1;
-        f64 best_mae = 0;
-        for (int ci = 0; ci < n_cands; ci++) {
-          int cnf = 0;
-          f64 mae = candidate_mae(&cands[ci], y, n, horizon, opts.gap,
-                                   folds_req, cand_fc, &cnf);
-          if (mae < 0) {
-            rc = SQLITE_NOMEM;
-            break;
-          }
-          if (cnf == 0)
-            continue; /* candidate could not be backtested on this series */
-          if (best < 0 || mae < best_mae) {
-            best = ci;
-            best_mae = mae;
-          }
-        }
-        if (rc != SQLITE_OK)
-          break;
-        if (best < 0) { /* no candidate had a usable fold */
-          ForecastRow *r = &cur->rows[cur->n_rows++];
-          memset(r, 0, sizeof(*r));
-          r->series_key = sqlite3_mprintf("%s", s->key);
-          r->status = "insufficient_history";
-          continue;
-        }
-        if (cands[best].is_student)
-          win_student = &cands[best].student;
-        else
-          use_model = cands[best].stat;
-      } else if (is_auto) {
-        int bi = ts_auto_select(y, ts, n, horizon, opts.gap, folds_req,
-                                naive_scale(y, n), bt_act, bt_fcst);
-        if (bi <= -2) { /* negative SQLITE code (OOM) */
-          rc = SQLITE_NOMEM;
-          break;
-        }
-        /* bi == -1: series too short to backtest -> default to theta */
-        use_model = bi >= 0 ? TS_MODELS[bi].run : model_theta;
-      }
-      if (win_student) {
-        if (fcst_run(win_student, y, n, horizon, opts.confidence, fc, lo, hi) !=
-            SQLITE_OK) {
-          rc = SQLITE_NOMEM;
-          break;
-        }
-      } else if (opts.interval_conformal) {
-        int nf = ts_conformal_q(use_model, y, ts, n, horizon, opts.gap,
-                                folds_req, opts.confidence, bt_act, bt_fcst,
-                                bt_col, bt_q);
-        if (nf <= -2) {
-          rc = SQLITE_NOMEM;
-          break;
-        }
-        if (nf < CONFORMAL_MIN_FOLDS) { /* cannot calibrate honestly */
-          ForecastRow *r = &cur->rows[cur->n_rows++];
-          memset(r, 0, sizeof(*r));
-          r->series_key = sqlite3_mprintf("%s", s->key);
-          r->status = "insufficient_history";
-          continue;
-        }
-        use_model(y, n, horizon, fc, NULL); /* point-only */
-        for (int h = 0; h < horizon; h++) {
-          lo[h] = fc[h] - bt_q[h];
-          hi[h] = fc[h] + bt_q[h];
-        }
-      } else {
-        use_model(y, n, horizon, fc, sg);
-        for (int h = 0; h < horizon; h++) { /* symmetric Gaussian interval */
-          lo[h] = fc[h] - z * sg[h];
-          hi[h] = fc[h] + z * sg[h];
-        }
-      }
-    }
-    for (int h = 1; h <= horizon; h++) {
-      ForecastRow *r = &cur->rows[cur->n_rows++];
-      memset(r, 0, sizeof(*r));
-      r->series_key = sqlite3_mprintf("%s", s->key);
-      r->step = h;
-      predict0_format_timestamp(ts[n - 1] + step_ms * h, r->ts,
-                                sizeof(r->ts));
-      r->forecast = fc[h - 1];
-      r->lower = lo[h - 1];
-      r->upper = hi[h - 1];
-      r->status = truncated ? "truncated" : "ok";
-      r->has_values = 1;
-    }
-  }
-
-  sqlite3_free(fc);
-  sqlite3_free(sg);
-  sqlite3_free(lo);
-  sqlite3_free(hi);
-  sqlite3_free(bt_act);
-  sqlite3_free(bt_fcst);
-  sqlite3_free(bt_col);
-  sqlite3_free(bt_q);
-  sqlite3_free(cand_fc);
-  for (int ci = 0; ci < n_cands; ci++)
-    if (cands[ci].is_student)
-      fcst_student_free(&cands[ci].student);
-  sqlite3_free(cands);
-  if (have_fstudent)
-    fcst_student_free(&fstudent); /* done serving; safe for every exit below */
-#ifdef SQLITE_PREDICT_ONNX
-  if (have_onnx)
-    predict0_model_row_free(&onnx_row);
-#endif
-  for (int i = 0; i < n_series; i++) {
-    sqlite3_free(series[i].key);
-    sqlite3_free(series[i].ts);
-    sqlite3_free(series[i].val);
-  }
-  sqlite3_free(series);
-
-  if (serve_err) { /* a registered model failed mid-serve */
-    sqlite3_free(vtab->base.zErrMsg);
-    vtab->base.zErrMsg = serve_err;
     sqlite3_free(resolved_time);
     sqlite3_free(resolved_value);
     forecast_opts_free(&opts);
-    return rc == SQLITE_OK ? SQLITE_ERROR : rc;
-  }
-  if (rc == SQLITE_NOMEM) {
-    sqlite3_free(resolved_time);
-    sqlite3_free(resolved_value);
-    forecast_opts_free(&opts);
-    return SQLITE_NOMEM;
+    return rc;
   }
 
   /* receipt: RFC §4.1.2 — digest BEFORE insert; params canonical via
    * json_object with alphabetical keys, resolved column names recorded */
   if (opts.receipt) {
-    char *errmsg = NULL;
-    const char *model_id = is_auto ? "auto"
-                           : (have_fstudent || have_onnx)
-                               ? opts.model
-                               : resolve_ts_model_id(opts.model);
-
-    /* result hash over rows sorted by (series_key, step) */
-    ForecastRow **order =
-        sqlite3_malloc(sizeof(ForecastRow *) * (cur->n_rows ? cur->n_rows : 1));
-    if (!order)
-      goto receipt_fail;
-    for (int i = 0; i < cur->n_rows; i++)
-      order[i] = &cur->rows[i];
-    qsort(order, (usize)cur->n_rows, sizeof(ForecastRow *),
-          forecast_row_cmp);
-    predict0_hasher h;
-    predict0_hash_init(&h);
-    for (int i = 0; i < cur->n_rows; i++) {
-      ForecastRow *r = order[i];
-      predict0_hash_text(&h, r->series_key);
-      if (r->has_values) {
-        predict0_hash_int(&h, r->step);
-        predict0_hash_text(&h, r->ts);
-        predict0_hash_real(&h, r->forecast);
-        predict0_hash_real(&h, r->lower);
-        predict0_hash_real(&h, r->upper);
-      } else {
-        for (int k = 0; k < 5; k++)
-          predict0_hash_null(&h);
-      }
-      predict0_hash_row_end(&h);
-    }
-    sqlite3_free(order);
+    char *rerr = NULL;
     char result_hash[PREDICT_HEX_BUFSIZE];
-    predict0_hash_hex(&h, result_hash);
+    if (fc_result_hash(cur->rows, cur->n_rows, result_hash) != SQLITE_OK)
+      goto receipt_fail;
 
-    /* canonical params via json_object (keys alphabetical) */
-    char group_json[600] = "";
-    if (opts.n_group_cols) {
-      usize gl = 0;
-      gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl, "[");
-      for (int g = 0; g < opts.n_group_cols && gl < sizeof(group_json) - 4;
-           g++)
-        gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl,
-                              "%s\"%s\"", g ? "," : "", opts.group_cols[g]);
-      snprintf(group_json + gl, sizeof(group_json) - gl, "]");
-    }
-    char cand_json[600] = "";
-    if (opts.n_candidates) {
-      usize cl = 0;
-      cl += (usize)snprintf(cand_json + cl, sizeof(cand_json) - cl, "[");
-      for (int g = 0; g < opts.n_candidates && cl < sizeof(cand_json) - 4; g++)
-        cl += (usize)snprintf(cand_json + cl, sizeof(cand_json) - cl,
-                              "%s\"%s\"", g ? "," : "", opts.candidates[g]);
-      snprintf(cand_json + cl, sizeof(cand_json) - cl, "]");
-    }
-    sqlite3_stmt *pj = NULL;
-    char *params = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "SELECT json_object("
-            " 'candidates', CASE WHEN ?11 = '' THEN NULL ELSE json(?11) END,"
-            " 'confidence_level', ?1, 'context_limit', ?2,"
-            " 'folds', ?3, 'gap', ?4,"
-            " 'group_cols', CASE WHEN ?5 = '' THEN NULL ELSE json(?5) END,"
-            " 'horizon', ?6, 'interval_method', ?7, 'model', ?8,"
-            " 'receipt', 1, 'time_col', ?9, 'value_col', ?10)",
-            -1, &pj, NULL) == SQLITE_OK) {
-      sqlite3_bind_double(pj, 1, opts.confidence);
-      sqlite3_bind_int(pj, 2, opts.context_limit);
-      if (opts.folds > 0)
-        sqlite3_bind_int(pj, 3, opts.folds);
-      else
-        sqlite3_bind_null(pj, 3);
-      if (opts.gap > 0)
-        sqlite3_bind_int(pj, 4, opts.gap);
-      else
-        sqlite3_bind_null(pj, 4);
-      sqlite3_bind_text(pj, 5, group_json, -1, SQLITE_STATIC);
-      sqlite3_bind_int(pj, 6, horizon);
-      sqlite3_bind_text(pj, 7, opts.interval_conformal ? "conformal" : "residual",
-                        -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 8, model_id, -1, SQLITE_STATIC);
-      if (resolved_time)
-        sqlite3_bind_text(pj, 9, resolved_time, -1, SQLITE_STATIC);
-      if (resolved_value)
-        sqlite3_bind_text(pj, 10, resolved_value, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 11, cand_json, -1, SQLITE_STATIC);
-      if (sqlite3_step(pj) == SQLITE_ROW)
-        params = sqlite3_mprintf(
-            "%s", (const char *)sqlite3_column_text(pj, 0));
-      sqlite3_finalize(pj);
-    }
+    char *params = fc_build_params(db, &opts, horizon, model_id,
+                                   resolved_time, resolved_value, 0);
     if (!params) {
       vtab->base.zErrMsg = sqlite3_mprintf(
           "%s: could not canonicalize params", PREDICT_ERR_RESOURCE);
@@ -2002,11 +2075,11 @@ static int fc_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
     char receipt_id[PREDICT_ULID_BUFSIZE];
     int irc = predict0_emit_receipt(db, "forecast", model_id, params, query,
-                                    result_hash, receipt_id, &errmsg);
+                                    result_hash, receipt_id, &rerr);
     sqlite3_free(params);
     if (irc != SQLITE_OK) {
       sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = errmsg;
+      vtab->base.zErrMsg = rerr;
       goto receipt_fail;
     }
     for (int i = 0; i < cur->n_rows; i++)
@@ -2530,6 +2603,272 @@ static int an_error(anom_cursor *cur, const char *code, const char *msg,
   return SQLITE_ERROR;
 }
 
+/* Resolve the detect_anomalies model choice. Sets *use_subpca,
+ * *theta_mode, and *model_id (static string). On failure sets *errmsg
+ * ("CODE: detail"). Shared by the query and aggregate forms. */
+static int an_resolve_model(const ForecastOpts *opts, int *use_subpca,
+                            int *theta_mode, const char **model_id,
+                            char **errmsg) {
+  /* sub-pca is a subsequence detector, not a forecast model: it has its own
+   * scoring path and bypasses the one-step-ahead forecaster resolution. */
+  *use_subpca = opts->model && strcmp(opts->model, "sub-pca") == 0;
+  *theta_mode = 1; /* default-ts and theta-classic */
+  *model_id = *use_subpca ? "sub-pca" : resolve_ts_model_id(opts->model);
+  if (!*model_id) {
+    *errmsg = sqlite3_mprintf("%s: no such model: %s",
+                              PREDICT_ERR_MODEL_NOT_FOUND, opts->model);
+    return SQLITE_ERROR;
+  }
+  /* the anomaly scorer implements only the one-step forecasters (theta /
+   * seasonal-naive) and sub-pca; a forecast-only model such as tsb must be
+   * rejected here rather than silently scored with theta */
+  if (!*use_subpca && strcmp(*model_id, "theta-classic") != 0 &&
+      strcmp(*model_id, "stub-seasonal-naive") != 0) {
+    *errmsg = sqlite3_mprintf(
+        "%s: model not supported for detect_anomalies (use theta-classic, "
+        "stub-seasonal-naive, or sub-pca): %s",
+        PREDICT_ERR_OPTIONS, opts->model);
+    return SQLITE_ERROR;
+  }
+  if (!*use_subpca && strcmp(*model_id, "stub-seasonal-naive") == 0)
+    *theta_mode = 0;
+  return SQLITE_OK;
+}
+
+/* Score every collected series into AnomRow output rows
+ * (sqlite3_malloc'd into *rows_out). Returns SQLITE_OK or SQLITE_NOMEM;
+ * on failure partial rows are freed here and *rows_out is NULL. */
+static int an_run_series(SeriesBuf *series, int n_series,
+                         const ForecastOpts *opts, int use_subpca,
+                         int theta_mode, AnomRow **rows_out, int *n_rows_out) {
+  *rows_out = NULL;
+  *n_rows_out = 0;
+  int rc = SQLITE_OK;
+
+  f64 z_thr = predict0_norm_quantile(0.5 + opts->confidence / 2);
+  int max_rows = 0;
+  for (int i = 0; i < n_series; i++) {
+    SeriesBuf *s = &series[i];
+    int usable = !s->non_numeric && s->n >= FORECAST_MIN_HISTORY;
+    int scored = (opts->context_limit > 0 && s->n > opts->context_limit)
+                     ? opts->context_limit
+                     : s->n;
+    max_rows += usable ? scored : 1;
+  }
+  AnomRow *rows = sqlite3_malloc(sizeof(AnomRow) * (max_rows ? max_rows : 1));
+  int n_rows = 0;
+  if (!rows)
+    return SQLITE_NOMEM;
+
+  for (int i = 0; i < n_series; i++) {
+    SeriesBuf *s = &series[i];
+    const char *status = NULL;
+    if (s->non_numeric)
+      status = "non_numeric";
+    else if (s->n < FORECAST_MIN_HISTORY)
+      status = "insufficient_history";
+    if (status) {
+      AnomRow *r = &rows[n_rows++];
+      memset(r, 0, sizeof(*r));
+      r->series_key = sqlite3_mprintf("%s", s->key);
+      r->status = status;
+      continue;
+    }
+    series_sort(s);
+    int truncated = 0;
+    f64 *y = s->val;
+    i64 *ts = s->ts;
+    int n = s->n;
+    if (opts->context_limit > 0 && n > opts->context_limit) {
+      y += n - opts->context_limit;
+      ts += n - opts->context_limit;
+      n = opts->context_limit;
+      truncated = 1;
+    }
+    if (use_subpca) { /* subsequence reconstruction detector (not a forecaster) */
+      f64 *score = sqlite3_malloc(sizeof(f64) * n);
+      SubpcaRank *rk = sqlite3_malloc(sizeof(SubpcaRank) * n);
+      if (!score || !rk) {
+        sqlite3_free(score);
+        sqlite3_free(rk);
+        rc = SQLITE_NOMEM;
+        break;
+      }
+      int win = 0;
+      char *serr = NULL;
+      if (subpca_score(y, n, &win, score, &serr) != SQLITE_OK) {
+        sqlite3_free(serr);
+        sqlite3_free(score);
+        sqlite3_free(rk);
+        AnomRow *r = &rows[n_rows++];
+        memset(r, 0, sizeof(*r));
+        r->series_key = sqlite3_mprintf("%s", s->key);
+        r->status = "insufficient_history";
+        continue;
+      }
+      for (int t = 0; t < n; t++) {
+        rk[t].s = score[t];
+        rk[t].i = t;
+      }
+      qsort(rk, n, sizeof(SubpcaRank), subpca_rank_cmp);
+      /* anomaly_probability = percentile rank: "more anomalous than this
+       * fraction of the series". Rank-preserving, so is_anomaly = rank >
+       * threshold flags the top (1 - threshold) fraction. */
+      for (int r0 = 0; r0 < n; r0++)
+        score[rk[r0].i] = n > 1 ? (f64)r0 / (n - 1) : 0.0;
+      for (int t = 0; t < n; t++) {
+        AnomRow *r = &rows[n_rows++];
+        memset(r, 0, sizeof(*r));
+        r->series_key = sqlite3_mprintf("%s", s->key);
+        predict0_format_timestamp(ts[t], r->ts, sizeof(r->ts));
+        r->value = y[t];
+        r->has_values = 1; /* has_pred stays 0: no forecast/interval */
+        r->status = truncated ? "truncated" : "ok";
+        r->prob = score[t];
+        r->is_anom = r->prob > opts->confidence;
+      }
+      sqlite3_free(score);
+      sqlite3_free(rk);
+      continue;
+    }
+    int p = detect_period(y, n);
+    f64 *pred = sqlite3_malloc(sizeof(f64) * n);
+    f64 *sig = sqlite3_malloc(sizeof(f64) * n);
+    u8 *valid = sqlite3_malloc(n);
+    if (!pred || !sig || !valid) {
+      sqlite3_free(pred);
+      sqlite3_free(sig);
+      sqlite3_free(valid);
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    score_online(y, n, p, theta_mode, pred, sig, valid);
+    for (int t = 0; t < n; t++) {
+      AnomRow *r = &rows[n_rows++];
+      memset(r, 0, sizeof(*r));
+      r->series_key = sqlite3_mprintf("%s", s->key);
+      predict0_format_timestamp(ts[t], r->ts, sizeof(r->ts));
+      r->value = y[t];
+      r->has_values = 1;
+      r->status = truncated ? "truncated" : "ok";
+      if (valid[t]) {
+        r->has_pred = 1;
+        r->fc = pred[t];
+        r->lo = pred[t] - z_thr * sig[t];
+        r->hi = pred[t] + z_thr * sig[t];
+        f64 z = (y[t] - pred[t]) / sig[t];
+        r->prob = erf(fabs(z) / 1.4142135623730951);
+        r->is_anom = r->prob > opts->confidence;
+      }
+    }
+    sqlite3_free(pred);
+    sqlite3_free(sig);
+    sqlite3_free(valid);
+  }
+
+  if (rc != SQLITE_OK) {
+    for (int i = 0; i < n_rows; i++)
+      sqlite3_free(rows[i].series_key);
+    sqlite3_free(rows);
+    return rc;
+  }
+  *rows_out = rows;
+  *n_rows_out = n_rows;
+  return SQLITE_OK;
+}
+
+/* RFC §4.1.3 result hash over rows sorted by (series_key, ts).
+ * Returns SQLITE_OK or SQLITE_NOMEM. */
+static int an_result_hash(AnomRow *rows, int n_rows,
+                          char out[PREDICT_HEX_BUFSIZE]) {
+  AnomRow **order = sqlite3_malloc(sizeof(AnomRow *) * (n_rows ? n_rows : 1));
+  if (!order)
+    return SQLITE_NOMEM;
+  for (int i = 0; i < n_rows; i++)
+    order[i] = &rows[i];
+  qsort(order, (usize)n_rows, sizeof(AnomRow *), anom_row_cmp);
+  predict0_hasher h;
+  predict0_hash_init(&h);
+  for (int i = 0; i < n_rows; i++) {
+    AnomRow *r = order[i];
+    predict0_hash_text(&h, r->series_key);
+    if (r->has_values) {
+      predict0_hash_text(&h, r->ts);
+      predict0_hash_real(&h, r->value);
+    } else {
+      predict0_hash_null(&h);
+      predict0_hash_null(&h);
+    }
+    if (r->has_pred) {
+      predict0_hash_real(&h, r->fc);
+      predict0_hash_real(&h, r->lo);
+      predict0_hash_real(&h, r->hi);
+    } else {
+      predict0_hash_null(&h);
+      predict0_hash_null(&h);
+      predict0_hash_null(&h);
+    }
+    if (r->has_values) {
+      predict0_hash_int(&h, r->is_anom);
+      predict0_hash_real(&h, r->prob);
+    } else {
+      predict0_hash_null(&h);
+      predict0_hash_null(&h);
+    }
+    predict0_hash_row_end(&h);
+  }
+  sqlite3_free(order);
+  predict0_hash_hex(&h, out);
+  return SQLITE_OK;
+}
+
+/* Canonical detect_anomalies receipt params. agg_form omits the
+ * query-shape keys (RFC §4.2.8). Returns sqlite3_malloc'd JSON or NULL. */
+static char *an_build_params(sqlite3 *db, const ForecastOpts *opts,
+                             const char *model_id, const char *time_col,
+                             const char *value_col, int agg_form) {
+  char group_json[600] = "";
+  if (opts->n_group_cols) {
+    usize gl = 0;
+    gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl, "[");
+    for (int g = 0; g < opts->n_group_cols && gl < sizeof(group_json) - 4; g++)
+      gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl,
+                            "%s\"%s\"", g ? "," : "", opts->group_cols[g]);
+    snprintf(group_json + gl, sizeof(group_json) - gl, "]");
+  }
+  sqlite3_stmt *pj = NULL;
+  char *params = NULL;
+  const char *sql =
+      agg_form ? "SELECT json_object('anomaly_prob_threshold', ?1,"
+                 " 'context_limit', ?2, 'model', ?4, 'receipt', 1)"
+               : "SELECT json_object('anomaly_prob_threshold', ?1,"
+                 " 'context_limit', ?2,"
+                 " 'group_cols', CASE WHEN ?3 = '' THEN NULL ELSE json(?3) END,"
+                 " 'model', ?4, 'receipt', 1, 'time_col', ?5, 'value_col', ?6)";
+  if (sqlite3_prepare_v2(db, sql, -1, &pj, NULL) == SQLITE_OK) {
+    sqlite3_bind_double(pj, 1, opts->confidence);
+    /* 0 = "score every point": record as null so replay re-defaults rather
+     * than failing the context_limit >= 1 check on the recorded params */
+    if (opts->context_limit > 0)
+      sqlite3_bind_int(pj, 2, opts->context_limit);
+    else
+      sqlite3_bind_null(pj, 2);
+    if (!agg_form)
+      sqlite3_bind_text(pj, 3, group_json, -1, SQLITE_STATIC);
+    sqlite3_bind_text(pj, 4, model_id, -1, SQLITE_STATIC);
+    if (!agg_form) {
+      if (time_col)
+        sqlite3_bind_text(pj, 5, time_col, -1, SQLITE_STATIC);
+      if (value_col)
+        sqlite3_bind_text(pj, 6, value_col, -1, SQLITE_STATIC);
+    }
+    if (sqlite3_step(pj) == SQLITE_ROW)
+      params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
+    sqlite3_finalize(pj);
+  }
+  return params;
+}
+
 static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                      const char *idxStr, int argc, sqlite3_value **argv) {
   UNUSED_PARAMETER(idxNum);
@@ -2565,31 +2904,16 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     forecast_opts_free(&opts);
     return SQLITE_ERROR;
   }
-  /* sub-pca is a subsequence detector, not a forecast model: it has its own
-   * scoring path below and bypasses the one-step-ahead forecaster resolution. */
-  int use_subpca = opts.model && strcmp(opts.model, "sub-pca") == 0;
-  int theta_mode = 1; /* default-ts and theta-classic */
-  const char *model_id = use_subpca ? "sub-pca" : resolve_ts_model_id(opts.model);
-  if (!model_id) {
-    int rc = an_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
-                      opts.model);
+  int use_subpca = 0, theta_mode = 1;
+  const char *model_id = NULL;
+  char *mrerr = NULL;
+  if (an_resolve_model(&opts, &use_subpca, &theta_mode, &model_id, &mrerr) !=
+      SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = mrerr;
     forecast_opts_free(&opts);
-    return rc;
+    return SQLITE_ERROR;
   }
-  /* the anomaly scorer implements only the one-step forecasters (theta /
-   * seasonal-naive) and sub-pca; a forecast-only model such as tsb must be
-   * rejected here rather than silently scored with theta */
-  if (!use_subpca && strcmp(model_id, "theta-classic") != 0 &&
-      strcmp(model_id, "stub-seasonal-naive") != 0) {
-    int rc = an_error(cur, PREDICT_ERR_OPTIONS,
-                      "model not supported for detect_anomalies (use "
-                      "theta-classic, stub-seasonal-naive, or sub-pca): ",
-                      opts.model);
-    forecast_opts_free(&opts);
-    return rc;
-  }
-  if (!use_subpca && strcmp(model_id, "stub-seasonal-naive") == 0)
-    theta_mode = 0;
 
   /* prepare + collect the series (shared with forecast) */
   SeriesBuf *series = NULL;
@@ -2615,211 +2939,24 @@ static int an_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   }
 
   /* score every series */
-  f64 z_thr = predict0_norm_quantile(0.5 + opts.confidence / 2);
-  int max_rows = 0;
-  for (int i = 0; i < n_series; i++) {
-    SeriesBuf *s = &series[i];
-    int usable = !s->non_numeric && s->n >= FORECAST_MIN_HISTORY;
-    int scored = (opts.context_limit > 0 && s->n > opts.context_limit)
-                     ? opts.context_limit
-                     : s->n;
-    max_rows += usable ? scored : 1;
-  }
-  cur->rows = sqlite3_malloc(sizeof(AnomRow) * (max_rows ? max_rows : 1));
-  if (!cur->rows) {
+  rc = an_run_series(series, n_series, &opts, use_subpca, theta_mode,
+                     &cur->rows, &cur->n_rows);
+  if (rc != SQLITE_OK) {
     AN_FREE_SERIES();
-    return SQLITE_NOMEM;
-  }
-  cur->n_rows = 0;
-
-  for (int i = 0; i < n_series; i++) {
-    SeriesBuf *s = &series[i];
-    const char *status = NULL;
-    if (s->non_numeric)
-      status = "non_numeric";
-    else if (s->n < FORECAST_MIN_HISTORY)
-      status = "insufficient_history";
-    if (status) {
-      AnomRow *r = &cur->rows[cur->n_rows++];
-      memset(r, 0, sizeof(*r));
-      r->series_key = sqlite3_mprintf("%s", s->key);
-      r->status = status;
-      continue;
-    }
-    series_sort(s);
-    int truncated = 0;
-    f64 *y = s->val;
-    i64 *ts = s->ts;
-    int n = s->n;
-    if (opts.context_limit > 0 && n > opts.context_limit) {
-      y += n - opts.context_limit;
-      ts += n - opts.context_limit;
-      n = opts.context_limit;
-      truncated = 1;
-    }
-    if (use_subpca) { /* subsequence reconstruction detector (not a forecaster) */
-      f64 *score = sqlite3_malloc(sizeof(f64) * n);
-      SubpcaRank *rk = sqlite3_malloc(sizeof(SubpcaRank) * n);
-      if (!score || !rk) {
-        sqlite3_free(score);
-        sqlite3_free(rk);
-        break;
-      }
-      int win = 0;
-      char *serr = NULL;
-      if (subpca_score(y, n, &win, score, &serr) != SQLITE_OK) {
-        sqlite3_free(serr);
-        sqlite3_free(score);
-        sqlite3_free(rk);
-        AnomRow *r = &cur->rows[cur->n_rows++];
-        memset(r, 0, sizeof(*r));
-        r->series_key = sqlite3_mprintf("%s", s->key);
-        r->status = "insufficient_history";
-        continue;
-      }
-      for (int t = 0; t < n; t++) {
-        rk[t].s = score[t];
-        rk[t].i = t;
-      }
-      qsort(rk, n, sizeof(SubpcaRank), subpca_rank_cmp);
-      /* anomaly_probability = percentile rank: "more anomalous than this
-       * fraction of the series". Rank-preserving, so is_anomaly = rank >
-       * threshold flags the top (1 - threshold) fraction. */
-      for (int r0 = 0; r0 < n; r0++)
-        score[rk[r0].i] = n > 1 ? (f64)r0 / (n - 1) : 0.0;
-      for (int t = 0; t < n; t++) {
-        AnomRow *r = &cur->rows[cur->n_rows++];
-        memset(r, 0, sizeof(*r));
-        r->series_key = sqlite3_mprintf("%s", s->key);
-        predict0_format_timestamp(ts[t], r->ts, sizeof(r->ts));
-        r->value = y[t];
-        r->has_values = 1; /* has_pred stays 0: no forecast/interval */
-        r->status = truncated ? "truncated" : "ok";
-        r->prob = score[t];
-        r->is_anom = r->prob > opts.confidence;
-      }
-      sqlite3_free(score);
-      sqlite3_free(rk);
-      continue;
-    }
-    int p = detect_period(y, n);
-    f64 *pred = sqlite3_malloc(sizeof(f64) * n);
-    f64 *sig = sqlite3_malloc(sizeof(f64) * n);
-    u8 *valid = sqlite3_malloc(n);
-    if (!pred || !sig || !valid) {
-      sqlite3_free(pred);
-      sqlite3_free(sig);
-      sqlite3_free(valid);
-      break;
-    }
-    score_online(y, n, p, theta_mode, pred, sig, valid);
-    for (int t = 0; t < n; t++) {
-      AnomRow *r = &cur->rows[cur->n_rows++];
-      memset(r, 0, sizeof(*r));
-      r->series_key = sqlite3_mprintf("%s", s->key);
-      predict0_format_timestamp(ts[t], r->ts, sizeof(r->ts));
-      r->value = y[t];
-      r->has_values = 1;
-      r->status = truncated ? "truncated" : "ok";
-      if (valid[t]) {
-        r->has_pred = 1;
-        r->fc = pred[t];
-        r->lo = pred[t] - z_thr * sig[t];
-        r->hi = pred[t] + z_thr * sig[t];
-        f64 z = (y[t] - pred[t]) / sig[t];
-        r->prob = erf(fabs(z) / 1.4142135623730951);
-        r->is_anom = r->prob > opts.confidence;
-      }
-    }
-    sqlite3_free(pred);
-    sqlite3_free(sig);
-    sqlite3_free(valid);
+    return rc;
   }
 
   /* receipt */
   if (opts.receipt) {
     char *rerr = NULL;
-    AnomRow **order =
-        sqlite3_malloc(sizeof(AnomRow *) * (cur->n_rows ? cur->n_rows : 1));
-    if (!order) {
+    char result_hash[PREDICT_HEX_BUFSIZE];
+    if (an_result_hash(cur->rows, cur->n_rows, result_hash) != SQLITE_OK) {
       AN_FREE_SERIES();
       an_rows_free(cur);
       return SQLITE_NOMEM;
     }
-    for (int i = 0; i < cur->n_rows; i++)
-      order[i] = &cur->rows[i];
-    qsort(order, (usize)cur->n_rows, sizeof(AnomRow *), anom_row_cmp);
-    predict0_hasher h;
-    predict0_hash_init(&h);
-    for (int i = 0; i < cur->n_rows; i++) {
-      AnomRow *r = order[i];
-      predict0_hash_text(&h, r->series_key);
-      if (r->has_values) {
-        predict0_hash_text(&h, r->ts);
-        predict0_hash_real(&h, r->value);
-      } else {
-        predict0_hash_null(&h);
-        predict0_hash_null(&h);
-      }
-      if (r->has_pred) {
-        predict0_hash_real(&h, r->fc);
-        predict0_hash_real(&h, r->lo);
-        predict0_hash_real(&h, r->hi);
-      } else {
-        predict0_hash_null(&h);
-        predict0_hash_null(&h);
-        predict0_hash_null(&h);
-      }
-      if (r->has_values) {
-        predict0_hash_int(&h, r->is_anom);
-        predict0_hash_real(&h, r->prob);
-      } else {
-        predict0_hash_null(&h);
-        predict0_hash_null(&h);
-      }
-      predict0_hash_row_end(&h);
-    }
-    sqlite3_free(order);
-    char result_hash[PREDICT_HEX_BUFSIZE];
-    predict0_hash_hex(&h, result_hash);
-
-    char group_json[600] = "";
-    if (opts.n_group_cols) {
-      usize gl = 0;
-      gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl, "[");
-      for (int g = 0; g < opts.n_group_cols && gl < sizeof(group_json) - 4;
-           g++)
-        gl += (usize)snprintf(group_json + gl, sizeof(group_json) - gl,
-                              "%s\"%s\"", g ? "," : "", opts.group_cols[g]);
-      snprintf(group_json + gl, sizeof(group_json) - gl, "]");
-    }
-    sqlite3_stmt *pj = NULL;
-    char *params = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "SELECT json_object('anomaly_prob_threshold', ?1,"
-            " 'context_limit', ?2,"
-            " 'group_cols', CASE WHEN ?3 = '' THEN NULL ELSE json(?3) END,"
-            " 'model', ?4, 'receipt', 1, 'time_col', ?5, 'value_col', ?6)",
-            -1, &pj, NULL) == SQLITE_OK) {
-      sqlite3_bind_double(pj, 1, opts.confidence);
-      /* 0 = "score every point": record as null so replay re-defaults rather
-       * than failing the context_limit >= 1 check on the recorded params */
-      if (opts.context_limit > 0)
-        sqlite3_bind_int(pj, 2, opts.context_limit);
-      else
-        sqlite3_bind_null(pj, 2);
-      sqlite3_bind_text(pj, 3, group_json, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 4, model_id, -1, SQLITE_STATIC);
-      if (resolved_time)
-        sqlite3_bind_text(pj, 5, resolved_time, -1, SQLITE_STATIC);
-      if (resolved_value)
-        sqlite3_bind_text(pj, 6, resolved_value, -1, SQLITE_STATIC);
-      if (sqlite3_step(pj) == SQLITE_ROW)
-        params = sqlite3_mprintf(
-            "%s", (const char *)sqlite3_column_text(pj, 0));
-      sqlite3_finalize(pj);
-    }
+    char *params = an_build_params(db, &opts, model_id, resolved_time,
+                                   resolved_value, 0);
     if (!params) {
       AN_FREE_SERIES();
       an_rows_free(cur);
@@ -3539,6 +3676,924 @@ static sqlite3_module backtestModule = {
 
 #pragma endregion
 
+#pragma region aggregate
+
+/* forecast(ts, value, horizon[, options]) and detect_anomalies(ts,
+ * value[, options]) — the aggregate forms, RFC §4.2.8. The enclosing
+ * statement pushes rows in (GROUP BY = series splitting), the model
+ * runs through the same fc_/an_ pipeline as the query form, and the
+ * result is one JSON document per group. Receipts embed the input
+ * series ('inline-series', §4.1.4) and are written only for series the
+ * model actually served; degraded series (insufficient_history,
+ * non_numeric) return a status document with receipt_id null. */
+
+/* aggregate option keys: the query form's set minus the query-shape
+ * keys (time_col/value_col/group_cols), which GROUP BY and the argument
+ * positions replace */
+static const char *const AGG_FORECAST_OPTION_KEYS[] = {
+    "confidence_level", "context_limit", "model",      "receipt",
+    "interval_method",  "folds",         "gap",        "candidates", NULL};
+static const char *const AGG_ANOMALY_OPTION_KEYS[] = {
+    "anomaly_prob_threshold", "context_limit", "model", "receipt", NULL};
+
+typedef struct {
+  i64 *ts;
+  f64 *val;
+  int n, cap;
+  int non_numeric; /* a row failed coercion; degrade like the query form */
+  char *options_json; /* first row's options text; NULL = no options */
+  int have_options;
+  i64 horizon; /* forecast only */
+  int have_horizon;
+  int started;
+} AggSeries;
+
+static void agg_series_clear(AggSeries *a) {
+  if (!a)
+    return;
+  sqlite3_free(a->ts);
+  sqlite3_free(a->val);
+  sqlite3_free(a->options_json);
+  a->ts = NULL;
+  a->val = NULL;
+  a->options_json = NULL;
+}
+
+/* TEXT first argument that reads as SQL: the caller invoked the query
+ * form in expression position; redirect them (RFC §4.2.8 Errors). */
+static int agg_looks_like_query(sqlite3_value *v) {
+  if (sqlite3_value_type(v) != SQLITE_TEXT)
+    return 0;
+  const char *t = (const char *)sqlite3_value_text(v);
+  if (!t)
+    return 0;
+  while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r')
+    t++;
+  return sqlite3_strnicmp(t, "select", 6) == 0 ||
+         sqlite3_strnicmp(t, "with", 4) == 0;
+}
+
+/* Shared xStep: coerce (ts, value) with the query form's rules
+ * (collect_series), enforce constant options (and horizon, when
+ * horizon_arg >= 0), and append. Timestamps normalize to whole seconds
+ * so the model reads exactly what the receipt records (§4.2.8). */
+static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
+                     const char *fname, int horizon_arg) {
+  AggSeries *a = sqlite3_aggregate_context(ctx, sizeof(AggSeries));
+  if (!a) {
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+
+  if (!a->started) {
+    a->started = 1;
+    if (agg_looks_like_query(argv[0])) {
+      char *msg = sqlite3_mprintf(
+          "%s: %s(query, ...) is the table-valued form and belongs in the "
+          "FROM clause; in expression position use the aggregate "
+          "%s(ts, value%s[, options])",
+          PREDICT_ERR_SCHEMA, fname, fname, horizon_arg >= 0 ? ", horizon" : "");
+      sqlite3_result_error(ctx, msg ? msg : PREDICT_ERR_SCHEMA, -1);
+      sqlite3_free(msg);
+      return;
+    }
+    if (horizon_arg >= 0) {
+      if (sqlite3_value_type(argv[horizon_arg]) != SQLITE_INTEGER) {
+        sqlite3_result_error(
+            ctx, PREDICT_ERR_HORIZON ": horizon must be an integer", -1);
+        return;
+      }
+      a->horizon = sqlite3_value_int64(argv[horizon_arg]);
+      a->have_horizon = 1;
+      if (a->horizon < 1 || a->horizon > FORECAST_MAX_HORIZON) {
+        sqlite3_result_error(
+            ctx, PREDICT_ERR_HORIZON ": horizon out of range 1..1000", -1);
+        return;
+      }
+    }
+    int opt_i = horizon_arg >= 0 ? horizon_arg + 1 : 2;
+    if (argc > opt_i && sqlite3_value_type(argv[opt_i]) != SQLITE_NULL) {
+      const char *o = (const char *)sqlite3_value_text(argv[opt_i]);
+      a->options_json = o ? sqlite3_mprintf("%s", o) : NULL;
+      if (o && !a->options_json) {
+        sqlite3_result_error_nomem(ctx);
+        return;
+      }
+    }
+    a->have_options = 1;
+  } else {
+    /* options (and horizon) MUST be constant across the group */
+    if (horizon_arg >= 0 &&
+        (sqlite3_value_type(argv[horizon_arg]) != SQLITE_INTEGER ||
+         sqlite3_value_int64(argv[horizon_arg]) != a->horizon)) {
+      sqlite3_result_error(
+          ctx, PREDICT_ERR_HORIZON ": horizon must be constant within a group",
+          -1);
+      return;
+    }
+    int opt_i = horizon_arg >= 0 ? horizon_arg + 1 : 2;
+    const char *o =
+        argc > opt_i && sqlite3_value_type(argv[opt_i]) != SQLITE_NULL
+            ? (const char *)sqlite3_value_text(argv[opt_i])
+            : NULL;
+    int differ = (o == NULL) != (a->options_json == NULL) ||
+                 (o && strcmp(o, a->options_json) != 0);
+    if (differ) {
+      sqlite3_result_error(
+          ctx, PREDICT_ERR_OPTIONS ": options must be constant within a group",
+          -1);
+      return;
+    }
+  }
+
+  if (a->non_numeric)
+    return; /* series poisoned; keep consuming rows, like collect_series */
+
+  /* ts coercion, mirroring collect_series */
+  i64 ms = 0;
+  int tt = sqlite3_value_type(argv[0]);
+  if (tt == SQLITE_INTEGER) {
+    i64 raw = sqlite3_value_int64(argv[0]);
+    if (raw < 0) {
+      a->non_numeric = 1;
+      return;
+    }
+    ms = raw >= PREDICT_EPOCH_MS_THRESHOLD ? raw : raw * 1000;
+    if (ms > PREDICT_MS_MAX) {
+      a->non_numeric = 1;
+      return;
+    }
+  } else if (tt != SQLITE_TEXT ||
+             predict0_parse_timestamp(
+                 (const char *)sqlite3_value_text(argv[0]), &ms)) {
+    a->non_numeric = 1;
+    return;
+  }
+  ms -= ((ms % 1000) + 1000) % 1000; /* floor to whole seconds */
+
+  int vt = sqlite3_value_type(argv[1]);
+  if (vt != SQLITE_INTEGER && vt != SQLITE_FLOAT) {
+    a->non_numeric = 1;
+    return;
+  }
+
+  if (a->n >= FORECAST_MAX_TOTAL_ROWS) {
+    sqlite3_result_error(ctx, PREDICT_ERR_RESOURCE ": too many input rows",
+                         -1);
+    return;
+  }
+  if (a->n == a->cap) {
+    int nc = a->cap ? a->cap * 2 : 64;
+    i64 *nts = sqlite3_realloc(a->ts, sizeof(i64) * nc);
+    f64 *nval = sqlite3_realloc(a->val, sizeof(f64) * nc);
+    if (!nts || !nval) {
+      sqlite3_free(nts);
+      sqlite3_free(nval);
+      a->ts = NULL;
+      a->val = NULL;
+      a->cap = 0;
+      a->n = 0;
+      sqlite3_result_error_nomem(ctx);
+      return;
+    }
+    a->ts = nts;
+    a->val = nval;
+    a->cap = nc;
+  }
+  a->ts[a->n] = ms;
+  a->val[a->n] = sqlite3_value_double(argv[1]);
+  a->n++;
+}
+
+static void agg_fc_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  agg_step(ctx, argc, argv, "forecast", 2);
+}
+
+static void agg_an_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  agg_step(ctx, argc, argv, "detect_anomalies", -1);
+}
+
+/* the query form called in expression position at its own arity:
+ * turn the likeliest confusion into directions (RFC §4.2.8 Errors) */
+static void agg_fc_misuse(sqlite3_context *ctx, int argc,
+                          sqlite3_value **argv) {
+  UNUSED_PARAMETER(argc);
+  UNUSED_PARAMETER(argv);
+  sqlite3_result_error(
+      ctx,
+      PREDICT_ERR_SCHEMA
+      ": forecast(query, horizon) is the table-valued form and belongs in "
+      "the FROM clause; in expression position use the aggregate "
+      "forecast(ts, value, horizon[, options])",
+      -1);
+}
+
+/* JSON emission: %.17g round-trips doubles exactly (SQLite's own JSON
+ * REAL formatting does not), which the inline-series replay hash
+ * depends on. Non-finite values have no JSON form and emit null. */
+static void agg_json_num(sqlite3_str *s, f64 v) {
+  if (!isfinite(v)) {
+    sqlite3_str_appendall(s, "null");
+    return;
+  }
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%.17g", v);
+  sqlite3_str_appendall(s, buf);
+}
+
+static void agg_json_str(sqlite3_str *s, const char *t) {
+  sqlite3_str_appendchar(s, 1, '"');
+  for (; *t; t++) {
+    unsigned char c = (unsigned char)*t;
+    if (c == '"' || c == '\\') {
+      sqlite3_str_appendchar(s, 1, '\\');
+      sqlite3_str_appendchar(s, 1, (char)c);
+    } else if (c < 0x20) {
+      sqlite3_str_appendf(s, "\\u%04x", c);
+    } else {
+      sqlite3_str_appendchar(s, 1, (char)c);
+    }
+  }
+  sqlite3_str_appendchar(s, 1, '"');
+}
+
+/* canonical input-series JSON + its §4.1.4 digest over the rows the
+ * model actually read (post-sort, post-truncation) */
+static char *agg_input_data(const i64 *ts, const f64 *val, int start, int n,
+                            char digest_out[PREDICT_HEX_BUFSIZE]) {
+  sqlite3_str *s = sqlite3_str_new(NULL);
+  predict0_hasher h;
+  predict0_hash_init(&h);
+  sqlite3_str_appendall(s, "{\"ts\":[");
+  char iso[PREDICT_TS_BUFSIZE];
+  for (int i = start; i < n; i++) {
+    predict0_format_timestamp(ts[i], iso, sizeof(iso));
+    sqlite3_str_appendf(s, "%s\"%s\"", i > start ? "," : "", iso);
+    predict0_hash_text(&h, iso);
+    predict0_hash_real(&h, val[i]);
+    predict0_hash_row_end(&h);
+  }
+  sqlite3_str_appendall(s, "],\"value\":[");
+  for (int i = start; i < n; i++) {
+    if (i > start)
+      sqlite3_str_appendchar(s, 1, ',');
+    agg_json_num(s, val[i]);
+  }
+  sqlite3_str_appendall(s, "]}");
+  predict0_hash_hex(&h, digest_out);
+  return sqlite3_str_finish(s); /* NULL on OOM */
+}
+
+/* result_error from a "CODE: detail" sqlite3_malloc'd message */
+static void agg_error(sqlite3_context *ctx, char *msg) {
+  sqlite3_result_error(ctx, msg ? msg : "PREDICT_ERR_RESOURCE: out of memory",
+                       -1);
+  sqlite3_free(msg);
+}
+
+static void agg_fc_final(sqlite3_context *ctx) {
+  AggSeries *a = sqlite3_aggregate_context(ctx, 0);
+  if (!a || !a->started) {
+    /* zero rows: NULL, the SQL aggregate convention (§4.2.8) */
+    agg_series_clear(a);
+    sqlite3_result_null(ctx);
+    return;
+  }
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  int horizon = (int)a->horizon;
+
+  ForecastOpts opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.confidence = 0.95;
+  opts.context_limit = FORECAST_DEFAULT_CONTEXT_LIMIT;
+  opts.receipt = 1;
+  char *perr = NULL;
+  if (predict0_options_parse(db, a->options_json, AGG_FORECAST_OPTION_KEYS,
+                             forecast_opt_cb, &opts, &perr)) {
+    agg_error(ctx, perr);
+    forecast_opts_free(&opts);
+    agg_series_clear(a);
+    return;
+  }
+
+  FcModels mc;
+  char *mrerr = NULL;
+  if (fc_resolve_models(db, &opts, horizon, &mc, &mrerr) != SQLITE_OK) {
+    agg_error(ctx, mrerr);
+    forecast_opts_free(&opts);
+    agg_series_clear(a);
+    return;
+  }
+  const char *model_id = fc_model_id(&opts, &mc);
+
+  SeriesBuf s;
+  memset(&s, 0, sizeof(s));
+  s.key = "";
+  s.ts = a->ts;
+  s.val = a->val;
+  s.n = a->n;
+  s.cap = a->cap;
+  s.non_numeric = a->non_numeric;
+
+  ForecastRow *rows = NULL;
+  int n_rows = 0;
+  char *serve_err = NULL;
+  int rc = fc_run_series(db, &s, 1, horizon, &opts, &mc, &rows, &n_rows,
+                         &serve_err);
+  fc_models_free(&mc);
+  if (rc != SQLITE_OK) {
+    if (serve_err)
+      agg_error(ctx, serve_err);
+    else
+      sqlite3_result_error_nomem(ctx);
+    forecast_opts_free(&opts);
+    agg_series_clear(a);
+    return;
+  }
+
+  /* one series: status is uniform across rows */
+  const char *status = n_rows ? rows[0].status : "ok";
+  int served = n_rows > 0 && rows[0].has_values;
+
+  /* receipt: only for series the model actually served (§4.2.8) */
+  char receipt_id[PREDICT_ULID_BUFSIZE] = "";
+  if (opts.receipt && served) {
+    char result_hash[PREDICT_HEX_BUFSIZE];
+    char sdigest[PREDICT_HEX_BUFSIZE];
+    char *input_data = NULL;
+    char *params = NULL;
+    char *rerr = NULL;
+    int start = (opts.context_limit > 0 && a->n > opts.context_limit)
+                    ? a->n - opts.context_limit
+                    : 0;
+    int irc = fc_result_hash(rows, n_rows, result_hash);
+    if (irc == SQLITE_OK) {
+      input_data = agg_input_data(a->ts, a->val, start, a->n, sdigest);
+      params = fc_build_params(db, &opts, horizon, model_id, NULL, NULL, 1);
+      if (!input_data || !params)
+        irc = SQLITE_NOMEM;
+    }
+    if (irc == SQLITE_OK)
+      irc = predict0_emit_receipt_inline(db, "forecast", model_id, params,
+                                         input_data, sdigest, result_hash,
+                                         receipt_id, &rerr);
+    sqlite3_free(input_data);
+    sqlite3_free(params);
+    if (irc != SQLITE_OK) {
+      agg_error(ctx, rerr);
+      for (int i = 0; i < n_rows; i++)
+        sqlite3_free(rows[i].series_key);
+      sqlite3_free(rows);
+      forecast_opts_free(&opts);
+      agg_series_clear(a);
+      return;
+    }
+  }
+
+  /* the result document (§4.2.8): row fields named as the query form's
+   * output columns */
+  sqlite3_str *doc = sqlite3_str_new(db);
+  sqlite3_str_appendall(doc, "{\"model\":");
+  agg_json_str(doc, model_id);
+  sqlite3_str_appendall(doc, ",\"receipt_id\":");
+  if (receipt_id[0])
+    sqlite3_str_appendf(doc, "\"%s\"", receipt_id);
+  else
+    sqlite3_str_appendall(doc, "null");
+  sqlite3_str_appendf(doc, ",\"status\":\"%s\",\"rows\":[", status);
+  int first = 1;
+  for (int i = 0; i < n_rows; i++) {
+    if (!rows[i].has_values)
+      continue;
+    if (!first)
+      sqlite3_str_appendchar(doc, 1, ',');
+    first = 0;
+    sqlite3_str_appendf(doc, "{\"step\":%d,\"forecast_timestamp\":\"%s\","
+                             "\"forecast\":",
+                        rows[i].step, rows[i].ts);
+    agg_json_num(doc, rows[i].forecast);
+    sqlite3_str_appendall(doc, ",\"lower_bound\":");
+    agg_json_num(doc, rows[i].lower);
+    sqlite3_str_appendall(doc, ",\"upper_bound\":");
+    agg_json_num(doc, rows[i].upper);
+    sqlite3_str_appendchar(doc, 1, '}');
+  }
+  sqlite3_str_appendall(doc, "]}");
+
+  for (int i = 0; i < n_rows; i++)
+    sqlite3_free(rows[i].series_key);
+  sqlite3_free(rows);
+  forecast_opts_free(&opts);
+  agg_series_clear(a);
+
+  char *out = sqlite3_str_finish(doc);
+  if (!out) {
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+  sqlite3_result_text(ctx, out, -1, sqlite3_free);
+}
+
+static void agg_an_final(sqlite3_context *ctx) {
+  AggSeries *a = sqlite3_aggregate_context(ctx, 0);
+  if (!a || !a->started) {
+    agg_series_clear(a);
+    sqlite3_result_null(ctx);
+    return;
+  }
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+
+  ForecastOpts opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.confidence = 0.99; /* anomaly_prob_threshold default */
+  opts.context_limit = 0; /* score every point, the query form's default */
+  opts.receipt = 1;
+  char *perr = NULL;
+  if (predict0_options_parse(db, a->options_json, AGG_ANOMALY_OPTION_KEYS,
+                             forecast_opt_cb, &opts, &perr)) {
+    agg_error(ctx, perr);
+    forecast_opts_free(&opts);
+    agg_series_clear(a);
+    return;
+  }
+
+  int use_subpca = 0, theta_mode = 1;
+  const char *model_id = NULL;
+  char *mrerr = NULL;
+  if (an_resolve_model(&opts, &use_subpca, &theta_mode, &model_id, &mrerr) !=
+      SQLITE_OK) {
+    agg_error(ctx, mrerr);
+    forecast_opts_free(&opts);
+    agg_series_clear(a);
+    return;
+  }
+
+  SeriesBuf s;
+  memset(&s, 0, sizeof(s));
+  s.key = "";
+  s.ts = a->ts;
+  s.val = a->val;
+  s.n = a->n;
+  s.cap = a->cap;
+  s.non_numeric = a->non_numeric;
+
+  AnomRow *rows = NULL;
+  int n_rows = 0;
+  int rc = an_run_series(&s, 1, &opts, use_subpca, theta_mode, &rows, &n_rows);
+  if (rc != SQLITE_OK) {
+    sqlite3_result_error_nomem(ctx);
+    forecast_opts_free(&opts);
+    agg_series_clear(a);
+    return;
+  }
+
+  const char *status = n_rows ? rows[0].status : "ok";
+  int served = n_rows > 0 && rows[0].has_values;
+
+  char receipt_id[PREDICT_ULID_BUFSIZE] = "";
+  if (opts.receipt && served) {
+    char result_hash[PREDICT_HEX_BUFSIZE];
+    char sdigest[PREDICT_HEX_BUFSIZE];
+    char *input_data = NULL;
+    char *params = NULL;
+    char *rerr = NULL;
+    int start = (opts.context_limit > 0 && a->n > opts.context_limit)
+                    ? a->n - opts.context_limit
+                    : 0;
+    int irc = an_result_hash(rows, n_rows, result_hash);
+    if (irc == SQLITE_OK) {
+      input_data = agg_input_data(a->ts, a->val, start, a->n, sdigest);
+      params = an_build_params(db, &opts, model_id, NULL, NULL, 1);
+      if (!input_data || !params)
+        irc = SQLITE_NOMEM;
+    }
+    if (irc == SQLITE_OK)
+      irc = predict0_emit_receipt_inline(db, "detect_anomalies", model_id,
+                                         params, input_data, sdigest,
+                                         result_hash, receipt_id, &rerr);
+    sqlite3_free(input_data);
+    sqlite3_free(params);
+    if (irc != SQLITE_OK) {
+      agg_error(ctx, rerr);
+      for (int i = 0; i < n_rows; i++)
+        sqlite3_free(rows[i].series_key);
+      sqlite3_free(rows);
+      forecast_opts_free(&opts);
+      agg_series_clear(a);
+      return;
+    }
+  }
+
+  sqlite3_str *doc = sqlite3_str_new(db);
+  sqlite3_str_appendall(doc, "{\"model\":");
+  agg_json_str(doc, model_id);
+  sqlite3_str_appendall(doc, ",\"receipt_id\":");
+  if (receipt_id[0])
+    sqlite3_str_appendf(doc, "\"%s\"", receipt_id);
+  else
+    sqlite3_str_appendall(doc, "null");
+  sqlite3_str_appendf(doc, ",\"status\":\"%s\",\"rows\":[", status);
+  int first = 1;
+  for (int i = 0; i < n_rows; i++) {
+    if (!rows[i].has_values)
+      continue;
+    if (!first)
+      sqlite3_str_appendchar(doc, 1, ',');
+    first = 0;
+    sqlite3_str_appendf(doc, "{\"ts\":\"%s\",\"value\":", rows[i].ts);
+    agg_json_num(doc, rows[i].value);
+    sqlite3_str_appendall(doc, ",\"forecast\":");
+    if (rows[i].has_pred)
+      agg_json_num(doc, rows[i].fc);
+    else
+      sqlite3_str_appendall(doc, "null");
+    sqlite3_str_appendall(doc, ",\"lower_bound\":");
+    if (rows[i].has_pred)
+      agg_json_num(doc, rows[i].lo);
+    else
+      sqlite3_str_appendall(doc, "null");
+    sqlite3_str_appendall(doc, ",\"upper_bound\":");
+    if (rows[i].has_pred)
+      agg_json_num(doc, rows[i].hi);
+    else
+      sqlite3_str_appendall(doc, "null");
+    sqlite3_str_appendf(doc, ",\"is_anomaly\":%d,\"anomaly_probability\":",
+                        rows[i].is_anom);
+    agg_json_num(doc, rows[i].prob);
+    sqlite3_str_appendchar(doc, 1, '}');
+  }
+  sqlite3_str_appendall(doc, "]}");
+
+  for (int i = 0; i < n_rows; i++)
+    sqlite3_free(rows[i].series_key);
+  sqlite3_free(rows);
+  forecast_opts_free(&opts);
+  agg_series_clear(a);
+
+  char *out = sqlite3_str_finish(doc);
+  if (!out) {
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+  sqlite3_result_text(ctx, out, -1, sqlite3_free);
+}
+
+#pragma endregion
+
+#pragma region expansion
+
+/* forecast_rows(doc) / anomaly_rows(doc) — expand an aggregate-form
+ * JSON document back into typed rows (RFC §4.2.9). Column names and
+ * types match the query form's output columns exactly; the numeric
+ * columns are forced REAL so the inline-series replay hash sees the
+ * same encoding the write path produced. */
+
+typedef struct {
+  i64 ints[2];   /* step | is_anomaly slots */
+  f64 reals[5];  /* forecast/lower/upper (+ value/prob for anomaly) */
+  char *ts;      /* forecast_timestamp | ts */
+  u8 has_int[2], has_real[5], has_ts;
+} XRow;
+
+typedef struct {
+  sqlite3_vtab base;
+  sqlite3 *db;
+  int is_anom; /* 0 = forecast_rows, 1 = anomaly_rows */
+} xrows_vtab;
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  XRow *rows;
+  int n_rows;
+  int i;
+  char *status;
+  char *receipt_id;
+} xrows_cursor;
+
+static int xr_connect(sqlite3 *db, void *pAux, int argc,
+                      const char *const *argv, sqlite3_vtab **ppVtab,
+                      char **pzErr) {
+  UNUSED_PARAMETER(argc);
+  UNUSED_PARAMETER(argv);
+  UNUSED_PARAMETER(pzErr);
+  int is_anom = pAux != NULL;
+  xrows_vtab *v = sqlite3_malloc(sizeof(*v));
+  if (!v)
+    return SQLITE_NOMEM;
+  memset(v, 0, sizeof(*v));
+  v->db = db;
+  v->is_anom = is_anom;
+  int rc = sqlite3_declare_vtab(
+      db, is_anom
+              ? "CREATE TABLE x(ts TEXT, value REAL, forecast REAL,"
+                " lower_bound REAL, upper_bound REAL, is_anomaly INTEGER,"
+                " anomaly_probability REAL, status TEXT, receipt_id TEXT,"
+                " doc HIDDEN)"
+              : "CREATE TABLE x(step INTEGER, forecast_timestamp TEXT,"
+                " forecast REAL, lower_bound REAL, upper_bound REAL,"
+                " status TEXT, receipt_id TEXT, doc HIDDEN)");
+  if (rc != SQLITE_OK) {
+    sqlite3_free(v);
+    return rc;
+  }
+  *ppVtab = &v->base;
+  return SQLITE_OK;
+}
+
+static int xr_disconnect(sqlite3_vtab *pVtab) {
+  sqlite3_free(pVtab);
+  return SQLITE_OK;
+}
+
+static int xr_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdx) {
+  xrows_vtab *v = (xrows_vtab *)pVtab;
+  int doc_col = v->is_anom ? 9 : 7;
+  int seen = 0;
+  for (int i = 0; i < pIdx->nConstraint; i++) {
+    const struct sqlite3_index_constraint *c = &pIdx->aConstraint[i];
+    if (c->iColumn == doc_col && c->op == SQLITE_INDEX_CONSTRAINT_EQ) {
+      if (!c->usable)
+        return SQLITE_CONSTRAINT;
+      pIdx->aConstraintUsage[i].argvIndex = 1;
+      pIdx->aConstraintUsage[i].omit = 1;
+      seen = 1;
+    }
+  }
+  if (!seen) {
+    pVtab->zErrMsg = sqlite3_mprintf(
+        "%s: %s(doc) requires a document argument", PREDICT_ERR_SCHEMA,
+        v->is_anom ? "anomaly_rows" : "forecast_rows");
+    return SQLITE_ERROR;
+  }
+  pIdx->estimatedCost = 1000;
+  return SQLITE_OK;
+}
+
+static int xr_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur) {
+  UNUSED_PARAMETER(pVtab);
+  xrows_cursor *c = sqlite3_malloc(sizeof(*c));
+  if (!c)
+    return SQLITE_NOMEM;
+  memset(c, 0, sizeof(*c));
+  *ppCur = &c->base;
+  return SQLITE_OK;
+}
+
+static void xr_rows_free(xrows_cursor *c) {
+  for (int i = 0; i < c->n_rows; i++)
+    sqlite3_free(c->rows[i].ts);
+  sqlite3_free(c->rows);
+  sqlite3_free(c->status);
+  sqlite3_free(c->receipt_id);
+  c->rows = NULL;
+  c->n_rows = 0;
+  c->status = NULL;
+  c->receipt_id = NULL;
+  c->i = 0;
+}
+
+static int xr_close(sqlite3_vtab_cursor *pCur) {
+  xrows_cursor *c = (xrows_cursor *)pCur;
+  xr_rows_free(c);
+  sqlite3_free(c);
+  return SQLITE_OK;
+}
+
+static int xr_error(xrows_cursor *cur, const char *detail) {
+  sqlite3_free(cur->base.pVtab->zErrMsg);
+  cur->base.pVtab->zErrMsg =
+      sqlite3_mprintf("%s: %s", PREDICT_ERR_SCHEMA, detail);
+  return SQLITE_ERROR;
+}
+
+static int xr_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
+                     int argc, sqlite3_value **argv) {
+  UNUSED_PARAMETER(idxNum);
+  UNUSED_PARAMETER(idxStr);
+  xrows_cursor *cur = (xrows_cursor *)pCur;
+  xrows_vtab *vtab = (xrows_vtab *)cur->base.pVtab;
+  sqlite3 *db = vtab->db;
+  xr_rows_free(cur);
+
+  if (argc < 1 || sqlite3_value_type(argv[0]) == SQLITE_NULL)
+    return SQLITE_OK; /* NULL in, empty out (the json_each convention) */
+  const char *doc = (const char *)sqlite3_value_text(argv[0]);
+  if (!doc)
+    return xr_error(cur, "document must be text");
+
+  /* validate the document shape and lift the top-level fields */
+  sqlite3_stmt *top = NULL;
+  if (sqlite3_prepare_v2(db,
+                         "SELECT json_type(?1), json_type(?1,'$.rows'),"
+                         " json_extract(?1,'$.status'),"
+                         " json_extract(?1,'$.receipt_id')",
+                         -1, &top, NULL) != SQLITE_OK)
+    return xr_error(cur, "could not parse document");
+  sqlite3_bind_text(top, 1, doc, -1, SQLITE_STATIC);
+  int rc = sqlite3_step(top);
+  const char *jt = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(top, 0)
+                                    : NULL;
+  const char *rt = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(top, 1)
+                                    : NULL;
+  if (!jt || strcmp(jt, "object") != 0 || !rt || strcmp(rt, "array") != 0 ||
+      sqlite3_column_type(top, 2) != SQLITE_TEXT) {
+    sqlite3_finalize(top);
+    return xr_error(cur, "not an aggregate-form result document");
+  }
+  cur->status =
+      sqlite3_mprintf("%s", (const char *)sqlite3_column_text(top, 2));
+  if (sqlite3_column_type(top, 3) == SQLITE_TEXT)
+    cur->receipt_id =
+        sqlite3_mprintf("%s", (const char *)sqlite3_column_text(top, 3));
+  sqlite3_finalize(top);
+
+  const char *rows_sql =
+      vtab->is_anom
+          ? "SELECT json_extract(j.value,'$.ts'),"
+            " json_extract(j.value,'$.value'),"
+            " json_extract(j.value,'$.forecast'),"
+            " json_extract(j.value,'$.lower_bound'),"
+            " json_extract(j.value,'$.upper_bound'),"
+            " json_extract(j.value,'$.is_anomaly'),"
+            " json_extract(j.value,'$.anomaly_probability')"
+            " FROM json_each(?1,'$.rows') j ORDER BY j.key"
+          : "SELECT json_extract(j.value,'$.step'),"
+            " json_extract(j.value,'$.forecast_timestamp'),"
+            " json_extract(j.value,'$.forecast'),"
+            " json_extract(j.value,'$.lower_bound'),"
+            " json_extract(j.value,'$.upper_bound')"
+            " FROM json_each(?1,'$.rows') j ORDER BY j.key";
+  sqlite3_stmt *stmt = NULL;
+  if (sqlite3_prepare_v2(db, rows_sql, -1, &stmt, NULL) != SQLITE_OK)
+    return xr_error(cur, "could not parse document rows");
+  sqlite3_bind_text(stmt, 1, doc, -1, SQLITE_STATIC);
+
+  int cap = 0;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    if (cur->n_rows == cap) {
+      int nc = cap ? cap * 2 : 32;
+      XRow *grown = sqlite3_realloc(cur->rows, sizeof(XRow) * nc);
+      if (!grown) {
+        sqlite3_finalize(stmt);
+        return SQLITE_NOMEM;
+      }
+      cur->rows = grown;
+      cap = nc;
+    }
+    XRow *r = &cur->rows[cur->n_rows++];
+    memset(r, 0, sizeof(*r));
+    if (vtab->is_anom) {
+      /* ts, value, forecast, lower, upper, is_anomaly, probability */
+      if (sqlite3_column_type(stmt, 0) == SQLITE_TEXT) {
+        r->ts = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 0));
+        r->has_ts = 1;
+      }
+      static const int real_col[5] = {1, 2, 3, 4, 6};
+      for (int k = 0; k < 5; k++)
+        if (sqlite3_column_type(stmt, real_col[k]) != SQLITE_NULL) {
+          r->reals[k] = sqlite3_column_double(stmt, real_col[k]);
+          r->has_real[k] = 1;
+        }
+      if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
+        r->ints[1] = sqlite3_column_int64(stmt, 5);
+        r->has_int[1] = 1;
+      }
+    } else {
+      /* step, forecast_timestamp, forecast, lower, upper */
+      if (sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        r->ints[0] = sqlite3_column_int64(stmt, 0);
+        r->has_int[0] = 1;
+      }
+      if (sqlite3_column_type(stmt, 1) == SQLITE_TEXT) {
+        r->ts = sqlite3_mprintf("%s", sqlite3_column_text(stmt, 1));
+        r->has_ts = 1;
+      }
+      for (int k = 0; k < 3; k++)
+        if (sqlite3_column_type(stmt, 2 + k) != SQLITE_NULL) {
+          r->reals[k] = sqlite3_column_double(stmt, 2 + k);
+          r->has_real[k] = 1;
+        }
+    }
+  }
+  int done = rc == SQLITE_DONE;
+  sqlite3_finalize(stmt);
+  if (!done)
+    return xr_error(cur, "document rows are not valid JSON");
+
+  /* empty rows: one status row, the query form's convention (§4.2.9) */
+  if (cur->n_rows == 0) {
+    cur->rows = sqlite3_malloc(sizeof(XRow));
+    if (!cur->rows)
+      return SQLITE_NOMEM;
+    memset(cur->rows, 0, sizeof(XRow));
+    cur->n_rows = 1;
+  }
+  cur->i = 0;
+  return SQLITE_OK;
+}
+
+static int xr_next(sqlite3_vtab_cursor *pCur) {
+  ((xrows_cursor *)pCur)->i++;
+  return SQLITE_OK;
+}
+
+static int xr_eof(sqlite3_vtab_cursor *pCur) {
+  xrows_cursor *c = (xrows_cursor *)pCur;
+  return c->i >= c->n_rows;
+}
+
+static int xr_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
+                     int col) {
+  xrows_cursor *c = (xrows_cursor *)pCur;
+  xrows_vtab *v = (xrows_vtab *)c->base.pVtab;
+  XRow *r = &c->rows[c->i];
+  int status_col = v->is_anom ? 7 : 5;
+  if (col == status_col) {
+    if (c->status)
+      sqlite3_result_text(ctx, c->status, -1, SQLITE_TRANSIENT);
+    return SQLITE_OK;
+  }
+  if (col == status_col + 1) {
+    if (c->receipt_id)
+      sqlite3_result_text(ctx, c->receipt_id, -1, SQLITE_TRANSIENT);
+    return SQLITE_OK;
+  }
+  if (v->is_anom) {
+    switch (col) {
+    case 0: /* ts */
+      if (r->has_ts)
+        sqlite3_result_text(ctx, r->ts, -1, SQLITE_TRANSIENT);
+      break;
+    case 1: case 2: case 3: case 4: /* value..upper_bound */
+      if (r->has_real[col - 1])
+        sqlite3_result_double(ctx, r->reals[col - 1]);
+      break;
+    case 5: /* is_anomaly */
+      if (r->has_int[1])
+        sqlite3_result_int64(ctx, r->ints[1]);
+      break;
+    case 6: /* anomaly_probability */
+      if (r->has_real[4])
+        sqlite3_result_double(ctx, r->reals[4]);
+      break;
+    default:
+      break;
+    }
+  } else {
+    switch (col) {
+    case 0: /* step */
+      if (r->has_int[0])
+        sqlite3_result_int64(ctx, r->ints[0]);
+      break;
+    case 1: /* forecast_timestamp */
+      if (r->has_ts)
+        sqlite3_result_text(ctx, r->ts, -1, SQLITE_TRANSIENT);
+      break;
+    case 2: case 3: case 4: /* forecast..upper_bound */
+      if (r->has_real[col - 2])
+        sqlite3_result_double(ctx, r->reals[col - 2]);
+      break;
+    default:
+      break;
+    }
+  }
+  return SQLITE_OK;
+}
+
+static int xr_rowid(sqlite3_vtab_cursor *pCur, sqlite3_int64 *pRowid) {
+  *pRowid = ((xrows_cursor *)pCur)->i;
+  return SQLITE_OK;
+}
+
+static sqlite3_module xrowsModule = {
+    /* iVersion    */ 0,
+    /* xCreate     */ NULL,
+    /* xConnect    */ xr_connect,
+    /* xBestIndex  */ xr_best_index,
+    /* xDisconnect */ xr_disconnect,
+    /* xDestroy    */ NULL,
+    /* xOpen       */ xr_open,
+    /* xClose      */ xr_close,
+    /* xFilter     */ xr_filter,
+    /* xNext       */ xr_next,
+    /* xEof        */ xr_eof,
+    /* xColumn     */ xr_column,
+    /* xRowid      */ xr_rowid,
+    /* xUpdate     */ NULL,
+    /* xBegin      */ NULL,
+    /* xSync       */ NULL,
+    /* xCommit     */ NULL,
+    /* xRollback   */ NULL,
+    /* xFindMethod */ NULL,
+    /* xRename     */ NULL,
+    /* xSavepoint  */ NULL,
+    /* xRelease    */ NULL,
+    /* xRollbackTo */ NULL,
+    /* xShadowName */ NULL,
+    /* xIntegrity  */ NULL};
+
+#pragma endregion
+
 int predict0_forecast_init(sqlite3 *db) {
   int rc = sqlite3_create_module(db, "forecast", &forecastModule, NULL);
   if (rc != SQLITE_OK)
@@ -3546,5 +4601,42 @@ int predict0_forecast_init(sqlite3 *db) {
   rc = sqlite3_create_module(db, "detect_anomalies", &anomModule, NULL);
   if (rc != SQLITE_OK)
     return rc;
-  return sqlite3_create_module(db, "backtest", &backtestModule, NULL);
+  rc = sqlite3_create_module(db, "backtest", &backtestModule, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  /* expansion functions (RFC §4.2.9); pAux discriminates the two shapes */
+  rc = sqlite3_create_module(db, "forecast_rows", &xrowsModule, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = sqlite3_create_module(db, "anomaly_rows", &xrowsModule, (void *)1);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  /* Aggregate forms (RFC §4.2.8), same names as the table-valued forms:
+   * SQLite keeps function and vtab-module namespaces separate, so
+   * expression position resolves here and FROM position resolves above.
+   * SQLITE_DIRECTONLY per §6.7 (receipt writes are a side effect), and
+   * never SQLITE_DETERMINISTIC. */
+  static const int AGG_FLAGS = SQLITE_UTF8 | SQLITE_DIRECTONLY;
+  rc = sqlite3_create_function_v2(db, "forecast", 3, AGG_FLAGS, NULL, NULL,
+                                  agg_fc_step, agg_fc_final, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = sqlite3_create_function_v2(db, "forecast", 4, AGG_FLAGS, NULL, NULL,
+                                  agg_fc_step, agg_fc_final, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = sqlite3_create_function_v2(db, "detect_anomalies", 2, AGG_FLAGS, NULL,
+                                  NULL, agg_an_step, agg_an_final, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = sqlite3_create_function_v2(db, "detect_anomalies", 3, AGG_FLAGS, NULL,
+                                  NULL, agg_an_step, agg_an_final, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  /* guidance stub: the query form's arity in expression position gets a
+   * self-correcting error instead of "wrong number of arguments" */
+  return sqlite3_create_function_v2(db, "forecast", 2, AGG_FLAGS, NULL,
+                                    agg_fc_misuse, NULL, NULL, NULL);
 }

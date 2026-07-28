@@ -309,6 +309,44 @@ int main(void) {
                 0);
     run_discard(db, "SELECT * FROM predict_replay('01NOPE')", 0);
     run_discard(db, "SELECT predict_ulid('not a time')", 0);
+
+    /* aggregate forms (RFC §4.2.8) + expansion functions (§4.2.9):
+     * happy path, GROUP BY, receipts on and off, and the error paths
+     * (constant options/horizon, query-shape keys, misuse redirect,
+     * garbage documents) so the sanitizers see the xStep/xFinal
+     * cleanup under load */
+    run_discard(db, "SELECT forecast(ts, value, 4) FROM series", 1);
+    run_discard(db, "SELECT grp, forecast(ts, value, 3,"
+                    " '{\"receipt\":0}') FROM series GROUP BY grp",
+                1);
+    run_discard(db, "SELECT detect_anomalies(ts, value) FROM series", 1);
+    run_discard(db, "SELECT grp, detect_anomalies(ts, value,"
+                    " '{\"model\":\"sub-pca\",\"receipt\":0}')"
+                    " FROM series GROUP BY grp",
+                1);
+    run_discard(db, "SELECT * FROM forecast_rows((SELECT forecast(ts, value,"
+                    " 4, '{\"receipt\":0}') FROM series))",
+                1);
+    run_discard(db, "SELECT * FROM anomaly_rows((SELECT detect_anomalies(ts,"
+                    " value, '{\"receipt\":0}') FROM series))",
+                1);
+    run_discard(db, "SELECT forecast(ts, value, 4) FROM series WHERE 0", 1);
+    run_discard(db, "SELECT forecast(ts, value, 4,"
+                    " '{\"time_col\":\"ts\"}') FROM series",
+                0);
+    run_discard(db, "SELECT forecast(ts, value, rowid % 2 + 1) FROM series",
+                0);
+    run_discard(db, "SELECT forecast(ts, value, 4, CASE WHEN rowid % 2"
+                    " THEN '{}' ELSE NULL END) FROM series",
+                0);
+    run_discard(db, "SELECT forecast('SELECT ts FROM series', 4)", 0);
+    run_discard(db, "SELECT forecast(ts, value, 0) FROM series", 0);
+    run_discard(db, "SELECT detect_anomalies(ts, value,"
+                    " '{\"model\":\"tsb\"}') FROM series",
+                0);
+    run_discard(db, "SELECT * FROM forecast_rows('not json')", 0);
+    run_discard(db, "SELECT * FROM anomaly_rows('[1,2]')", 0);
+    run_discard(db, "SELECT * FROM forecast_rows(NULL)", 1);
   }
 
   /* one replay round-trip on the last receipt */
@@ -316,6 +354,17 @@ int main(void) {
                   "SELECT match FROM predict_replay("
                   "(SELECT receipt_id FROM _predict_receipts ORDER BY"
                   " receipt_id DESC LIMIT 1))",
+                  1))
+    goto done_fail;
+
+  /* inline-series replay round-trip: aggregate receipt, then mutate the
+   * source and replay again (the durability property, §4.2.6) */
+  run_discard(db, "DELETE FROM series WHERE rowid % 3 = 0", 1);
+  if (run_discard(db,
+                  "SELECT match FROM predict_replay("
+                  "(SELECT receipt_id FROM _predict_receipts WHERE"
+                  " anchor_kind = 'inline-series' ORDER BY receipt_id DESC"
+                  " LIMIT 1))",
                   1))
     goto done_fail;
 

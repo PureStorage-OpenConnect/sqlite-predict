@@ -58,7 +58,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   sqlite3_predict_init(db, NULL, NULL);
   seed_tables(db);
 
-  switch (data[0] % 5) {
+  switch (data[0] % 7) {
   case 0: /* fuzz forecast options */
     run_sql_discard(db, "SELECT * FROM forecast("
                         "'SELECT ts, value FROM series', 3, ?1)",
@@ -82,6 +82,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
                     " ?1, '{\"target\":\"label\",\"receipt\":0}')",
                     text, NULL, NULL);
+    break;
+  case 5: /* fuzz the aggregate forms: options JSON and the ts argument */
+    run_sql_discard(db,
+                    "SELECT forecast(ts, value, 3, ?1) FROM series"
+                    " GROUP BY grp",
+                    text, NULL, NULL);
+    run_sql_discard(db, "SELECT detect_anomalies(ts, value, ?1) FROM series",
+                    text, NULL, NULL);
+    run_sql_discard(db, "SELECT forecast(?1, value, 3) FROM series", text,
+                    NULL, NULL);
+    break;
+  case 6: /* fuzz the expansion functions' document parser */
+    run_sql_discard(db, "SELECT * FROM forecast_rows(?1)", text, NULL, NULL);
+    run_sql_discard(db, "SELECT * FROM anomaly_rows(?1)", text, NULL, NULL);
     break;
   default: /* fuzz predict_ulid + predict_replay lookups */
     run_sql_discard(db, "SELECT predict_ulid(?1)", text, NULL, NULL);

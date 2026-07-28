@@ -1,0 +1,1 @@
+{"model":"theta-classic","receipt_id":"01ABCDEFGHJKMNPQRSTVWXYZ01","status":"ok","rows":[{"step":1,"forecast_timestamp":"2026-01-02T00:00:00Z","forecast":11.5,"lower_bound":9.1,"upper_bound":13.9}]}

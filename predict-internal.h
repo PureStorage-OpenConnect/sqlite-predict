@@ -251,13 +251,20 @@ int predict0_onnx_introspect(sqlite3 *db, const char *weights_uri,
  * excluding _predict_% and sqlite_%), hex into out[65]. */
 int predict0_logical_digest(sqlite3 *db, char out[PREDICT_HEX_BUFSIZE], char **errmsg);
 
-/* Insert one receipt row. anchor/params/input_sql/result_hash owned by
- * caller. receipt_id_out[27] receives the new ULID. */
+/* Digest of a canonical input-series JSON, RFC §4.1.4 'inline-series'
+ * (per row: RFC 3339 timestamp as TEXT, value as REAL). */
+int predict0_series_digest(sqlite3 *db, const char *input_data,
+                           char out[PREDICT_HEX_BUFSIZE], char **errmsg);
+
+/* Insert one receipt row. anchor/params/input_sql/input_data/result_hash
+ * owned by caller; exactly one of input_sql/input_data is non-NULL.
+ * receipt_id_out[27] receives the new ULID. */
 int predict0_receipt_insert(sqlite3 *db, const char *operation,
                             const char *model_id, const char *model_hash,
                             const char *anchor_kind, const char *anchor,
                             const char *params, const char *input_sql,
-                            const char *result_hash, char receipt_id_out[PREDICT_ULID_BUFSIZE],
+                            const char *input_data, const char *result_hash,
+                            char receipt_id_out[PREDICT_ULID_BUFSIZE],
                             char **errmsg);
 
 /* Shared receipt tail: ensure tables + model hash + digest + insert.
@@ -267,5 +274,15 @@ int predict0_emit_receipt(sqlite3 *db, const char *op, const char *model_id,
                           const char *result_hash,
                           char receipt_id_out[PREDICT_ULID_BUFSIZE],
                           char **errmsg);
+
+/* Aggregate-form receipt tail (RFC §4.2.8): input series embedded as
+ * input_data, anchored by its own digest (anchor_kind 'inline-series'). */
+int predict0_emit_receipt_inline(sqlite3 *db, const char *op,
+                                 const char *model_id, const char *params,
+                                 const char *input_data,
+                                 const char *series_digest,
+                                 const char *result_hash,
+                                 char receipt_id_out[PREDICT_ULID_BUFSIZE],
+                                 char **errmsg);
 
 #endif /* PREDICT_INTERNAL_H */
