@@ -30,12 +30,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { pkg: sqlite-predict-darwin-arm64, runner: macos-14,      os: darwin, cpu: arm64, ext: dylib, apt: "", cc: "" }
-          - { pkg: sqlite-predict-darwin-x64,   runner: macos-13,      os: darwin, cpu: x64,   ext: dylib, apt: "", cc: "" }
-          - { pkg: sqlite-predict-linux-x64,    runner: ubuntu-latest, os: linux,  cpu: x64,   ext: so,    apt: "", cc: "" }
+          - { pkg: sqlite-predict-darwin-arm64, runner: macos-14,      os: darwin, cpu: arm64, ext: dylib, apt: "", cc: "", macarch: "" }
+          # darwin-x64 cross-compiles on the arm64 runner: the Intel macos-13
+          # runners are scarce / being deprecated, and clang targets x86_64 fine.
+          - { pkg: sqlite-predict-darwin-x64,   runner: macos-14,      os: darwin, cpu: x64,   ext: dylib, apt: "", cc: "", macarch: "x86_64" }
+          - { pkg: sqlite-predict-linux-x64,    runner: ubuntu-latest, os: linux,  cpu: x64,   ext: so,    apt: "", cc: "", macarch: "" }
           # linux-arm64 cross-compiles on the x64 runner (the free arm64 runner
           # is public-repo-only); the binary is built, not run, on CI.
-          - { pkg: sqlite-predict-linux-arm64,  runner: ubuntu-latest, os: linux,  cpu: arm64, ext: so,    apt: "gcc-aarch64-linux-gnu", cc: "CC=aarch64-linux-gnu-gcc" }
+          - { pkg: sqlite-predict-linux-arm64,  runner: ubuntu-latest, os: linux,  cpu: arm64, ext: so,    apt: "gcc-aarch64-linux-gnu", cc: "CC=aarch64-linux-gnu-gcc", macarch: "" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,7 +55,12 @@ jobs:
         if: matrix.apt != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
       - name: Build loadable extension
-        run: make loadable ${{ matrix.cc }}
+        run: |
+          if [ -n "${{ matrix.macarch }}" ]; then
+            make loadable CC="clang -arch ${{ matrix.macarch }}"
+          else
+            make loadable ${{ matrix.cc }}
+          fi
       - name: Assemble platform package
         run: node scripts/npm-pkg.mjs platform ${{ matrix.pkg }} ${{ matrix.os }} ${{ matrix.cpu }} ${{ matrix.ext }} ${{ steps.v.outputs.version }}
       - name: Publish
