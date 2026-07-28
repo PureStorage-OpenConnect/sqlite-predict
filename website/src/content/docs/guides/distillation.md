@@ -1,45 +1,70 @@
 ---
 title: Distillation
-description: Compress a slow teacher into a tiny native student that runs anywhere.
+description: Compress a slow teacher into a tiny native student, then serve it like any other model.
 ---
 
 Foundation models are accurate but too heavy to call per query on CPU. The
-answer is distillation: run the teacher once to label your data, then fit a small
-**native student** that runs in the zero-dependency core with no runtime.
+answer is distillation: run the teacher once to label your data, then fit a
+small **native student** that runs in the zero-dependency core with no
+runtime. Every distilled student registers under the `student_id` you give
+it, and you serve it by passing that id as the `model` option of the normal
+serving call. There is no separate "serve a student" API.
 
-## Tabular: `distill_predict`
+## Tabular: distill with `distill_predict`, serve with `predict`
 
 ```sql
+-- once: fit and register the student
 SELECT model_id, holdout_metric FROM distill_predict(
   'SELECT f1, f2, label FROM training',
-  '{"target":"label","student_kind":"gbt"}');
+  '{"target":"label","student_id":"churn-v1","student_kind":"gbt"}');
+
+-- forever: serve it. train_query is NULL because the student already
+-- learned; only the rows to predict are needed.
+SELECT row_ref, prediction, confidence FROM predict(NULL,
+  'SELECT id, f1, f2 FROM customers',
+  '{"model":"churn-v1"}');
 ```
 
-`student_kind` is `tree` (a single CART), `gbt` (a gradient-boosted forest with
-second-order leaves, which matches or beats tuned XGBoost on most tasks), or
-`mlp` (a one-hidden-layer net for boundaries a tree renders poorly). With `proba`
-and `classes` the student learns the teacher's full probability distribution
-(soft-label distillation), not just its argmax. The result registers a model you
-call with [`predict()`](../../reference/functions/).
+The `NULL` first argument is the signature of serving a student: `predict`
+normally takes a training query for in-context models, but a student carries
+its training inside its blob, so passing one is an error.
 
-## Forecasting: `distill_forecast`
+`student_kind` is `tree` (a single CART), `gbt` (a gradient-boosted forest
+with second-order leaves, which matches or beats tuned XGBoost on most
+tasks), or `mlp` (a one-hidden-layer net for boundaries a tree renders
+poorly). With `proba` and `classes` the student learns the teacher's full
+probability distribution (soft-label distillation), not just its argmax.
+
+## Forecasting: distill with `distill_forecast`, serve with `forecast`
 
 ```sql
+-- once: an onnx teacher labels sliding windows in-database (needs the
+-- opt-in onnx build; window mode below needs nothing extra)
 SELECT model_id, train_rmse FROM distill_forecast(
   'SELECT series_key, value FROM history ORDER BY series_key, t',
   '{"teacher":"chronos-onnx","context":48,"horizon":12,"student_id":"fc"}');
+
+-- forever: serve it through the ordinary aggregate
+SELECT forecast(ts, value, 12, '{"model":"fc"}') FROM readings;
+
+-- or let auto decide: a registered student competes against the
+-- statistical baselines automatically, and the document's "model"
+-- field tells you when it won
+SELECT forecast(ts, value, 12, '{"model":"auto"}') FROM readings;
 ```
 
-The student is a DLinear/TiDE-style net (a linear skip plus a small residual). It
-serves through [`forecast()`](../../reference/functions/) like any other model, competes under `'{"model":"auto"}'` automatically the moment it is registered, and
-can compete in [`auto`](../auto-and-conformal/) selection.
+The student is a DLinear/TiDE-style net (a linear skip plus a small
+residual). Without an onnx teacher, `distill_forecast` also trains directly
+from windowed rows: each training row is `context` window columns followed by
+`horizon` continuation columns (your own teacher's forecasts, computed
+anywhere and stored as columns).
 
 ## Distribute the student
 
 A distilled student is a small native row in `_predict_models` (kilobytes,
-`runtime='tree'`). It serves in the zero-dependency build with no ONNX runtime,
-travels with a snapshot or fork of the database, and can be copied to another
-database and used there. So you can **distill once on a capable machine and
-predict everywhere SQLite runs**. Only distilling *from a live foundation-model
-teacher* needs the optional ONNX build; a student distilled from its own target
-columns needs nothing extra.
+`runtime='tree'`). It serves in the zero-dependency build with no ONNX
+runtime, travels with a snapshot or fork of the database, and can be copied
+to another database and used there. So you can **distill once on a capable
+machine and predict everywhere SQLite runs**. Only distilling *from a live
+foundation-model teacher* needs the optional ONNX build; a student distilled
+from its own target columns needs nothing extra.

@@ -74,7 +74,9 @@ of `(time, value)`, optionally with grouping columns. Columns: `series_key`,
 
 Learns from `train_query` (features plus a `target` column) and predicts the
 target for every row of `apply_query`. Columns: `row_ref`, `prediction`,
-`confidence`, `status`.
+`confidence`, `status`. To serve a distilled student, pass its id as the
+`model` option and `NULL` as `train_query` (the student already learned):
+`predict(NULL, 'SELECT id, f1, f2 FROM t', '{"model":"churn-v1"}')`.
 
 ### `distill_predict(train_query [, options])`
 
