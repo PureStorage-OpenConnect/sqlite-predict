@@ -1524,7 +1524,8 @@ done:
 static int fc_resolve_models(sqlite3 *db, const ForecastOpts *opts,
                              int horizon, FcModels *mc, char **errmsg) {
   memset(mc, 0, sizeof(*mc));
-  mc->is_auto = opts->model && strcmp(opts->model, "auto") == 0;
+  /* no model named means "the best available": auto is the default */
+  mc->is_auto = !opts->model || strcmp(opts->model, "auto") == 0;
   mc->model = mc->is_auto ? NULL : resolve_ts_model(opts->model);
   if (!mc->is_auto && !mc->model) {
     /* not a bundled model: maybe a registered forecast student (PSFCST) */
@@ -2821,6 +2822,7 @@ typedef struct {
   i64 horizon; /* forecast only */
   int have_horizon;
   int started;
+  int errored; /* a step raised: the final must not run the pipeline */
 } AggSeries;
 
 static void agg_series_clear(AggSeries *a) {
@@ -2869,12 +2871,14 @@ static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
           PREDICT_ERR_SCHEMA, fname, fname, horizon_arg >= 0 ? ", horizon" : "");
       sqlite3_result_error(ctx, msg ? msg : PREDICT_ERR_SCHEMA, -1);
       sqlite3_free(msg);
+      a->errored = 1;
       return;
     }
     if (horizon_arg >= 0) {
       if (sqlite3_value_type(argv[horizon_arg]) != SQLITE_INTEGER) {
         sqlite3_result_error(
             ctx, PREDICT_ERR_HORIZON ": horizon must be an integer", -1);
+        a->errored = 1;
         return;
       }
       a->horizon = sqlite3_value_int64(argv[horizon_arg]);
@@ -2882,6 +2886,7 @@ static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
       if (a->horizon < 1 || a->horizon > FORECAST_MAX_HORIZON) {
         sqlite3_result_error(
             ctx, PREDICT_ERR_HORIZON ": horizon out of range 1..1000", -1);
+        a->errored = 1;
         return;
       }
     }
@@ -2903,6 +2908,7 @@ static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
       sqlite3_result_error(
           ctx, PREDICT_ERR_HORIZON ": horizon must be constant within a group",
           -1);
+      a->errored = 1;
       return;
     }
     int opt_i = horizon_arg >= 0 ? horizon_arg + 1 : 2;
@@ -2916,6 +2922,7 @@ static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
       sqlite3_result_error(
           ctx, PREDICT_ERR_OPTIONS ": options must be constant within a group",
           -1);
+      a->errored = 1;
       return;
     }
   }
@@ -2954,6 +2961,7 @@ static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
   if (a->n >= FORECAST_MAX_TOTAL_ROWS) {
     sqlite3_result_error(ctx, PREDICT_ERR_RESOURCE ": too many input rows",
                          -1);
+    a->errored = 1;
     return;
   }
   if (a->n == a->cap) {
@@ -2968,6 +2976,7 @@ static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
       a->cap = 0;
       a->n = 0;
       sqlite3_result_error_nomem(ctx);
+      a->errored = 1;
       return;
     }
     a->ts = nts;
@@ -3043,6 +3052,11 @@ static void agg_fc_final(sqlite3_context *ctx) {
     /* zero rows: NULL, the SQL aggregate convention (§4.2.8) */
     agg_series_clear(a);
     sqlite3_result_null(ctx);
+    return;
+  }
+  if (a->errored) { /* a step already raised; the result is discarded */
+    agg_series_clear(a);
+    sqlite3_result_error_code(ctx, SQLITE_ERROR);
     return;
   }
   sqlite3 *db = sqlite3_context_db_handle(ctx);
@@ -3146,6 +3160,11 @@ static void agg_an_final(sqlite3_context *ctx) {
   if (!a || !a->started) {
     agg_series_clear(a);
     sqlite3_result_null(ctx);
+    return;
+  }
+  if (a->errored) { /* a step already raised; the result is discarded */
+    agg_series_clear(a);
+    sqlite3_result_error_code(ctx, SQLITE_ERROR);
     return;
   }
   sqlite3 *db = sqlite3_context_db_handle(ctx);

@@ -5,13 +5,19 @@ description: Let sqlite-predict pick the model, and get calibrated prediction in
 
 ## Auto-selection
 
-You don't have to hand-pick a model. `'{"model":"auto"}'` runs a rolling-origin
-backtest of each candidate on the series and forecasts with the lowest-error one.
-The choice is deterministic: the same rows pick the same winner.
+You don't have to pick a model at all: **auto is the default**. A call with no
+`model` option runs a rolling-origin backtest of each candidate on the series
+and forecasts with the lowest-error one. The choice is deterministic: the same
+rows pick the same winner.
 
 ```sql
-SELECT forecast(ts, value, 12, '{"model":"auto"}') FROM readings;
+SELECT forecast(ts, value, 12) FROM readings;   -- auto, implicitly
 ```
+
+Selection backtests every candidate per call, which costs single-digit
+milliseconds on typical series and tens of milliseconds at the 4096-point
+context cap. On a latency-critical path over long series, pin a `model` or
+lower `context_limit`.
 
 The default pool is the bundled statistical models (`theta-classic`,
 `stub-seasonal-naive`, `tsb` for intermittent demand) **plus every eligible

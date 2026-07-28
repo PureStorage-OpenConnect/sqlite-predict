@@ -8,6 +8,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`auto` is the forecast default.** A `forecast(ts, value, h)` call with
+  no `model` option now selects the best model per series instead of pinning
+  theta-classic, at a cost of single-digit milliseconds on typical series
+  (pin a `model` or lower `context_limit` on latency-critical long-series
+  paths). `candidates` no longer requires naming `model:"auto"` first, since
+  bare `candidates` narrows the default pool; combining `candidates` with a
+  pinned model remains an error. `detect_anomalies` (no auto exists) and
+  `backtest` (evaluates a named model) keep `theta-classic` as their
+  default. Also hardened: a step-phase aggregate error (bad horizon, query
+  string misuse) now short-circuits the final, instead of running the
+  pipeline with unvalidated arguments.
 - **Registered students compete under `auto` by default.** With
   `'{"model":"auto"}'` and no `candidates` list, the pool is the bundled
   statistical models plus every eligible registered forecast student:

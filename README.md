@@ -140,12 +140,13 @@ trailing JSON object (`'{"confidence_level":0.9}'`).
 
 ### Calibrated intervals, auto-selection, and backtesting
 
-- **Auto-selection.** `'{"model":"auto"}'` picks the model with the lowest
-  rolling-origin error per series, deterministically, over the bundled
-  statistical models plus every eligible registered forecast student: distill
-  once and your model competes with the baselines automatically, at every
-  call site. `'{"model":"auto","candidates":[...]}'` narrows the pool. The
-  result document's `model` field reports the winner.
+- **Auto-selection is the default.** A call with no `model` option picks the
+  model with the lowest rolling-origin error per series, deterministically,
+  over the bundled statistical models plus every eligible registered forecast
+  student: distill once and your model competes with the baselines
+  automatically, at every call site. `'{"candidates":[...]}'` narrows the
+  pool; `'{"model":"theta-classic"}'` pins one. The result document's
+  `model` field reports the winner.
 - **Conformal intervals.** `'{"interval_method":"conformal"}'` replaces the
   default Gaussian band with a distribution-free one calibrated on out-of-sample
   residuals. On smooth data the default band is overconfident; conformal lands

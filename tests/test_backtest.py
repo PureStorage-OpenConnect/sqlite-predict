@@ -273,12 +273,20 @@ def test_candidates_restrict_and_select_pool(db):
     assert both == tsb_only                           # auto picks tsb (the better)
 
 
-def test_candidates_requires_auto(db):
+def test_candidates_narrows_the_default_and_rejects_named_models(db):
     series, _ = syn.trend_season(n=100, seed=1)
     syn.load_into(db, series)
+    # auto is the default, so bare candidates narrows the default pool
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, 6, ?) FROM series",
+        (json.dumps({"candidates": ["theta-classic"]}),)).fetchone()[0])
+    assert doc["status"] == "ok"
+    assert doc["model"] == "theta-classic"
+    # but candidates alongside a pinned non-auto model is a contradiction
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute("SELECT forecast(ts, value, 6, ?) FROM series",
-                   (json.dumps({"candidates": ["theta-classic"]}),)).fetchone()
+                   (json.dumps({"model": "tsb",
+                                "candidates": ["theta-classic"]}),)).fetchone()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
 
 

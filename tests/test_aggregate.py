@@ -348,3 +348,12 @@ def test_sqlalchemy_composes_the_aggregate(db):
         assert len(out) == 1
         d = json.loads(out[0].doc)
         assert d["status"] == "ok" and len(d["rows"]) == 4
+
+
+def test_no_model_defaults_to_auto(db):
+    rows, _ = syn.trend_season(n=96, seed=57)
+    syn.load_into(db, rows)
+    bare = db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()[0]
+    auto = db.execute("SELECT forecast(ts, value, 6,"
+                      " '{\"model\":\"auto\"}') FROM series").fetchone()[0]
+    assert bare and bare == auto  # byte-identical documents

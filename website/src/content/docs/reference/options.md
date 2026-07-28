@@ -11,7 +11,7 @@ rather than being ignored.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `model` | string | `theta-classic` | Forecast model, or `auto`. |
+| `model` | string | `auto` | A model id to pin, or `auto` (the default: best of the stats plus eligible registered students, per series). |
 | `confidence_level` | number (0,1) | 0.9 | Nominal coverage of the interval. |
 | `interval_method` | `residual` \| `conformal` | `residual` | Interval construction. |
 | `folds` | integer | 20 | Rolling origins used by `auto` / conformal. |
