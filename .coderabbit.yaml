@@ -1,0 +1,116 @@
+# CodeRabbit configuration for sqlite-predict.
+# Reference: https://docs.coderabbit.ai/reference/yaml-template
+
+language: "en-US"
+
+tone_instructions: >-
+  Be direct and specific. Cite the file and line. Skip praise and
+  restatements of the diff; comment only where something should change,
+  and say exactly what and why.
+
+reviews:
+  profile: "chill"
+  # Request changes while comments are open, approve once they resolve:
+  # this is what lets CodeRabbit act as an approving reviewer.
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_filters:
+    - "!dist/**"
+    - "!vendor/**"
+    - "!npm/**"
+    - "!website/node_modules/**"
+    - "!bindings/rust/target/**"
+    - "!benchmarks/results/*.jsonl"
+
+  path_instructions:
+    - path: "**/*.{c,h}"
+      instructions: >-
+        This is a zero-dependency C99 SQLite extension in the sqlite-vec
+        mold. Hold changes to these rules: (1) fail loudly, never
+        silently — errors use the closed PREDICT_ERR_* set formatted
+        "CODE: detail", unknown option keys are rejected, and there are
+        no silent fallback paths; (2) memory discipline is
+        sqlite3_malloc/sqlite3_free with goto-cleanup, every error path
+        must free what it allocated — trace them; (3) all deserialization
+        of registry blobs is bounds-checked, and inline weights are
+        verified against content_hash before use; (4) serving functions
+        (forecast/detect_anomalies aggregates, predict) must stay pure:
+        no writes, no table creation, safe under PRAGMA query_only;
+        (5) determinism: same input, same output — no clock, randomness,
+        or float formatting that breaks %.17g round-tripping; (6) new
+        cross-TU symbols need the predict0_ prefix (the amalgamation
+        makes unprefixed externs collision bait); (7) no new
+        dependencies in the core build, ever. Flag any comment that
+        references internal design documents (RFC section numbers): the
+        public docs site is the contract.
+
+    - path: "tests/**"
+      instructions: >-
+        Tests here should try to break the code, not confirm the happy
+        path: flag new features that lack adversarial cases (malformed
+        blobs, unknown options, imbalanced or degenerate data, error
+        paths). Error-message assertions should match PREDICT_ERR_*
+        codes, not prose. Registered test model ids must not reuse
+        bundled ids (auto, tsb, theta-classic, stub-seasonal-naive,
+        sub-pca, knn5-incontext). Soak drivers must propagate statement
+        failures to the exit code — flag any discarded result.
+
+    - path: "benchmarks/**"
+      instructions: >-
+        Benchmark claims must be measured and reproducible: flag numbers
+        stated without a script or results file behind them, and any
+        methodology change that isn't reflected in the results doc.
+        Model licensing is load-bearing here: TabFM and TabPFN-2.5/2.6/3
+        are non-commercial teachers that must never be distilled for
+        anything published as more than evaluation, and no teacher
+        weights or teacher-derived artifacts may be committed to the
+        repo (caches live under ~/.cache). TabPFN-3 outputs must not be
+        used to train or distill any model. Permissive teachers (TabPFN-2,
+        TabICL, Mitra, Chronos) are the only distillation sources whose
+        students may be presented as shippable.
+
+    - path: "{website/src/content/**,*.md,.github/**/*.md}"
+      instructions: >-
+        Docs must read standalone for a first-time public reader. Flag:
+        em or en dashes (house style forbids them; use periods, colons,
+        commas, or parentheses), references to internal design docs or
+        RFC section numbers, receipts-era terminology (the feature was
+        removed), title-case headings (use sentence case), and any
+        distillation framing that suggests distilling a non-commercial
+        model for production use. Claims of accuracy or speed must match
+        the benchmarks pages.
+
+    - path: ".github/workflows/**"
+      instructions: >-
+        Every workflow must declare an explicit permissions block (the
+        repo default token is read-only). Release automation is
+        tag-driven (v* fires release/wheels/npm/crate): flag anything
+        that would publish outside that path or duplicate the version
+        source of truth (make sync-version owns version stamps).
+
+    - path: "bindings/**"
+      instructions: >-
+        Binding metadata (descriptions, READMEs, __version__) rots
+        independently of the docs site: flag stale references to removed
+        features and version strings not managed by scripts/sync-version.mjs.
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "warning"
+      requirements: >-
+        Conventional-commit style prefix (feat/fix/docs/bench/site/chore/
+        refactor/test/ci) with a concise, specific subject.
+
+chat:
+  auto_reply: true
