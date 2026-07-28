@@ -57,16 +57,31 @@ SELECT forecast(ts, value, 24, '{"model":"traffic-v1"}') FROM readings;
 </CardGrid>
 
 
-## Why not the usual ways?
+## Three why-nots, and one why
 
 Every alternative gets tables right. The differences are where the work
 lives, where your data goes, and what each prediction costs at volume.
 
 <div class="cmp-grid">
+  <div class="cmp-card cmp-ours">
+    <div>
+      <p class="cmp-kicker">Why <code>SELECT forecast(...)</code></p>
+      <p class="cmp-sub">A SQL function at your data. Zero-shot in seconds;
+      distill a teacher once and serve its student in microseconds, forever.
+      No pipeline, no endpoint, no meter.</p>
+    </div>
+    <ul class="cmp-specs">
+      <li><span>FIRST PREDICTION</span><b class="good">SECONDS</b></li>
+      <li><span>TRAINING</span><b class="good">NONE, OR ONCE IN SECONDS</b></li>
+      <li><span>SERVING</span><b class="good">IN-PROCESS, MICROSECONDS</b></li>
+      <li><span>DATA LEAVES THE DB</span><b class="good">NEVER</b></li>
+      <li><span>COST AT VOLUME</span><b class="good">FLAT, NEAR ZERO</b></li>
+    </ul>
+  </div>
   <div class="cmp-card">
     <p class="cmp-kicker">Why not an ML pipeline?</p>
-    <p class="cmp-sub">Great algorithms. The cost is everything around them:
-    the export, the feature job, the container, the deploy.</p>
+    <p class="cmp-sub">Great algorithms. The cost is the pipeline around
+    them: export, features, container, deploy.</p>
     <ul class="cmp-specs">
       <li><span>FIRST PREDICTION</span><b class="bad">MONTHS</b></li>
       <li><span>TRAINING</span><b class="bad">PER DATASET, YOUR CLUSTER</b></li>
@@ -78,7 +93,7 @@ lives, where your data goes, and what each prediction costs at volume.
   <div class="cmp-card">
     <p class="cmp-kicker">Why not AutoML?</p>
     <p class="cmp-sub">Automates the fit. Keeps the pipeline, the
-    infrastructure, and the wait.</p>
+    infrastructure, and the wait before a first answer.</p>
     <ul class="cmp-specs">
       <li><span>FIRST PREDICTION</span><b class="bad">WEEKS</b></li>
       <li><span>TRAINING</span><b class="bad">PER DATASET, MANAGED</b></li>
@@ -89,9 +104,8 @@ lives, where your data goes, and what each prediction costs at volume.
   </div>
   <div class="cmp-card">
     <p class="cmp-kicker">Why not a prediction API?</p>
-    <p class="cmp-sub">Seconds to the first answer, and the frontier models
-    live here. But "no training" means your rows ride along as context on
-    every call, on a meter, in someone else's cloud.</p>
+    <p class="cmp-sub">Seconds to a first answer, and the frontier lives
+    here. But your rows ride along on every metered call.</p>
     <ul class="cmp-specs">
       <li><span>FIRST PREDICTION</span><b class="good">SECONDS</b></li>
       <li><span>TRAINING</span><b class="bad">HIDDEN IN EVERY CALL</b></li>
@@ -100,24 +114,11 @@ lives, where your data goes, and what each prediction costs at volume.
       <li><span>COST AT VOLUME</span><b class="bad">LINEAR, THEIR INVOICE</b></li>
     </ul>
   </div>
-  <div class="cmp-card cmp-ours">
-    <p class="cmp-kicker"><code>SELECT forecast(...)</code></p>
-    <p class="cmp-sub">A SQL function at your data. Zero-shot in seconds;
-    distill a teacher once and serve its student in microseconds, forever.</p>
-    <ul class="cmp-specs">
-      <li><span>FIRST PREDICTION</span><b class="good">SECONDS</b></li>
-      <li><span>TRAINING</span><b class="good">NONE, OR ONCE IN SECONDS</b></li>
-      <li><span>SERVING</span><b class="good">IN-PROCESS, MICROSECONDS</b></li>
-      <li><span>DATA LEAVES THE DB</span><b class="good">NEVER</b></li>
-      <li><span>COST AT VOLUME</span><b class="good">FLAT, NEAR ZERO</b></li>
-    </ul>
-  </div>
 </div>
 
 The honest asterisk: a frontier model called zero-shot is still the accuracy
 ceiling. The [benchmarks](./benchmarks/) measure the gap; a distilled student
-typically gives up about half a point of accuracy against its teacher and
-keeps everything in the right column.
+typically gives up about half a point of accuracy against its teacher.
 
 :::caution[Pre-alpha]
 The API and the SQL surface are unstable and may change without notice. Not yet

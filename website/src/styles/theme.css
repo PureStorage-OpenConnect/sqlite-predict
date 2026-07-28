@@ -69,9 +69,15 @@ div.hero {
  * Grid collapses to one column on narrow screens. */
 .cmp-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+  /* one full-width "why" row, then the three why-nots share a row */
+  grid-template-columns: repeat(3, 1fr);
   gap: 1rem;
   margin-top: 1.5rem;
+}
+@media (max-width: 50rem) {
+  .cmp-grid {
+    grid-template-columns: 1fr;
+  }
 }
 .cmp-card {
   border: 1px solid var(--sl-color-gray-5);
@@ -79,8 +85,28 @@ div.hero {
   padding: 1.25rem 1.25rem 0.75rem;
   background: var(--sl-color-black);
 }
+/* Our card is the answer, not a fourth alternative: full-width, first,
+ * accent-bordered, with the pitch beside the spec sheet on wide screens. */
 .cmp-card.cmp-ours {
   border-color: var(--sl-color-accent);
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 2rem;
+  align-items: center;
+}
+.cmp-card.cmp-ours .cmp-specs {
+  border-top: none;
+  margin-top: 0.5rem;
+}
+@media (max-width: 40rem) {
+  .cmp-card.cmp-ours {
+    grid-template-columns: 1fr;
+  }
+  .cmp-card.cmp-ours .cmp-specs {
+    border-top: 1px solid var(--sl-color-gray-6);
+    margin-top: 1rem;
+  }
 }
 .cmp-kicker {
   font-size: var(--sl-text-lg);
@@ -110,8 +136,8 @@ div.hero {
   padding: 0.45rem 0;
   border-bottom: 1px solid var(--sl-color-gray-6);
   font-family: var(--__sl-font-mono, monospace);
-  font-size: 0.72rem;
-  letter-spacing: 0.04em;
+  font-size: 0.66rem;
+  letter-spacing: 0.03em;
 }
 .cmp-specs li:last-child {
   border-bottom: none;
