@@ -3,18 +3,24 @@ title: Receipts & replay
 description: Every prediction is bound to a receipt you can reproduce byte-for-byte.
 ---
 
-Every result carries a **receipt**: the model identity and content hash, an
-anchor for the exact data state the call read, the canonical call parameters, and
-a canonical hash of the result. The receipt id (a ULID) is stamped on every
-result row.
+Every served result carries a **receipt**: the model identity and content
+hash, an anchor for the exact inputs, the canonical call parameters, and a
+canonical hash of the result. The two forms carry it differently:
+
+- **Table-valued calls** write a receipt row to `_predict_receipts`, anchored
+  to the database state the query read, and stamp its id (a ULID) on every
+  result row.
+- **Aggregate calls** return the receipt as a
+  [document inside the result](#document-receipts-the-aggregate-form) —
+  nothing is written, and there is no id: the document is its own identity.
 
 ```sql
 SELECT receipt_id FROM forecast('SELECT ts, value FROM readings', 12);
 -- 01J...
 ```
 
-`predict_replay(receipt_id)` re-executes the recorded call against the anchored
-data state and confirms the result reproduces:
+`predict_replay(receipt_id)` re-executes a recorded table-valued call against
+the anchored data state and confirms the result reproduces:
 
 ```sql
 SELECT match, detail FROM predict_replay('01J...');
@@ -25,11 +31,14 @@ SELECT match, detail FROM predict_replay('01J...');
 - If the data the call read has changed, replay returns
   `PREDICT_ERR_ANCHOR_UNAVAILABLE` rather than a false match.
 - The result and params are canonicalized (type-tagged fields, IEEE-754 bit
-  patterns for reals), so replay is exact across machines.
+  patterns for reals), so a match means bit-identical, not approximately
+  equal. Reproduction across *different* platforms is bounded by the C
+  library's floating-point rounding (interval bounds pass through `log`,
+  `sqrt`, and `erf`, whose last bits vary between libm implementations).
 
 This is what makes an agent's predictions **auditable**: the agent cites the
-receipt id, and anyone can reproduce the number later, or detect that the
-underlying data moved.
+receipt id (or hands over the receipt document), and anyone can reproduce the
+number later, or detect that the underlying data moved.
 
 ## Document receipts (the aggregate form)
 
