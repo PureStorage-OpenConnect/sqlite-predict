@@ -1,6 +1,6 @@
 {
   "name": "sqlite-predict",
-  "version": "0.0.1-alpha.4",
+  "version": "0.0.1-alpha.5",
   "description": "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, predict, with replayable receipts.",
   "main": "index.cjs",
   "types": "index.d.ts",
@@ -24,10 +24,10 @@
     "directory": "bindings/node"
   },
   "optionalDependencies": {
-    "sqlite-predict-darwin-arm64": "0.0.1-alpha.4",
-    "sqlite-predict-darwin-x64": "0.0.1-alpha.4",
-    "sqlite-predict-linux-x64": "0.0.1-alpha.4",
-    "sqlite-predict-linux-arm64": "0.0.1-alpha.4",
-    "sqlite-predict-windows-x64": "0.0.1-alpha.4"
+    "sqlite-predict-darwin-arm64": "0.0.1-alpha.5",
+    "sqlite-predict-darwin-x64": "0.0.1-alpha.5",
+    "sqlite-predict-linux-x64": "0.0.1-alpha.5",
+    "sqlite-predict-linux-arm64": "0.0.1-alpha.5",
+    "sqlite-predict-windows-x64": "0.0.1-alpha.5"
   }
 }
