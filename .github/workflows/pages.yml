@@ -32,6 +32,11 @@ jobs:
         working-directory: website
     steps:
       - uses: actions/checkout@v4
+      # Reads the live Pages config and exposes the correct origin + base_path
+      # for the current URL (root subdomain while private, /sqlite-predict once
+      # public). We feed those into the Astro build so one build serves either.
+      - uses: actions/configure-pages@v5
+        id: pages
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -39,6 +44,9 @@ jobs:
           cache-dependency-path: website/package-lock.json
       - run: npm ci
       - run: npm run build
+        env:
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          PAGES_ORIGIN: ${{ steps.pages.outputs.origin }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: website/dist

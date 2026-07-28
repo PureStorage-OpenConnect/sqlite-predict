@@ -1,0 +1,42 @@
+/* Everpure / Pure Storage brand theme for sqlite-predict.
+ *
+ * Pulled from everpuredata.com: Pure Orange (#FE5000) as the one accent, warm
+ * near-black ink (#0F0E0D), warm neutrals, and cream surfaces in light mode.
+ * We keep Starlight's own lightness structure and only shift the hue to orange,
+ * so contrast stays where Starlight tuned it. Default :root is the dark theme;
+ * [data-theme='light'] inverts it. */
+
+:root {
+  /* Pure Orange accent. Base is the brand #FE5000 (button/fill); -high is the
+     readable link color on dark; -low is a deep tint for active backgrounds. */
+  --sl-color-accent-low: hsl(19, 60%, 18%);
+  --sl-color-accent: hsl(19, 100%, 50%);
+  --sl-color-accent-high: hsl(24, 100%, 72%);
+
+  /* Warm neutral ramp (hue ~28) instead of Starlight's cool blue-grey. */
+  --sl-color-white: hsl(0, 0%, 100%);
+  --sl-color-gray-1: hsl(28, 18%, 92%);
+  --sl-color-gray-2: hsl(28, 10%, 76%);
+  --sl-color-gray-3: hsl(28, 8%, 55%);
+  --sl-color-gray-4: hsl(28, 9%, 35%);
+  --sl-color-gray-5: hsl(28, 14%, 21%);
+  --sl-color-gray-6: hsl(28, 16%, 13%);
+  --sl-color-black: hsl(30, 8%, 6%); /* #0F0E0D warm near-black */
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-high: hsl(20, 95%, 34%);
+  --sl-color-accent: hsl(19, 100%, 50%);
+  --sl-color-accent-low: hsl(28, 100%, 90%);
+
+  /* Inverted warm ramp with a cream page background. */
+  --sl-color-white: hsl(30, 12%, 8%); /* darkest text */
+  --sl-color-gray-1: hsl(28, 15%, 16%);
+  --sl-color-gray-2: hsl(28, 12%, 23%);
+  --sl-color-gray-3: hsl(28, 9%, 40%);
+  --sl-color-gray-4: hsl(28, 10%, 58%);
+  --sl-color-gray-5: hsl(30, 25%, 82%);
+  --sl-color-gray-6: hsl(35, 45%, 90%);
+  --sl-color-gray-7: hsl(38, 52%, 94%);
+  --sl-color-black: hsl(40, 60%, 96%); /* cream page background */
+}

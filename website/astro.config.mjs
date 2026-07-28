@@ -2,19 +2,25 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
-// Deployed to GitHub Pages as a project site under /sqlite-predict. On this
-// Enterprise Cloud org the internal repo publishes with Pages visibility set to
-// Private (viewable by enterprise members only) until we flip it public.
-// `site` + `base` drive canonical links and asset paths; internal doc links are
-// path-relative so they survive any base or a future custom domain.
+// GitHub Pages serves this project at different URLs depending on visibility: a
+// random *.pages.github.io ROOT while the repo is internal (private Pages), and
+// purestorage-openconnect.github.io/sqlite-predict once it is public. The deploy
+// workflow reads the live Pages config (actions/configure-pages) and passes the
+// correct origin + base in via env, so one build works for either URL. Locally
+// we default to root. Internal doc links are path-relative, so only asset and
+// nav paths depend on `base`.
+const base = process.env.PAGES_BASE_PATH || "/";
+const site = process.env.PAGES_ORIGIN || "https://purestorage-openconnect.github.io";
+
 export default defineConfig({
-  site: "https://purestorage-openconnect.github.io",
-  base: "/sqlite-predict",
+  site,
+  base,
   integrations: [
     starlight({
       title: "sqlite-predict",
       description:
         "Forecasting, anomaly detection, and prediction as SQL primitives for SQLite, with replayable receipts.",
+      customCss: ["./src/styles/theme.css"],
       social: [
         {
           icon: "github",
