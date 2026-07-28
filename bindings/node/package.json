@@ -1,7 +1,7 @@
 {
   "name": "sqlite-predict",
   "version": "0.0.1-alpha.6",
-  "description": "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, predict, with replayable receipts.",
+  "description": "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, and predict, in a zero-dependency loadable extension.",
   "main": "index.cjs",
   "types": "index.d.ts",
   "files": [

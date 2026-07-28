@@ -1,4 +1,4 @@
-"""everpure.sqlite_predict: prediction as a SQL primitive.
+"""sqlite_predict: prediction as a SQL primitive for SQLite.
 
     import sqlite3
     import sqlite_predict
@@ -11,7 +11,7 @@ The wheel bundles the zero-dependency loadable extension for your platform.
 """
 import os
 
-__version__ = "0.0.1a1"
+__version__ = "0.0.1a6"
 
 
 def loadable_path() -> str:

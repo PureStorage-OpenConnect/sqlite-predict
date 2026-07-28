@@ -1,6 +1,5 @@
 //! Prediction as a SQL primitive for SQLite: `forecast()`, `detect_anomalies()`,
-//! and `predict()`, with replayable receipts. The zero-dependency C core is
-//! compiled into this crate.
+//! and `predict()`. The zero-dependency C core is compiled into this crate.
 //!
 //! Register it as an auto-extension once at startup, then every connection your
 //! process opens (e.g. via `rusqlite`) has the functions available:

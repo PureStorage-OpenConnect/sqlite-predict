@@ -54,6 +54,8 @@ rewriteLine("bindings/rust/Cargo.toml", /^version = "[^"]*"/m,
 const pv = pep440(version);
 rewriteLine("bindings/python/pyproject.toml", /^version = "[^"]*"/m,
             `version = "${pv}"`, pv);
+rewriteLine("bindings/python/sqlite_predict/__init__.py",
+            /^__version__ = "[^"]*"/m, `__version__ = "${pv}"`, pv);
 
 const pkgPath = path.join(root, "bindings", "node", "package.json");
 const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
