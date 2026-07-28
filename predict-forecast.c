@@ -4078,31 +4078,31 @@ static void agg_fc_final(sqlite3_context *ctx) {
   const char *status = n_rows ? rows[0].status : "ok";
   int served = n_rows > 0 && rows[0].has_values;
 
-  /* receipt: a constant-size commitment, only for series the model
-   * actually served (§4.2.8) */
-  char receipt_id[PREDICT_ULID_BUFSIZE] = "";
-  if (opts.receipt && served) {
-    char result_hash[PREDICT_HEX_BUFSIZE];
-    char sdigest[PREDICT_HEX_BUFSIZE];
-    char *rerr = NULL;
+  /* the document receipt (§4.1.7): computed, never written — the
+   * aggregate form is a pure function, and the caller decides where
+   * provenance lives */
+  char result_hash[PREDICT_HEX_BUFSIZE];
+  char sdigest[PREDICT_HEX_BUFSIZE];
+  char model_hash[PREDICT_HEX_BUFSIZE];
+  char *params = NULL;
+  int with_receipt = opts.receipt && served;
+  if (with_receipt) {
     int start = (opts.context_limit > 0 && a->n > opts.context_limit)
                     ? a->n - opts.context_limit
                     : 0;
     int irc = fc_result_hash(rows, n_rows, result_hash);
-    char *params = NULL;
     if (irc == SQLITE_OK) {
       agg_series_digest(a->ts, a->val, start, a->n, sdigest);
+      if (predict0_model_hash_for(db, model_id, model_hash))
+        irc = SQLITE_NOMEM;
+    }
+    if (irc == SQLITE_OK) {
       params = fc_build_params(db, &opts, horizon, model_id, NULL, NULL, 1);
       if (!params)
         irc = SQLITE_NOMEM;
     }
-    if (irc == SQLITE_OK)
-      irc = predict0_emit_receipt_digest(db, "forecast", model_id, params,
-                                         sdigest, result_hash, receipt_id,
-                                         &rerr);
-    sqlite3_free(params);
     if (irc != SQLITE_OK) {
-      agg_error(ctx, rerr);
+      sqlite3_result_error_nomem(ctx);
       for (int i = 0; i < n_rows; i++)
         sqlite3_free(rows[i].series_key);
       sqlite3_free(rows);
@@ -4117,11 +4117,18 @@ static void agg_fc_final(sqlite3_context *ctx) {
   sqlite3_str *doc = sqlite3_str_new(db);
   sqlite3_str_appendall(doc, "{\"model\":");
   agg_json_str(doc, model_id);
-  sqlite3_str_appendall(doc, ",\"receipt_id\":");
-  if (receipt_id[0])
-    sqlite3_str_appendf(doc, "\"%s\"", receipt_id);
-  else
+  sqlite3_str_appendall(doc, ",\"receipt\":");
+  if (with_receipt) {
+    sqlite3_str_appendall(doc, "{\"op\":\"forecast\",\"model\":");
+    agg_json_str(doc, model_id);
+    sqlite3_str_appendf(doc,
+                        ",\"model_hash\":\"%s\",\"params\":%s,"
+                        "\"input_digest\":\"%s\",\"result_hash\":\"%s\"}",
+                        model_hash, params, sdigest, result_hash);
+  } else {
     sqlite3_str_appendall(doc, "null");
+  }
+  sqlite3_free(params);
   sqlite3_str_appendf(doc, ",\"status\":\"%s\",\"rows\":[", status);
   int first = 1;
   for (int i = 0; i < n_rows; i++) {
@@ -4212,29 +4219,29 @@ static void agg_an_final(sqlite3_context *ctx) {
   const char *status = n_rows ? rows[0].status : "ok";
   int served = n_rows > 0 && rows[0].has_values;
 
-  char receipt_id[PREDICT_ULID_BUFSIZE] = "";
-  if (opts.receipt && served) {
-    char result_hash[PREDICT_HEX_BUFSIZE];
-    char sdigest[PREDICT_HEX_BUFSIZE];
-    char *params = NULL;
-    char *rerr = NULL;
+  /* document receipt (§4.1.7): computed, never written */
+  char result_hash[PREDICT_HEX_BUFSIZE];
+  char sdigest[PREDICT_HEX_BUFSIZE];
+  char model_hash[PREDICT_HEX_BUFSIZE];
+  char *params = NULL;
+  int with_receipt = opts.receipt && served;
+  if (with_receipt) {
     int start = (opts.context_limit > 0 && a->n > opts.context_limit)
                     ? a->n - opts.context_limit
                     : 0;
     int irc = an_result_hash(rows, n_rows, result_hash);
     if (irc == SQLITE_OK) {
       agg_series_digest(a->ts, a->val, start, a->n, sdigest);
+      if (predict0_model_hash_for(db, model_id, model_hash))
+        irc = SQLITE_NOMEM;
+    }
+    if (irc == SQLITE_OK) {
       params = an_build_params(db, &opts, model_id, NULL, NULL, 1);
       if (!params)
         irc = SQLITE_NOMEM;
     }
-    if (irc == SQLITE_OK)
-      irc = predict0_emit_receipt_digest(db, "detect_anomalies", model_id,
-                                         params, sdigest, result_hash,
-                                         receipt_id, &rerr);
-    sqlite3_free(params);
     if (irc != SQLITE_OK) {
-      agg_error(ctx, rerr);
+      sqlite3_result_error_nomem(ctx);
       for (int i = 0; i < n_rows; i++)
         sqlite3_free(rows[i].series_key);
       sqlite3_free(rows);
@@ -4247,11 +4254,18 @@ static void agg_an_final(sqlite3_context *ctx) {
   sqlite3_str *doc = sqlite3_str_new(db);
   sqlite3_str_appendall(doc, "{\"model\":");
   agg_json_str(doc, model_id);
-  sqlite3_str_appendall(doc, ",\"receipt_id\":");
-  if (receipt_id[0])
-    sqlite3_str_appendf(doc, "\"%s\"", receipt_id);
-  else
+  sqlite3_str_appendall(doc, ",\"receipt\":");
+  if (with_receipt) {
+    sqlite3_str_appendall(doc, "{\"op\":\"detect_anomalies\",\"model\":");
+    agg_json_str(doc, model_id);
+    sqlite3_str_appendf(doc,
+                        ",\"model_hash\":\"%s\",\"params\":%s,"
+                        "\"input_digest\":\"%s\",\"result_hash\":\"%s\"}",
+                        model_hash, params, sdigest, result_hash);
+  } else {
     sqlite3_str_appendall(doc, "null");
+  }
+  sqlite3_free(params);
   sqlite3_str_appendf(doc, ",\"status\":\"%s\",\"rows\":[", status);
   int first = 1;
   for (int i = 0; i < n_rows; i++) {
@@ -4327,7 +4341,6 @@ typedef struct {
   int n_rows;
   int i;
   char *status;
-  char *receipt_id;
 } xrows_cursor;
 
 static int xr_connect(sqlite3 *db, void *pAux, int argc,
@@ -4347,11 +4360,10 @@ static int xr_connect(sqlite3 *db, void *pAux, int argc,
       db, is_anom
               ? "CREATE TABLE x(ts TEXT, value REAL, forecast REAL,"
                 " lower_bound REAL, upper_bound REAL, is_anomaly INTEGER,"
-                " anomaly_probability REAL, status TEXT, receipt_id TEXT,"
-                " doc HIDDEN)"
+                " anomaly_probability REAL, status TEXT, doc HIDDEN)"
               : "CREATE TABLE x(step INTEGER, forecast_timestamp TEXT,"
                 " forecast REAL, lower_bound REAL, upper_bound REAL,"
-                " status TEXT, receipt_id TEXT, doc HIDDEN)");
+                " status TEXT, doc HIDDEN)");
   if (rc != SQLITE_OK) {
     sqlite3_free(v);
     return rc;
@@ -4367,7 +4379,7 @@ static int xr_disconnect(sqlite3_vtab *pVtab) {
 
 static int xr_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdx) {
   xrows_vtab *v = (xrows_vtab *)pVtab;
-  int doc_col = v->is_anom ? 9 : 7;
+  int doc_col = v->is_anom ? 8 : 6;
   int seen = 0;
   for (int i = 0; i < pIdx->nConstraint; i++) {
     const struct sqlite3_index_constraint *c = &pIdx->aConstraint[i];
@@ -4404,11 +4416,9 @@ static void xr_rows_free(xrows_cursor *c) {
     sqlite3_free(c->rows[i].ts);
   sqlite3_free(c->rows);
   sqlite3_free(c->status);
-  sqlite3_free(c->receipt_id);
   c->rows = NULL;
   c->n_rows = 0;
   c->status = NULL;
-  c->receipt_id = NULL;
   c->i = 0;
 }
 
@@ -4441,12 +4451,11 @@ static int xr_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (!doc)
     return xr_error(cur, "document must be text");
 
-  /* validate the document shape and lift the top-level fields */
+  /* validate the document shape and lift the top-level status */
   sqlite3_stmt *top = NULL;
   if (sqlite3_prepare_v2(db,
                          "SELECT json_type(?1), json_type(?1,'$.rows'),"
-                         " json_extract(?1,'$.status'),"
-                         " json_extract(?1,'$.receipt_id')",
+                         " json_extract(?1,'$.status')",
                          -1, &top, NULL) != SQLITE_OK)
     return xr_error(cur, "could not parse document");
   sqlite3_bind_text(top, 1, doc, -1, SQLITE_STATIC);
@@ -4462,9 +4471,6 @@ static int xr_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   }
   cur->status =
       sqlite3_mprintf("%s", (const char *)sqlite3_column_text(top, 2));
-  if (sqlite3_column_type(top, 3) == SQLITE_TEXT)
-    cur->receipt_id =
-        sqlite3_mprintf("%s", (const char *)sqlite3_column_text(top, 3));
   sqlite3_finalize(top);
 
   const char *rows_sql =
@@ -4573,11 +4579,6 @@ static int xr_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
       sqlite3_result_text(ctx, c->status, -1, SQLITE_TRANSIENT);
     return SQLITE_OK;
   }
-  if (col == status_col + 1) {
-    if (c->receipt_id)
-      sqlite3_result_text(ctx, c->receipt_id, -1, SQLITE_TRANSIENT);
-    return SQLITE_OK;
-  }
   if (v->is_anom) {
     switch (col) {
     case 0: /* ts */
@@ -4676,9 +4677,9 @@ int predict0_forecast_init(sqlite3 *db) {
   /* Aggregate forms (RFC §4.2.8), same names as the table-valued forms:
    * SQLite keeps function and vtab-module namespaces separate, so
    * expression position resolves here and FROM position resolves above.
-   * SQLITE_DIRECTONLY per §6.7 (receipt writes are a side effect), and
-   * never SQLITE_DETERMINISTIC. */
-  static const int AGG_FLAGS = SQLITE_UTF8 | SQLITE_DIRECTONLY;
+   * Pure functions (§4.1.7: the receipt is returned, never written), so
+   * no SQLITE_DIRECTONLY — views over forecasts are legal (§6.7). */
+  static const int AGG_FLAGS = SQLITE_UTF8;
   rc = sqlite3_create_function_v2(db, "forecast", 3, AGG_FLAGS, NULL, NULL,
                                   agg_fc_step, agg_fc_final, NULL);
   if (rc != SQLITE_OK)

@@ -43,16 +43,17 @@ Fits a native forecast student and registers it. Columns: `model_id`,
 ### `predict_replay(receipt_id)`
 
 Re-executes a recorded query-form call against its anchored data. Columns:
-`match`, `result_hash`, `original_hash`, `detail`. Aggregate-form (commitment)
-receipts are rejected with a pointer to `predict_verify`.
+`match`, `result_hash`, `original_hash`, `detail`.
 
-### `predict_verify(receipt_id, query)`
+### `predict_verify(receipt, query)`
 
-Verifies an aggregate-form commitment receipt against caller-supplied rows:
-`query` is a read-only `SELECT` of one `(ts, value)` series; its digest is
-checked against the receipt's committed input digest, then the recorded call
-re-runs on those rows and result hashes are compared. A digest mismatch is a
-finding (`match = 0`), not an error. Columns as `predict_replay`.
+Verifies an aggregate-form receipt document against caller-supplied rows,
+statelessly: `receipt` is the document itself (or a whole result document),
+`query` is a read-only `SELECT` of one `(ts, value)` series. The rows' digest
+is checked against the receipt's `input_digest`, then the recorded call
+re-runs on them and result hashes are compared. A digest mismatch is a
+finding (`match = 0`), not an error; a model-hash mismatch is a hard error.
+Columns as `predict_replay`.
 
 ## Aggregate forms
 
@@ -66,10 +67,17 @@ instead of text inside a string. See the [ORM guide](../../guides/orms/).
 ### `forecast(ts, value, horizon [, options])` — aggregate
 
 One `(ts, value)` observation per input row; rows are sorted by `ts`
-internally, so input order never matters. Returns one JSON document per group:
+internally, so input order never matters. Returns one JSON document per group,
+carrying its [receipt as data](../../guides/receipts/#document-receipts-the-aggregate-form)
+(nothing is written — the aggregate is a pure function, legal in views and on
+read-only databases):
 
 ```json
-{"model": "theta-classic", "receipt_id": "01J…", "status": "ok",
+{"model": "theta-classic",
+ "receipt": {"op": "forecast", "model": "theta-classic",
+             "model_hash": "…", "params": {…},
+             "input_digest": "…", "result_hash": "…"},
+ "status": "ok",
  "rows": [{"step": 1, "forecast_timestamp": "…", "forecast": 1.0,
            "lower_bound": 0.5, "upper_bound": 1.5}, …]}
 ```
@@ -80,7 +88,7 @@ SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 
 An aggregate over zero rows returns `NULL` (like `sum()`). A degraded series
 (`insufficient_history`, `non_numeric`) returns a status document with empty
-`rows` and `receipt_id` null; it does not fail the statement.
+`rows` and `receipt` null; it does not fail the statement.
 
 ### `detect_anomalies(ts, value [, options])` — aggregate
 

@@ -102,7 +102,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     text, NULL, NULL);
     run_sql_discard(db,
                     "SELECT match FROM predict_verify((SELECT forecast(ts,"
-                    " value, 2) ->> '$.receipt_id' FROM series), ?1)",
+                    " value, 2) FROM series), ?1)",
                     text, NULL, NULL);
     break;
   default: /* fuzz predict_ulid + predict_replay lookups */

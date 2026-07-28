@@ -45,7 +45,8 @@ const out = db
   .groupBy(readings.city)
   .all();
 
-const { rows, receipt_id } = JSON.parse(out[0].doc);
+const { rows, receipt } = JSON.parse(out[0].doc);
+// store `receipt` in your own provenance table if you want it kept
 ```
 
 ## SQLAlchemy (Python)
@@ -123,9 +124,8 @@ context.configure(include_name=include_name, ...)
 drift detection flags them; keep predict tables in a separate attached
 database, or use `migrate diff` reviews rather than auto-apply.
 
-One more consideration for app read paths: every serving call writes a receipt
-row by default. The aggregate form's receipt is a ~450-byte commitment (never
-your data), so the cost is the write itself, not the size: on hot read paths
-or read-only replicas, pass `'{"receipt": 0}'`; on a read-only database, calls
-without it fail loudly and name the fix. See
-[Receipts & replay](../receipts/).
+A note on receipts: the aggregate form never writes to the database. Its
+receipt is a ~450-byte document returned inside the result (never your data,
+only digests); store it in your own provenance table or pipeline if you want
+it kept, and verify it later with `predict_verify`. Read paths stay read-only,
+replicas included. See [Receipts & replay](../receipts/).

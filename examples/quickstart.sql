@@ -44,10 +44,12 @@ SELECT match, detail FROM predict_replay(
 .print '\n== the aggregate form: plain SQL supplies the rows (the ORM path) =='
 -- forecast() also works as an aggregate in expression position: WHERE,
 -- joins, and GROUP BY compose, and each group returns one JSON document.
--- Its receipt is a constant-size commitment: a digest of the exact input
--- rows, verifiable later by re-supplying them (no row values stored).
-SELECT json_extract(forecast(ts, value, 6), '$.status')  AS status,
-       json_extract(forecast(ts, value, 6), '$.model')   AS model
+-- It is a pure function: nothing is written, so it works on read-only
+-- databases and in views, and the receipt comes back INSIDE the document
+-- (digests only, never your data) for you to store wherever provenance
+-- lives.
+SELECT json_extract(forecast(ts, value, 6), '$.status')            AS status,
+       json_extract(forecast(ts, value, 6), '$.receipt.model_hash') AS model_hash
 FROM readings;
 
 -- expand the document back to typed rows in SQL
@@ -55,15 +57,15 @@ SELECT r.step, r.forecast_timestamp, round(r.forecast, 1) AS forecast
 FROM forecast_rows((SELECT forecast(ts, value, 6, '{"receipt":0}')
                     FROM readings)) AS r;
 
-.print '\n== verify a commitment receipt by re-supplying the rows =='
+.print '\n== verify a receipt document by re-supplying the rows =='
+-- hand predict_verify the document (or just its receipt field) + the rows
 SELECT match, detail FROM predict_verify(
-  (SELECT receipt_id FROM _predict_receipts
-   WHERE anchor_kind = 'input-digest' ORDER BY receipt_id DESC LIMIT 1),
+  (SELECT forecast(ts, value, 6) FROM readings),
   'SELECT ts, value FROM readings');
 
--- change the data and the same verification reports honestly
+-- change the data and the same receipt reports honestly
+CREATE TEMP TABLE saved AS
+  SELECT forecast(ts, value, 6) AS doc FROM readings;
 DELETE FROM readings WHERE rowid % 5 = 0;
 SELECT match, detail FROM predict_verify(
-  (SELECT receipt_id FROM _predict_receipts
-   WHERE anchor_kind = 'input-digest' ORDER BY receipt_id DESC LIMIT 1),
-  'SELECT ts, value FROM readings');
+  (SELECT doc FROM saved), 'SELECT ts, value FROM readings');

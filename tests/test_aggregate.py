@@ -35,10 +35,12 @@ def last_receipt(db, **where):
                      "input_sql", "result_hash"), row))
 
 
-def verify(db, receipt_id, query):
+def verify(db, receipt, query):
+    if isinstance(receipt, dict):
+        receipt = json.dumps(receipt)
     return db.execute(
         "SELECT match, detail FROM predict_verify(?, ?)",
-        (receipt_id, query)).fetchone()
+        (receipt, query)).fetchone()
 
 
 # ---- shape and semantics ----
@@ -50,7 +52,9 @@ def test_forecast_doc_shape(db):
     d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
     assert d["status"] == "ok"
     assert d["model"] == "theta-classic"
-    assert d["receipt_id"] is not None
+    assert set(d["receipt"]) == {"op", "model", "model_hash", "params",
+                                 "input_digest", "result_hash"}
+    assert d["receipt"]["op"] == "forecast"
     assert len(d["rows"]) == 6
     r = d["rows"][0]
     assert set(r) == {"step", "forecast_timestamp", "forecast",
@@ -111,11 +115,7 @@ def test_degraded_series_status_no_receipt(db):
     d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
     assert d["status"] == "insufficient_history"
     assert d["rows"] == []
-    assert d["receipt_id"] is None
-    if db.execute("SELECT name FROM sqlite_master WHERE name ="
-                  " '_predict_receipts'").fetchone():
-        assert db.execute(
-            "SELECT count(*) FROM _predict_receipts").fetchone()[0] == 0
+    assert d["receipt"] is None
 
 
 def test_non_numeric_degrades_not_fails(db):
@@ -125,7 +125,7 @@ def test_non_numeric_degrades_not_fails(db):
     d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
     assert d["status"] == "non_numeric"
     assert d["rows"] == []
-    assert d["receipt_id"] is None
+    assert d["receipt"] is None
 
 
 # ---- conformance invariant 1: cross-form hash parity ----
@@ -134,26 +134,24 @@ def test_non_numeric_degrades_not_fails(db):
 def test_aggregate_hash_equals_single_series_query_hash(db):
     rows, _ = syn.trend_season(n=120, seed=26)
     syn.load_into(db, rows)
-    db.execute("SELECT forecast(ts, value, 8) FROM series").fetchone()
+    d = doc(db, "SELECT forecast(ts, value, 8) FROM series")
     db.execute(
         "SELECT count(*) FROM forecast('SELECT ts, value FROM series"
         " ORDER BY ts', 8)").fetchone()
-    agg = last_receipt(db, anchor_kind="input-digest")
     query = last_receipt(db, anchor_kind="logical-digest")
-    assert agg["result_hash"] == query["result_hash"]
+    assert d["receipt"]["result_hash"] == query["result_hash"]
 
 
 def test_anomaly_aggregate_hash_parity(db):
     rows, _ = syn.trend_season(n=96, seed=27)
     rows, _ = syn.with_anomalies(rows, k=3, seed=28)
     syn.load_into(db, rows)
-    db.execute("SELECT detect_anomalies(ts, value) FROM series").fetchone()
+    d = doc(db, "SELECT detect_anomalies(ts, value) FROM series")
     db.execute(
         "SELECT count(*) FROM detect_anomalies('SELECT ts, value FROM series"
         " ORDER BY ts')").fetchone()
-    agg = last_receipt(db, anchor_kind="input-digest")
     query = last_receipt(db, anchor_kind="logical-digest")
-    assert agg["result_hash"] == query["result_hash"]
+    assert d["receipt"]["result_hash"] == query["result_hash"]
 
 
 # ---- conformance invariant 2: predict_verify (§4.2.10) ----
@@ -162,18 +160,22 @@ def test_anomaly_aggregate_hash_parity(db):
 def test_verify_round_trip_and_mutation_detection(db):
     rows, _ = syn.trend_season(n=96, seed=29)
     syn.load_into(db, rows)
-    db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
-    rec = last_receipt(db, anchor_kind="input-digest")
+    rec = doc(db, "SELECT forecast(ts, value, 6) FROM series")["receipt"]
 
-    match, detail = verify(db, rec["receipt_id"],
-                           "SELECT ts, value FROM series")
+    match, detail = verify(db, rec, "SELECT ts, value FROM series")
+    assert match == 1, detail
+
+    # a whole result document is accepted too
+    match, detail = db.execute(
+        "SELECT match, detail FROM predict_verify("
+        "(SELECT forecast(ts, value, 6) FROM series),"
+        " 'SELECT ts, value FROM series')").fetchone()
     assert match == 1, detail
 
     # changed inputs are a finding (match = 0), never a false match
     db.execute("UPDATE series SET value = value + 1 WHERE rowid = 5")
     db.commit()
-    match, detail = verify(db, rec["receipt_id"],
-                           "SELECT ts, value FROM series")
+    match, detail = verify(db, rec, "SELECT ts, value FROM series")
     assert match == 0
     assert "input digest" in detail
 
@@ -181,15 +183,14 @@ def test_verify_round_trip_and_mutation_detection(db):
 def test_verify_survives_source_drop_via_reconstruction(db):
     rows, _ = syn.trend_season(n=96, seed=30)
     syn.load_into(db, rows)
-    db.execute("SELECT detect_anomalies(ts, value) FROM series").fetchone()
-    rec = last_receipt(db, operation="detect_anomalies")
+    rec = doc(db, "SELECT detect_anomalies(ts, value) FROM series")["receipt"]
+    assert rec["op"] == "detect_anomalies"
 
     # the durability property: verification needs the rows, not the table
     db.execute("CREATE TEMP TABLE recon AS SELECT ts, value FROM series")
     db.execute("DROP TABLE series")
     db.commit()
-    match, detail = verify(db, rec["receipt_id"],
-                           "SELECT ts, value FROM recon")
+    match, detail = verify(db, rec, "SELECT ts, value FROM recon")
     assert match == 1, detail
 
 
@@ -198,81 +199,77 @@ def test_verify_applies_recorded_context_limit(db):
     # window); verifying with the full history must still match
     rows, _ = syn.trend_season(n=96, seed=31)
     syn.load_into(db, rows)
-    db.execute("SELECT forecast(ts, value, 6,"
-               " '{\"context_limit\": 64}') FROM series").fetchone()
-    rec = last_receipt(db, anchor_kind="input-digest")
-    match, detail = verify(db, rec["receipt_id"],
-                           "SELECT ts, value FROM series")
+    rec = doc(db, "SELECT forecast(ts, value, 6,"
+                  " '{\"context_limit\": 64}') FROM series")["receipt"]
+    assert rec["params"]["context_limit"] == 64
+    match, detail = verify(db, rec, "SELECT ts, value FROM series")
     assert match == 1, detail
-
-
-def test_replay_rejects_commitment_receipts(db):
-    rows, _ = syn.trend_season(n=96, seed=52)
-    syn.load_into(db, rows)
-    db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
-    rec = last_receipt(db, anchor_kind="input-digest")
-    with pytest.raises(sqlite3.OperationalError,
-                       match="ANCHOR_UNAVAILABLE.*predict_verify"):
-        db.execute("SELECT match FROM predict_replay(?)",
-                   (rec["receipt_id"],)).fetchone()
-
-
-def test_verify_rejects_query_form_receipts(db):
-    rows, _ = syn.trend_season(n=96, seed=53)
-    syn.load_into(db, rows)
-    db.execute("SELECT count(*) FROM forecast('SELECT ts, value FROM series"
-               " ORDER BY ts', 6)").fetchone()
-    rec = last_receipt(db, anchor_kind="logical-digest")
-    with pytest.raises(sqlite3.OperationalError,
-                       match="ANCHOR_UNAVAILABLE.*predict_replay"):
-        verify(db, rec["receipt_id"], "SELECT ts, value FROM series")
 
 
 def test_verify_argument_errors(db):
     rows, _ = syn.trend_season(n=96, seed=54)
     syn.load_into(db, rows)
-    db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
-    rec = last_receipt(db, anchor_kind="input-digest")
-    with pytest.raises(sqlite3.OperationalError, match="RECEIPT_NOT_FOUND"):
+    rec = doc(db, "SELECT forecast(ts, value, 6) FROM series")["receipt"]
+    # a receipt_id-style string is not a document
+    with pytest.raises(sqlite3.OperationalError, match="SCHEMA"):
         verify(db, "01NOPE", "SELECT ts, value FROM series")
+    for garbage in ("{}", "[1,2]", '{"op": "forecast"}'):
+        with pytest.raises(sqlite3.OperationalError, match="SCHEMA"):
+            verify(db, garbage, "SELECT ts, value FROM series")
     with pytest.raises(sqlite3.OperationalError, match="NOT_READONLY"):
-        verify(db, rec["receipt_id"], "DELETE FROM series")
+        verify(db, rec, "DELETE FROM series")
 
 
-def test_tampered_anchor_reports_mismatch(db):
+def test_tampered_receipt_is_caught(db):
     rows, _ = syn.trend_season(n=96, seed=55)
     syn.load_into(db, rows)
-    db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
-    rec = last_receipt(db, anchor_kind="input-digest")
-    db.execute("UPDATE _predict_receipts SET anchor = ? WHERE receipt_id = ?",
-               ("0" * 64, rec["receipt_id"]))
-    db.commit()
-    match, detail = verify(db, rec["receipt_id"],
-                           "SELECT ts, value FROM series")
-    assert match == 0
-    assert "input digest" in detail
+    rec = doc(db, "SELECT forecast(ts, value, 6) FROM series")["receipt"]
+
+    # edited input digest: a mismatch finding
+    bad = dict(rec, input_digest="0" * 64)
+    match, detail = verify(db, bad, "SELECT ts, value FROM series")
+    assert match == 0 and "input digest" in detail
+
+    # edited result hash: inputs confirm, result does not
+    bad = dict(rec, result_hash="0" * 64)
+    match, detail = verify(db, bad, "SELECT ts, value FROM series")
+    assert match == 0 and "diverged" in detail
+
+    # edited model hash: a hard error, the model is not the one attested
+    bad = dict(rec, model_hash="0" * 64)
+    with pytest.raises(sqlite3.OperationalError, match="MODEL_HASH"):
+        verify(db, bad, "SELECT ts, value FROM series")
 
 
 # ---- receipts ----
 
 
-def test_commitment_receipt_fields(db):
+def test_document_receipt_fields(db):
     rows, _ = syn.trend_season(n=96, seed=32)
     syn.load_into(db, rows)
-    d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
-    rec = last_receipt(db, anchor_kind="input-digest")
-    assert rec["receipt_id"] == d["receipt_id"]
-    assert rec["input_sql"] is None
-    assert len(rec["anchor"]) == 64  # a digest, never row values
-    params = json.loads(rec["params"])
+    rec = doc(db, "SELECT forecast(ts, value, 6) FROM series")["receipt"]
+    assert rec["op"] == "forecast"
+    assert len(rec["input_digest"]) == 64  # digests, never row values
+    assert len(rec["result_hash"]) == 64
+    assert len(rec["model_hash"]) == 64
     # aggregate params carry no query-shape keys (RFC §4.2.8)
     for absent in ("time_col", "value_col", "group_cols"):
-        assert absent not in params
-    assert params["horizon"] == 6
+        assert absent not in rec["params"]
+    assert rec["params"]["horizon"] == 6
+
+
+def test_aggregate_is_pure_no_tables_no_writes(db):
+    # the aggregate form writes nothing: not even the registry tables
+    rows, _ = syn.trend_season(n=96, seed=56)
+    syn.load_into(db, rows)
+    db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
+    db.execute("SELECT detect_anomalies(ts, value) FROM series").fetchone()
+    assert db.execute("SELECT count(*) FROM sqlite_master WHERE name LIKE"
+                      " '_predict%'").fetchone()[0] == 0
 
 
 def test_receipt_is_constant_size(db):
-    # the commitment receipt's weight must not scale with the series
+    # the document receipt's weight must not scale with the series
     import conftest
     sizes = {}
     for n in (96, 4096):
@@ -281,12 +278,9 @@ def test_receipt_is_constant_size(db):
         c.executemany("INSERT INTO r VALUES (?,?)",
                       [(1577836800 + i * 3600, 50.0 + i % 24)
                        for i in range(n)])
-        c.execute("SELECT detect_anomalies(ts, value) FROM r").fetchone()
-        sizes[n] = c.execute(
-            "SELECT length(receipt_id)+length(operation)+length(model_id)"
-            "+length(model_hash)+length(anchor_kind)+length(anchor)"
-            "+length(params)+length(result_hash) FROM _predict_receipts"
-        ).fetchone()[0]
+        d = json.loads(c.execute(
+            "SELECT detect_anomalies(ts, value) FROM r").fetchone()[0])
+        sizes[n] = len(json.dumps(d["receipt"]))
         c.close()
     assert sizes[96] == sizes[4096]
     assert sizes[96] < 1000
@@ -297,15 +291,12 @@ def test_receipt_opt_out(db):
     syn.load_into(db, rows)
     d = doc(db, "SELECT forecast(ts, value, 6, '{\"receipt\": 0}') FROM series")
     assert d["status"] == "ok"
-    assert d["receipt_id"] is None
-    tables = db.execute("SELECT name FROM sqlite_master WHERE name ="
-                        " '_predict_receipts'").fetchall()
-    if tables:
-        assert db.execute(
-            "SELECT count(*) FROM _predict_receipts").fetchone()[0] == 0
+    assert d["receipt"] is None
 
 
-def test_read_only_database_fails_loudly_without_opt_out(db, tmp_path):
+def test_read_only_database_works_with_receipts(db, tmp_path):
+    # the aggregate form is pure, so a read-only database serves
+    # forecasts with receipts intact, and verifies them too
     path = tmp_path / "ro.db"
     setup = sqlite3.connect(path)
     rows, _ = syn.trend_season(n=96, seed=34)
@@ -317,14 +308,13 @@ def test_read_only_database_fails_loudly_without_opt_out(db, tmp_path):
     ro.enable_load_extension(True)
     ro.load_extension(conftest.EXT_PATH)
     try:
-        with pytest.raises(sqlite3.OperationalError,
-                           match="receipt"):
-            ro.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
         d = json.loads(ro.execute(
-            "SELECT forecast(ts, value, 6, '{\"receipt\": 0}') FROM series"
-        ).fetchone()[0])
+            "SELECT forecast(ts, value, 6) FROM series").fetchone()[0])
         assert d["status"] == "ok"
-        assert d["receipt_id"] is None
+        assert d["receipt"] is not None
+        match, detail = verify(ro, d["receipt"],
+                               "SELECT ts, value FROM series")
+        assert match == 1, detail
     finally:
         ro.close()
 
@@ -337,11 +327,10 @@ def test_one_receipt_per_group(db):
     docs = db.execute(
         "SELECT grp, forecast(ts, value, 4) FROM series GROUP BY grp"
     ).fetchall()
-    rids = {json.loads(d)["receipt_id"] for _, d in docs}
-    assert len(rids) == 2 and None not in rids
-    n = db.execute("SELECT count(*) FROM _predict_receipts WHERE"
-                   " anchor_kind = 'input-digest'").fetchone()[0]
-    assert n == 2
+    recs = [json.loads(d)["receipt"] for _, d in docs]
+    assert all(r is not None for r in recs)
+    assert len({r["input_digest"] for r in recs}) == 2
+    assert len({r["result_hash"] for r in recs}) == 2
 
 
 # ---- argument and option validation ----
@@ -474,13 +463,12 @@ def test_forecast_rows_round_trip(db):
     syn.load_into(db, rows)
     out = db.execute(
         "SELECT r.step, r.forecast_timestamp, r.forecast, r.lower_bound,"
-        " r.upper_bound, r.status, r.receipt_id FROM forecast_rows("
+        " r.upper_bound, r.status FROM forecast_rows("
         " (SELECT forecast(ts, value, 5) FROM series)) r").fetchall()
     assert len(out) == 5
     assert [r[0] for r in out] == [1, 2, 3, 4, 5]
     assert all(isinstance(r[2], float) for r in out)
     assert all(r[5] == "ok" for r in out)
-    assert len({r[6] for r in out}) == 1 and out[0][6] is not None
 
 
 def test_anomaly_rows_round_trip(db):
@@ -497,9 +485,9 @@ def test_anomaly_rows_round_trip(db):
 def test_expansion_status_doc_yields_one_status_row(db):
     syn.load_into(db, [("2024-01-01T00:00:00Z", 1.0)])
     out = db.execute(
-        "SELECT step, forecast, status, receipt_id FROM forecast_rows("
+        "SELECT step, forecast, status FROM forecast_rows("
         " (SELECT forecast(ts, value, 4) FROM series))").fetchall()
-    assert out == [(None, None, "insufficient_history", None)]
+    assert out == [(None, None, "insufficient_history")]
 
 
 def test_expansion_null_doc_yields_zero_rows(db):
@@ -513,16 +501,17 @@ def test_expansion_rejects_garbage(db):
             db.execute(f"SELECT * FROM forecast_rows({bad})").fetchall()
 
 
-# ---- side-effect containment (§6.7) ----
+# ---- purity in expression contexts (§6.7) ----
 
 
-def test_aggregate_is_directonly(db):
+def test_aggregate_works_in_views(db):
+    # pure function: a forecast view is legal and evaluates on read
     rows, _ = syn.trend_season(n=96, seed=49)
     syn.load_into(db, rows)
     db.execute("CREATE VIEW v AS SELECT forecast(ts, value, 4) AS d"
                " FROM series")
-    with pytest.raises(sqlite3.OperationalError, match="unsafe"):
-        db.execute("SELECT * FROM v").fetchall()
+    d = json.loads(db.execute("SELECT d FROM v").fetchone()[0])
+    assert d["status"] == "ok" and len(d["rows"]) == 4
 
 
 # ---- ORM-style usage (SQLAlchemy smoke) ----

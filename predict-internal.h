@@ -270,15 +270,11 @@ int predict0_emit_receipt(sqlite3 *db, const char *op, const char *model_id,
                           char receipt_id_out[PREDICT_ULID_BUFSIZE],
                           char **errmsg);
 
-/* Aggregate-form receipt tail (RFC §4.2.8): a constant-size commitment
- * anchored by the digest of the input rows ('input-digest'); no row
- * values stored. */
-int predict0_emit_receipt_digest(sqlite3 *db, const char *op,
-                                 const char *model_id, const char *params,
-                                 const char *series_digest,
-                                 const char *result_hash,
-                                 char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                                 char **errmsg);
+/* Content hash of a model for the aggregate form's document receipt
+ * (RFC §4.1.7): registry row when present (a read), else the
+ * bundled-model formula. Writes nothing. 0 on success. */
+int predict0_model_hash_for(sqlite3 *db, const char *model_id,
+                            char out[PREDICT_HEX_BUFSIZE]);
 
 /* predict_verify's collection half (predict-forecast.c, RFC §4.2.10):
  * collect `query` as one series under the aggregate form's rules and

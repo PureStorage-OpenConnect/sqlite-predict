@@ -31,40 +31,50 @@ This is what makes an agent's predictions **auditable**: the agent cites the
 receipt id, and anyone can reproduce the number later, or detect that the
 underlying data moved.
 
-## Commitment receipts (the aggregate form)
+## Document receipts (the aggregate form)
 
-The [aggregate form](../operations/#two-forms-table-valued-and-aggregate) has
-no query text to re-run, so its receipt is a **commitment**, in the mold of
-supply-chain attestations: this model (pinned by hash), these params, inputs
-with this digest, a result with this hash. It stores no row values and is
-constant-size (~450 bytes) no matter how long the series is, so leaving
-receipts on costs nothing measurable.
+The [aggregate form](../operations/#two-forms-table-valued-and-aggregate)
+**returns its receipt instead of writing it**: a self-contained ~450-byte
+document inside the result, in the mold of a supply-chain attestation — this
+model (pinned by hash), these params, inputs with this digest, a result with
+this hash. The database is never written; where provenance lives is your
+decision, made above the database. An agent that wants the receipt kept
+simply stores the document with a tool call; an app INSERTs it into its own
+table; a pipeline ships it to the log system.
 
-Verification is `predict_verify(receipt_id, query)`: you bring the rows, it
-checks them against the committed digest, re-runs the recorded call, and
-compares result hashes:
+```json
+{"op": "forecast", "model": "theta-classic", "model_hash": "75af…",
+ "params": {"horizon": 24, …}, "input_digest": "…", "result_hash": "…"}
+```
+
+Verification is `predict_verify(receipt, query)` — hand it the receipt
+document (or the whole result document) plus the rows, from anywhere:
 
 ```sql
-SELECT match, detail FROM predict_verify('01J…',
+SELECT match, detail FROM predict_verify(:receipt_json,
   'SELECT ts, value FROM readings WHERE city = ''SF''');
 -- 1 | verified (24 rows)
 ```
 
-| | query-anchored (table-valued) | commitment (aggregate) |
+| | query-anchored (table-valued) | document (aggregate) |
 | --- | --- | --- |
-| verified by | `predict_replay` against anchored DB state | `predict_verify` with caller-supplied rows |
+| receipt lives | in `_predict_receipts`, in your DB | wherever you put it |
+| verified by | `predict_replay` against anchored DB state | `predict_verify` with the document + rows |
 | source table changed since | `PREDICT_ERR_ANCHOR_UNAVAILABLE` | match = 0, "inputs do not match" |
-| original rows available (anywhere) | n/a | **match = 1**, even from a temp table or restored backup |
+| original rows available (anywhere) | n/a | **match = 1**, even from a temp table, a backup, another database |
+| works on read-only databases | no (receipts are writes) | **yes, receipts included** |
 | receipt contains your data | no (query text only) | no (digests only) |
 
 Both answer different questions: the query-anchored receipt proves "this exact
-database state produced this number"; the commitment receipt proves "these
-exact inputs produced this number" to anyone who can produce the inputs. A
-digest mismatch is a finding (match = 0), never a false match.
+database state produced this number"; the document receipt proves "these exact
+inputs produced this number" to anyone holding the document and the inputs. A
+digest mismatch is a finding (match = 0), never a false match; a model-hash
+mismatch is a hard error, because a match under a different model would be
+meaningless.
 
-A receipt is written per served group; degraded groups (`insufficient_history`,
-`non_numeric`) return `receipt_id` null since there is no model execution to
-attest.
+Degraded groups (`insufficient_history`, `non_numeric`) carry `receipt` null:
+there is no model execution to attest. `'{"receipt": 0}'` merely omits the
+object from the document.
 
 ## Skipping receipts
 

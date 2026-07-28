@@ -349,8 +349,7 @@ int main(void) {
     run_discard(db, "SELECT * FROM forecast_rows(NULL)", 1);
   }
 
-  /* one replay round-trip on the last query-form receipt (aggregate
-   * receipts are commitments and reject replay) */
+  /* one replay round-trip on the last query-form receipt */
   if (run_discard(db,
                   "SELECT match FROM predict_replay("
                   "(SELECT receipt_id FROM _predict_receipts WHERE"
@@ -359,27 +358,20 @@ int main(void) {
                   1))
     goto done_fail;
 
-  /* predict_verify round-trips on a commitment receipt (§4.2.10): with
-   * the original rows, after mutation (a match=0 finding, statement
-   * still succeeds), plus the replay rejection and the error paths */
+  /* predict_verify round-trips on a document receipt (§4.2.10): whole
+   * result documents are accepted, mutation is a match=0 finding
+   * (statement still succeeds), and the error paths are loud */
   if (run_discard(db,
                   "SELECT match FROM predict_verify("
-                  "(SELECT receipt_id FROM _predict_receipts WHERE"
-                  " anchor_kind = 'input-digest' ORDER BY receipt_id DESC"
-                  " LIMIT 1), 'SELECT ts, value FROM series')",
+                  "(SELECT forecast(ts, value, 4) FROM series),"
+                  " 'SELECT ts, value FROM series')",
                   1))
     goto done_fail;
-  run_discard(db,
-              "SELECT match FROM predict_replay("
-              "(SELECT receipt_id FROM _predict_receipts WHERE"
-              " anchor_kind = 'input-digest' LIMIT 1))",
-              0);
   run_discard(db, "DELETE FROM series WHERE rowid % 3 = 0", 1);
   if (run_discard(db,
                   "SELECT match FROM predict_verify("
-                  "(SELECT receipt_id FROM _predict_receipts WHERE"
-                  " anchor_kind = 'input-digest' ORDER BY receipt_id DESC"
-                  " LIMIT 1), 'SELECT ts, value FROM series')",
+                  "(SELECT detect_anomalies(ts, value) FROM series),"
+                  " 'SELECT ts, value FROM series')",
                   1))
     goto done_fail;
   run_discard(db,
@@ -388,8 +380,7 @@ int main(void) {
               0);
   run_discard(db,
               "SELECT match FROM predict_verify("
-              "(SELECT receipt_id FROM _predict_receipts WHERE"
-              " anchor_kind = 'input-digest' LIMIT 1),"
+              "(SELECT forecast(ts, value, 2) FROM series),"
               " 'DELETE FROM series')",
               0);
 
