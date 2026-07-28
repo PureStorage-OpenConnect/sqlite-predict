@@ -57,10 +57,10 @@ SELECT forecast(ts, value, 24, '{"model":"traffic-v1"}') FROM readings;
 </CardGrid>
 
 
-## Three why-nots, and one why
+## The pipeline, the meter, or a SQL function
 
-Every alternative gets tables right. The differences are where the work
-lives, where your data goes, and what each prediction costs at volume.
+Every way to predict on tables makes you pick one: build the pipeline,
+pay the meter, or call a function where the data already lives.
 
 <div class="cmp-grid">
   <div class="cmp-card cmp-ours">
