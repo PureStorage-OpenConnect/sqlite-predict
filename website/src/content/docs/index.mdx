@@ -56,6 +56,69 @@ SELECT forecast(ts, value, 24, '{"model":"traffic-v1"}') FROM readings;
   </Card>
 </CardGrid>
 
+
+## Why not the usual ways?
+
+Every alternative gets tables right. The differences are where the work
+lives, where your data goes, and what each prediction costs at volume.
+
+<div class="cmp-grid">
+  <div class="cmp-card">
+    <p class="cmp-kicker">Why not an ML pipeline?</p>
+    <p class="cmp-sub">Great algorithms. The cost is everything around them:
+    the export, the feature job, the container, the deploy.</p>
+    <ul class="cmp-specs">
+      <li><span>FIRST PREDICTION</span><b class="bad">MONTHS</b></li>
+      <li><span>TRAINING</span><b class="bad">PER DATASET, YOUR CLUSTER</b></li>
+      <li><span>SERVING</span><b class="mid">YOUR INFRA, MS</b></li>
+      <li><span>DATA LEAVES THE DB</span><b class="mid">TO THE PIPELINE</b></li>
+      <li><span>COST AT VOLUME</span><b class="mid">YOUR CLUSTER</b></li>
+    </ul>
+  </div>
+  <div class="cmp-card">
+    <p class="cmp-kicker">Why not AutoML?</p>
+    <p class="cmp-sub">Automates the fit. Keeps the pipeline, the
+    infrastructure, and the wait.</p>
+    <ul class="cmp-specs">
+      <li><span>FIRST PREDICTION</span><b class="bad">WEEKS</b></li>
+      <li><span>TRAINING</span><b class="bad">PER DATASET, MANAGED</b></li>
+      <li><span>SERVING</span><b class="mid">DEPLOYED ENDPOINT</b></li>
+      <li><span>DATA LEAVES THE DB</span><b class="bad">USUALLY, TO A CLOUD</b></li>
+      <li><span>COST AT VOLUME</span><b class="mid">YOUR CLUSTER</b></li>
+    </ul>
+  </div>
+  <div class="cmp-card">
+    <p class="cmp-kicker">Why not a prediction API?</p>
+    <p class="cmp-sub">Seconds to the first answer, and the frontier models
+    live here. But "no training" means your rows ride along as context on
+    every call, on a meter, in someone else's cloud.</p>
+    <ul class="cmp-specs">
+      <li><span>FIRST PREDICTION</span><b class="good">SECONDS</b></li>
+      <li><span>TRAINING</span><b class="bad">HIDDEN IN EVERY CALL</b></li>
+      <li><span>SERVING</span><b class="bad">NETWORK ROUND-TRIP</b></li>
+      <li><span>DATA LEAVES THE DB</span><b class="bad">EVERY CALL</b></li>
+      <li><span>COST AT VOLUME</span><b class="bad">LINEAR, THEIR INVOICE</b></li>
+    </ul>
+  </div>
+  <div class="cmp-card cmp-ours">
+    <p class="cmp-kicker"><code>SELECT forecast(...)</code></p>
+    <p class="cmp-sub">A SQL function at your data. Zero-shot in seconds;
+    distill a teacher once and serve its student in microseconds, forever.</p>
+    <ul class="cmp-specs">
+      <li><span>FIRST PREDICTION</span><b class="good">SECONDS</b></li>
+      <li><span>TRAINING</span><b class="good">NONE, OR ONCE IN SECONDS</b></li>
+      <li><span>SERVING</span><b class="good">IN-PROCESS, MICROSECONDS</b></li>
+      <li><span>DATA LEAVES THE DB</span><b class="good">NEVER</b></li>
+      <li><span>COST AT VOLUME</span><b class="good">FLAT, NEAR ZERO</b></li>
+    </ul>
+  </div>
+</div>
+
+The honest asterisk: a frontier model called zero-shot is still the accuracy
+ceiling. The [benchmarks](./benchmarks/) measure the gap; a distilled student
+typically gives up about half a point of accuracy against its teacher and
+keeps everything in the right column.
+
 :::caution[Pre-alpha]
 The API and the SQL surface are unstable and may change without notice. Not yet
 recommended for production.
