@@ -53,7 +53,9 @@ JSONL = os.path.join(os.path.dirname(__file__), "results", "tabpfn-arena.jsonl")
 FULL = os.path.join(os.path.dirname(__file__), "results", "tabarena-full.jsonl")
 RESULTS = os.path.join(os.path.dirname(__file__), "results", "tabpfn.md")
 DEVICE = os.environ.get("TABPFN_DEVICE", "cpu")
-VERSIONS = ("v2", "v3")
+# comma-separated override, e.g. TABPFN_VERSIONS=v2 while only the v2
+# license is accepted on the account (each model family gates separately)
+VERSIONS = tuple(os.environ.get("TABPFN_VERSIONS", "v2,v3").split(","))
 
 
 def tabpfn_estimator(task, version):
@@ -100,12 +102,20 @@ def one_dataset(name, X, y, task):
         row[f"tabpfn_{v}"] = TA.score(yte, t["pred_te"], task)
         row[f"tabpfn_{v}_s"] = round(t["secs_te"], 2)
 
-        # hard-label distillation into our gbt student, served by the extension
-        preds, blob, hold = TA.run_ours_distill_teacher(
-            Xtr, np.asarray(t["pred_tr"]), Xte, task, kind="gbt")
-        row[f"gbt<-tabpfn_{v}"] = TA.score(yte, preds, task)
-        row[f"gbt<-tabpfn_{v} fid"] = TA.fidelity(preds, t["pred_te"])
-        row[f"gbt<-tabpfn_{v} blob"] = blob
+        # hard-label distillation into our gbt student, served by the
+        # extension. On heavily imbalanced sets the teacher's hard train
+        # labels can collapse to one class and distill_predict refuses
+        # loudly; keep the zero-shot columns and fall through to soft.
+        try:
+            preds, blob, hold = TA.run_ours_distill_teacher(
+                Xtr, np.asarray(t["pred_tr"]), Xte, task, kind="gbt")
+            row[f"gbt<-tabpfn_{v}"] = TA.score(yte, preds, task)
+            row[f"gbt<-tabpfn_{v} fid"] = TA.fidelity(preds, t["pred_te"])
+            row[f"gbt<-tabpfn_{v} blob"] = blob
+        except Exception as e:  # noqa: BLE001
+            if "single class" not in str(e):
+                raise
+            row[f"gbt<-tabpfn_{v} collapsed"] = 1
 
         # soft-label (probability) distillation, classification only
         if task == "cls" and t["proba_tr"] is not None:

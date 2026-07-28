@@ -51,6 +51,12 @@ a toy series.
   beats tuned XGBoost** on most [TabArena](benchmarks/results/tabarena-full.md)
   tasks, at a couple of kilobytes and microseconds per row (an evaluation
   under TabFM's non-commercial license; see the license note below).
+- **TabPFN, including the teacher you can actually ship.**
+  [Same subset](benchmarks/results/tabpfn.md): the latest TabPFN-3 beats
+  xgboost on 49/51 tasks zero-shot (~1.5 s/call on Apple GPU), and
+  distilling **TabPFN-2, whose license permits commercial distillation**,
+  into our ~100 KB student costs a median half point of accuracy and
+  serves in microseconds with no Python and no runtime.
 - **Calibrated uncertainty.** On smooth data the default Gaussian prediction
   band is overconfident (measured **0.57 coverage at a nominal 0.90**); the
   `conformal` option lands at the nominal level, and `backtest()` lets a caller
