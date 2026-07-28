@@ -22,7 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
         uses: astral-sh/setup-uv@v5
       - name: Build loadable extension
@@ -34,7 +34,7 @@ jobs:
     name: amalgamation compiles
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # regenerate the single-file amalgamation from the current sources and
       # compile it (static + loadable), so it can never drift from the tree.
       - name: Generate + compile amalgamation
@@ -44,7 +44,7 @@ jobs:
     name: bindings (node + rust)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # rust crate: compiles the amalgamation via build.rs, register + forecast
       - name: Rust crate
         run: make rust-src && cargo test --manifest-path bindings/rust/Cargo.toml
@@ -83,7 +83,7 @@ jobs:
     name: ASan + UBSan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run sanitizer soak
         run: make test-asan CC=clang
 
@@ -91,7 +91,7 @@ jobs:
     name: valgrind
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Run valgrind inside a container instead of apt-installing it on the
       # runner: the host's apt contends with the runner's background
       # unattended-upgrades dpkg lock and can hang. `make test-valgrind` builds
@@ -104,7 +104,7 @@ jobs:
     name: fuzz smoke (60s)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build + run libFuzzer
         run: make fuzz
 
@@ -115,7 +115,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -134,7 +134,7 @@ jobs:
     name: wasm (emscripten)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install emscripten
         run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git
@@ -153,7 +153,7 @@ jobs:
     env:
       ORT_VERSION: "1.27.1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
         uses: astral-sh/setup-uv@v5
       - name: Fetch onnxruntime

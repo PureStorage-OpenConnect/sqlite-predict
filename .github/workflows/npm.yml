@@ -39,7 +39,7 @@ jobs:
           # is public-repo-only); the binary is built, not run, on CI.
           - { pkg: sqlite-predict-linux-arm64,  runner: ubuntu-latest, os: linux,  cpu: arm64, ext: so,    apt: "gcc-aarch64-linux-gnu", cc: "CC=aarch64-linux-gnu-gcc", macarch: "" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -73,7 +73,7 @@ jobs:
     name: sqlite-predict-windows-x64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -107,7 +107,7 @@ jobs:
     needs: [platform, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

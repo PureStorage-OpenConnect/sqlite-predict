@@ -31,7 +31,7 @@ jobs:
       run:
         working-directory: website
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Reads the live Pages config and exposes the correct origin + base_path
       # for the current URL (root subdomain while private, /sqlite-predict once
       # public). We feed those into the Astro build so one build serves either.
