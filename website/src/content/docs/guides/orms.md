@@ -124,6 +124,8 @@ drift detection flags them; keep predict tables in a separate attached
 database, or use `migrate diff` reviews rather than auto-apply.
 
 One more consideration for app read paths: every serving call writes a receipt
-row by default. On hot read paths or read-only replicas, pass
-`'{"receipt": 0}'`; on a read-only database, calls without it fail loudly and
-name the fix. See [Receipts & replay](../receipts/).
+row by default. The aggregate form's receipt is a ~450-byte commitment (never
+your data), so the cost is the write itself, not the size: on hot read paths
+or read-only replicas, pass `'{"receipt": 0}'`; on a read-only database, calls
+without it fail loudly and name the fix. See
+[Receipts & replay](../receipts/).

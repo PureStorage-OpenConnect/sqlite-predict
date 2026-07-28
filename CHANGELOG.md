@@ -19,24 +19,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   functions. This is the ORM-native interface: Drizzle and SQLAlchemy smoke
   tests run in CI, and a "Using with ORMs" guide covers Drizzle, SQLAlchemy,
   Diesel, Prisma, and the `_predict_*` migration-diff exclusions.
-- **Inline-series receipts.** Aggregate-form receipts embed the input series
-  (`input_data`, `anchor_kind='inline-series'`, anchored by a digest of the
-  embedded rows), because no query text exists to re-derive them. They replay
-  independent of database state: `predict_replay` reproduces the result after
-  the source table has churned, which query-anchored receipts cannot.
-  Conformance invariants, both tested: an aggregate call and a single-series
-  table-valued call over identical rows produce identical result hashes, and
-  an inline receipt replays with match = 1 after source mutation. Receipts
-  are written only for series the model actually served; degraded series
-  return `receipt_id` null. The aggregates register `SQLITE_DIRECTONLY` so
-  the receipt side effect cannot fire from views or triggers.
+- **Commitment receipts + `predict_verify`.** Aggregate-form receipts are
+  constant-size (~450 bytes) commitments in the supply-chain-attestation
+  mold: model hash, canonical params, a digest of the exact input rows
+  (`anchor_kind='input-digest'`), and the result hash — no row values are
+  ever stored, so the no-context-rows invariant holds for every receipt kind
+  and receipt weight is independent of series length. The new
+  `predict_verify(receipt_id, query)` TVF verifies one: the caller supplies
+  the rows, their digest is checked against the commitment (a mismatch is a
+  match = 0 finding, never a false match), and on a match the recorded call
+  re-runs and result hashes are compared. Verification succeeds from any
+  source that reproduces the rows, including after the original table is
+  mutated or dropped; `predict_replay` rejects commitment receipts with a
+  pointer to `predict_verify`. Conformance invariants, all tested: cross-form
+  result-hash parity, verify round trip, and honest mismatch reporting.
+  Receipts are written only for series the model actually served; degraded
+  series return `receipt_id` null. The aggregates register
+  `SQLITE_DIRECTONLY` so the receipt side effect cannot fire from views or
+  triggers.
 
 - **`_predict_receipts` schema change** (breaking, pre-alpha): `input_sql` is
-  now nullable, `input_data` added, `anchor_kind` CHECK gains
-  `'inline-series'`, and exactly one of `input_sql`/`input_data` must be set.
-  Databases created by earlier alphas keep working for the table-valued forms
-  (the new column is added idempotently), but aggregate-form receipts on an
-  old table fail its old CHECK; drop `_predict_receipts` to upgrade.
+  now nullable and `anchor_kind` gains `'input-digest'` (NULL `input_sql` iff
+  input-digest). Databases created by earlier alphas keep working for the
+  table-valued forms, but aggregate-form receipts on an old table fail its
+  old CHECK; drop `_predict_receipts` to upgrade.
 - `forecast()`, `detect_anomalies()`, `predict()`, `distill_predict()`, and
   `backtest()` table-valued functions with a trailing JSON options argument.
 - **Auto model selection, conformal intervals, and `backtest()`.**

@@ -42,8 +42,17 @@ Fits a native forecast student and registers it. Columns: `model_id`,
 
 ### `predict_replay(receipt_id)`
 
-Re-executes a recorded call against its anchored data. Columns: `match`,
-`result_hash`, `original_hash`, `detail`.
+Re-executes a recorded query-form call against its anchored data. Columns:
+`match`, `result_hash`, `original_hash`, `detail`. Aggregate-form (commitment)
+receipts are rejected with a pointer to `predict_verify`.
+
+### `predict_verify(receipt_id, query)`
+
+Verifies an aggregate-form commitment receipt against caller-supplied rows:
+`query` is a read-only `SELECT` of one `(ts, value)` series; its digest is
+checked against the receipt's committed input digest, then the recorded call
+re-runs on those rows and result hashes are compared. A digest mismatch is a
+finding (`match = 0`), not an error. Columns as `predict_replay`.
 
 ## Aggregate forms
 

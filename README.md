@@ -89,6 +89,7 @@ toolbox: sqlite-vec gave SQLite vector search; this gives it prediction.
 | `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native DLinear/TiDE forecast net (a linear skip plus a small residual), registered and ready for `forecast()` |
 | `backtest(query, horizon [, options])` | How accurate is the model here? | per-fold accuracy (MAE, RMSE, MASE, sMAPE) and interval coverage from a rolling-origin evaluation |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag by re-running the recorded call against its anchored data state |
+| `predict_verify(receipt_id, query)` | Are these the rows behind this prediction? | a match flag by checking supplied rows against a commitment receipt's input digest and re-running |
 
 `query` is any read-only `SELECT`; results are ordinary rows you can join,
 filter, and materialize. Options are a trailing JSON object
@@ -98,10 +99,12 @@ deliberately mirrors BigQuery's `AI.FORECAST`: rows in, rows out.
 `forecast` and `detect_anomalies` also register as **aggregate functions**
 under the same names, for callers that compose SQL programmatically: the
 statement supplies the rows (`WHERE`, joins, and bound parameters all work),
-`GROUP BY` replaces `group_cols`, and the receipt embeds the input series so
-it replays even after the source table changes. Expand the returned JSON
-document back to typed rows with `forecast_rows()` / `anomaly_rows()`, or just
-`JSON.parse` it in your app. See [Using with
+`GROUP BY` replaces `group_cols`, and each call writes a constant-size
+**commitment receipt** (a digest of the exact inputs, ~450 bytes; no row
+values stored) that `predict_verify(receipt_id, query)` checks later against
+re-supplied rows. Expand the returned JSON document back to typed rows with
+`forecast_rows()` / `anomaly_rows()`, or just `JSON.parse` it in your app. See
+[Using with
 ORMs](https://purestorage-openconnect.github.io/sqlite-predict/guides/orms/).
 
 ### Calibrated intervals, auto-selection, and backtesting
@@ -130,10 +133,11 @@ SELECT avg(coverage) FROM backtest('SELECT ts, value FROM readings', 6,
 ### Receipts and replay
 
 Every prediction is bound to a receipt: the model identity and content
-hash, an anchor for the exact data state it read, the call parameters, and
-a canonical hash of the result. `predict_replay()` re-executes the recorded
-call against that anchored state and confirms the result reproduces
-byte-for-byte.
+hash, an anchor for the exact data it read, the call parameters, and a
+canonical hash of the result — never the data itself. `predict_replay()`
+re-executes a recorded table-valued call against its anchored database
+state; `predict_verify()` checks an aggregate call's commitment receipt
+against rows you re-supply.
 
 ```sql
 SELECT receipt_id FROM forecast('SELECT ts, value FROM readings', 12);
@@ -141,9 +145,14 @@ SELECT receipt_id FROM forecast('SELECT ts, value FROM readings', 12);
 
 SELECT match, detail FROM predict_replay('01J...');
 -- 1 | reproduced (12 rows)
+
+SELECT match, detail FROM predict_verify('01K...',
+  'SELECT ts, value FROM readings WHERE city = ''SF''');
+-- 1 | verified (24 rows)
 ```
 
-Pass `'{"receipt": 0}'` to skip receipt writing on hot paths.
+Pass `'{"receipt": 0}'` to skip receipt writing on hot read paths or
+read-only databases.
 
 ## Models
 

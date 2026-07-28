@@ -31,25 +31,36 @@ This is what makes an agent's predictions **auditable**: the agent cites the
 receipt id, and anyone can reproduce the number later, or detect that the
 underlying data moved.
 
-## Inline-series receipts (the aggregate form)
+## Commitment receipts (the aggregate form)
 
 The [aggregate form](../operations/#two-forms-table-valued-and-aggregate) has
-no query text to re-run, so its receipts embed the input series itself
-(`input_data`), anchored by a digest of that data (`anchor_kind =
-'inline-series'`). That flips the durability trade:
+no query text to re-run, so its receipt is a **commitment**, in the mold of
+supply-chain attestations: this model (pinned by hash), these params, inputs
+with this digest, a result with this hash. It stores no row values and is
+constant-size (~450 bytes) no matter how long the series is, so leaving
+receipts on costs nothing measurable.
 
-| | query-anchored (table-valued) | inline-series (aggregate) |
+Verification is `predict_verify(receipt_id, query)`: you bring the rows, it
+checks them against the committed digest, re-runs the recorded call, and
+compares result hashes:
+
+```sql
+SELECT match, detail FROM predict_verify('01J…',
+  'SELECT ts, value FROM readings WHERE city = ''SF''');
+-- 1 | verified (24 rows)
+```
+
+| | query-anchored (table-valued) | commitment (aggregate) |
 | --- | --- | --- |
-| replay re-runs | the stored query against anchored DB state | the model on the embedded rows |
-| source table changed since | `PREDICT_ERR_ANCHOR_UNAVAILABLE` | **still replays, match = 1** |
-| receipt contains your data | no (query text only) | yes (the numeric series) |
+| verified by | `predict_replay` against anchored DB state | `predict_verify` with caller-supplied rows |
+| source table changed since | `PREDICT_ERR_ANCHOR_UNAVAILABLE` | match = 0, "inputs do not match" |
+| original rows available (anywhere) | n/a | **match = 1**, even from a temp table or restored backup |
+| receipt contains your data | no (query text only) | no (digests only) |
 
-Both behaviors are correct answers to different questions: the query-anchored
-receipt proves "this exact database state produced this number"; the inline
-receipt proves "these exact inputs produced this number" and keeps proving it
-after the table churns. Because the receipt holds a copy of the series, treat
-`_predict_receipts` at the same sensitivity as the data itself, and prune it
-on the usual schedule.
+Both answer different questions: the query-anchored receipt proves "this exact
+database state produced this number"; the commitment receipt proves "these
+exact inputs produced this number" to anyone who can produce the inputs. A
+digest mismatch is a finding (match = 0), never a false match.
 
 A receipt is written per served group; degraded groups (`insufficient_history`,
 `non_numeric`) return `receipt_id` null since there is no model execution to

@@ -3682,10 +3682,13 @@ static sqlite3_module backtestModule = {
  * value[, options]) — the aggregate forms, RFC §4.2.8. The enclosing
  * statement pushes rows in (GROUP BY = series splitting), the model
  * runs through the same fc_/an_ pipeline as the query form, and the
- * result is one JSON document per group. Receipts embed the input
- * series ('inline-series', §4.1.4) and are written only for series the
- * model actually served; degraded series (insufficient_history,
- * non_numeric) return a status document with receipt_id null. */
+ * result is one JSON document per group. Receipts are constant-size
+ * commitments: an 'input-digest' anchor over the exact rows the model
+ * read (§4.1.4), verified later by predict_verify with caller-supplied
+ * rows — no row values are ever stored (§6.4). Receipts are written
+ * only for series the model actually served; degraded series
+ * (insufficient_history, non_numeric) return a status document with
+ * receipt_id null. */
 
 /* aggregate option keys: the query form's set minus the query-shape
  * keys (time_col/value_col/group_cols), which GROUP BY and the argument
@@ -3917,31 +3920,91 @@ static void agg_json_str(sqlite3_str *s, const char *t) {
   sqlite3_str_appendchar(s, 1, '"');
 }
 
-/* canonical input-series JSON + its §4.1.4 digest over the rows the
- * model actually read (post-sort, post-truncation) */
-static char *agg_input_data(const i64 *ts, const f64 *val, int start, int n,
-                            char digest_out[PREDICT_HEX_BUFSIZE]) {
-  sqlite3_str *s = sqlite3_str_new(NULL);
+/* §4.1.4 input-digest over the rows the model actually read
+ * (post-sort, post-truncation): per row, the RFC 3339 timestamp as
+ * TEXT then the value as REAL. The receipt commits to the inputs; it
+ * never stores them (§6.4). */
+static void agg_series_digest(const i64 *ts, const f64 *val, int start, int n,
+                              char digest_out[PREDICT_HEX_BUFSIZE]) {
   predict0_hasher h;
   predict0_hash_init(&h);
-  sqlite3_str_appendall(s, "{\"ts\":[");
   char iso[PREDICT_TS_BUFSIZE];
   for (int i = start; i < n; i++) {
     predict0_format_timestamp(ts[i], iso, sizeof(iso));
-    sqlite3_str_appendf(s, "%s\"%s\"", i > start ? "," : "", iso);
     predict0_hash_text(&h, iso);
     predict0_hash_real(&h, val[i]);
     predict0_hash_row_end(&h);
   }
-  sqlite3_str_appendall(s, "],\"value\":[");
-  for (int i = start; i < n; i++) {
-    if (i > start)
-      sqlite3_str_appendchar(s, 1, ',');
-    agg_json_num(s, val[i]);
-  }
-  sqlite3_str_appendall(s, "]}");
   predict0_hash_hex(&h, digest_out);
-  return sqlite3_str_finish(s); /* NULL on OOM */
+}
+
+/* predict_verify's collection half (RFC §4.2.10): run `query` through
+ * collect_series, then apply the aggregate form's normalization (sort,
+ * whole-second timestamps, the recorded context_limit), and produce
+ * both the §4.1.4 digest and the canonical series JSON the re-run
+ * feeds through json_each. On success the caller owns *doc_out
+ * (sqlite3_malloc'd); on failure *errmsg is set ("CODE: detail"). */
+int predict0_verify_collect(sqlite3 *db, const char *query, int context_limit,
+                            char **doc_out,
+                            char digest_out[PREDICT_HEX_BUFSIZE],
+                            char **errmsg) {
+  *doc_out = NULL;
+  ForecastOpts opts;
+  memset(&opts, 0, sizeof(opts)); /* no groups; infer time/value */
+
+  SeriesBuf *series = NULL;
+  int n_series = 0;
+  char *rtime = NULL, *rvalue = NULL;
+  int rc = collect_series(db, query, &opts, &series, &n_series, &rtime,
+                          &rvalue, errmsg);
+  sqlite3_free(rtime);
+  sqlite3_free(rvalue);
+  if (rc != SQLITE_OK)
+    return rc;
+  if (n_series != 1) {
+    series_array_free(series, n_series);
+    *errmsg = sqlite3_mprintf(
+        "%s: verification query must yield exactly one series",
+        PREDICT_ERR_SCHEMA);
+    return SQLITE_ERROR;
+  }
+  SeriesBuf *s = &series[0];
+  if (s->non_numeric) {
+    series_array_free(series, n_series);
+    *errmsg = sqlite3_mprintf(
+        "%s: verification query yields non-numeric rows", PREDICT_ERR_SCHEMA);
+    return SQLITE_ERROR;
+  }
+  series_sort(s);
+  for (int i = 0; i < s->n; i++) /* the aggregate form's normalization */
+    s->ts[i] -= ((s->ts[i] % 1000) + 1000) % 1000;
+  int start = (context_limit > 0 && s->n > context_limit)
+                  ? s->n - context_limit
+                  : 0;
+
+  agg_series_digest(s->ts, s->val, start, s->n, digest_out);
+
+  sqlite3_str *j = sqlite3_str_new(db);
+  sqlite3_str_appendall(j, "{\"ts\":[");
+  char iso[PREDICT_TS_BUFSIZE];
+  for (int i = start; i < s->n; i++) {
+    predict0_format_timestamp(s->ts[i], iso, sizeof(iso));
+    sqlite3_str_appendf(j, "%s\"%s\"", i > start ? "," : "", iso);
+  }
+  sqlite3_str_appendall(j, "],\"value\":[");
+  for (int i = start; i < s->n; i++) {
+    if (i > start)
+      sqlite3_str_appendchar(j, 1, ',');
+    agg_json_num(j, s->val[i]);
+  }
+  sqlite3_str_appendall(j, "]}");
+  series_array_free(series, n_series);
+  *doc_out = sqlite3_str_finish(j);
+  if (!*doc_out) {
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+    return SQLITE_NOMEM;
+  }
+  return SQLITE_OK;
 }
 
 /* result_error from a "CODE: detail" sqlite3_malloc'd message */
@@ -4015,29 +4078,28 @@ static void agg_fc_final(sqlite3_context *ctx) {
   const char *status = n_rows ? rows[0].status : "ok";
   int served = n_rows > 0 && rows[0].has_values;
 
-  /* receipt: only for series the model actually served (§4.2.8) */
+  /* receipt: a constant-size commitment, only for series the model
+   * actually served (§4.2.8) */
   char receipt_id[PREDICT_ULID_BUFSIZE] = "";
   if (opts.receipt && served) {
     char result_hash[PREDICT_HEX_BUFSIZE];
     char sdigest[PREDICT_HEX_BUFSIZE];
-    char *input_data = NULL;
-    char *params = NULL;
     char *rerr = NULL;
     int start = (opts.context_limit > 0 && a->n > opts.context_limit)
                     ? a->n - opts.context_limit
                     : 0;
     int irc = fc_result_hash(rows, n_rows, result_hash);
+    char *params = NULL;
     if (irc == SQLITE_OK) {
-      input_data = agg_input_data(a->ts, a->val, start, a->n, sdigest);
+      agg_series_digest(a->ts, a->val, start, a->n, sdigest);
       params = fc_build_params(db, &opts, horizon, model_id, NULL, NULL, 1);
-      if (!input_data || !params)
+      if (!params)
         irc = SQLITE_NOMEM;
     }
     if (irc == SQLITE_OK)
-      irc = predict0_emit_receipt_inline(db, "forecast", model_id, params,
-                                         input_data, sdigest, result_hash,
-                                         receipt_id, &rerr);
-    sqlite3_free(input_data);
+      irc = predict0_emit_receipt_digest(db, "forecast", model_id, params,
+                                         sdigest, result_hash, receipt_id,
+                                         &rerr);
     sqlite3_free(params);
     if (irc != SQLITE_OK) {
       agg_error(ctx, rerr);
@@ -4154,7 +4216,6 @@ static void agg_an_final(sqlite3_context *ctx) {
   if (opts.receipt && served) {
     char result_hash[PREDICT_HEX_BUFSIZE];
     char sdigest[PREDICT_HEX_BUFSIZE];
-    char *input_data = NULL;
     char *params = NULL;
     char *rerr = NULL;
     int start = (opts.context_limit > 0 && a->n > opts.context_limit)
@@ -4162,16 +4223,15 @@ static void agg_an_final(sqlite3_context *ctx) {
                     : 0;
     int irc = an_result_hash(rows, n_rows, result_hash);
     if (irc == SQLITE_OK) {
-      input_data = agg_input_data(a->ts, a->val, start, a->n, sdigest);
+      agg_series_digest(a->ts, a->val, start, a->n, sdigest);
       params = an_build_params(db, &opts, model_id, NULL, NULL, 1);
-      if (!input_data || !params)
+      if (!params)
         irc = SQLITE_NOMEM;
     }
     if (irc == SQLITE_OK)
-      irc = predict0_emit_receipt_inline(db, "detect_anomalies", model_id,
-                                         params, input_data, sdigest,
-                                         result_hash, receipt_id, &rerr);
-    sqlite3_free(input_data);
+      irc = predict0_emit_receipt_digest(db, "detect_anomalies", model_id,
+                                         params, sdigest, result_hash,
+                                         receipt_id, &rerr);
     sqlite3_free(params);
     if (irc != SQLITE_OK) {
       agg_error(ctx, rerr);

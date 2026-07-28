@@ -93,9 +93,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     run_sql_discard(db, "SELECT forecast(?1, value, 3) FROM series", text,
                     NULL, NULL);
     break;
-  case 6: /* fuzz the expansion functions' document parser */
+  case 6: /* fuzz the expansion functions' document parser + verify */
     run_sql_discard(db, "SELECT * FROM forecast_rows(?1)", text, NULL, NULL);
     run_sql_discard(db, "SELECT * FROM anomaly_rows(?1)", text, NULL, NULL);
+    run_sql_discard(db,
+                    "SELECT * FROM predict_verify(?1,"
+                    " 'SELECT ts, value FROM series')",
+                    text, NULL, NULL);
+    run_sql_discard(db,
+                    "SELECT match FROM predict_verify((SELECT forecast(ts,"
+                    " value, 2) ->> '$.receipt_id' FROM series), ?1)",
+                    text, NULL, NULL);
     break;
   default: /* fuzz predict_ulid + predict_replay lookups */
     run_sql_discard(db, "SELECT predict_ulid(?1)", text, NULL, NULL);

@@ -349,24 +349,49 @@ int main(void) {
     run_discard(db, "SELECT * FROM forecast_rows(NULL)", 1);
   }
 
-  /* one replay round-trip on the last receipt */
-  if (run_discard(db,
-                  "SELECT match FROM predict_replay("
-                  "(SELECT receipt_id FROM _predict_receipts ORDER BY"
-                  " receipt_id DESC LIMIT 1))",
-                  1))
-    goto done_fail;
-
-  /* inline-series replay round-trip: aggregate receipt, then mutate the
-   * source and replay again (the durability property, §4.2.6) */
-  run_discard(db, "DELETE FROM series WHERE rowid % 3 = 0", 1);
+  /* one replay round-trip on the last query-form receipt (aggregate
+   * receipts are commitments and reject replay) */
   if (run_discard(db,
                   "SELECT match FROM predict_replay("
                   "(SELECT receipt_id FROM _predict_receipts WHERE"
-                  " anchor_kind = 'inline-series' ORDER BY receipt_id DESC"
+                  " anchor_kind = 'logical-digest' ORDER BY receipt_id DESC"
                   " LIMIT 1))",
                   1))
     goto done_fail;
+
+  /* predict_verify round-trips on a commitment receipt (§4.2.10): with
+   * the original rows, after mutation (a match=0 finding, statement
+   * still succeeds), plus the replay rejection and the error paths */
+  if (run_discard(db,
+                  "SELECT match FROM predict_verify("
+                  "(SELECT receipt_id FROM _predict_receipts WHERE"
+                  " anchor_kind = 'input-digest' ORDER BY receipt_id DESC"
+                  " LIMIT 1), 'SELECT ts, value FROM series')",
+                  1))
+    goto done_fail;
+  run_discard(db,
+              "SELECT match FROM predict_replay("
+              "(SELECT receipt_id FROM _predict_receipts WHERE"
+              " anchor_kind = 'input-digest' LIMIT 1))",
+              0);
+  run_discard(db, "DELETE FROM series WHERE rowid % 3 = 0", 1);
+  if (run_discard(db,
+                  "SELECT match FROM predict_verify("
+                  "(SELECT receipt_id FROM _predict_receipts WHERE"
+                  " anchor_kind = 'input-digest' ORDER BY receipt_id DESC"
+                  " LIMIT 1), 'SELECT ts, value FROM series')",
+                  1))
+    goto done_fail;
+  run_discard(db,
+              "SELECT match FROM predict_verify('01NOPE',"
+              " 'SELECT ts, value FROM series')",
+              0);
+  run_discard(db,
+              "SELECT match FROM predict_verify("
+              "(SELECT receipt_id FROM _predict_receipts WHERE"
+              " anchor_kind = 'input-digest' LIMIT 1),"
+              " 'DELETE FROM series')",
+              0);
 
   sqlite3_close(db);
   fprintf(stderr, "soak ok\n");

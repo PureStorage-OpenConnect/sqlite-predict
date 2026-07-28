@@ -1,10 +1,12 @@
-"""Aggregate forms of forecast/detect_anomalies (RFC 0005 §4.2.8) and
-the expansion functions (§4.2.9).
+"""Aggregate forms of forecast/detect_anomalies (RFC 0005 §4.2.8), the
+expansion functions (§4.2.9), and predict_verify (§4.2.10).
 
-The two cross-form conformance invariants from §5 live here: an
-aggregate call and a single-series query-form call over identical rows
-produce identical result hashes, and an inline-series receipt still
-replays with match = 1 after the source table has been mutated.
+The cross-form conformance invariants from §5 live here: an aggregate
+call and a single-series query-form call over identical rows produce
+identical result hashes; predict_verify over the original rows returns
+match = 1 from any source that reproduces them (including after the
+original table is mutated or dropped); and rows that differ from the
+receipt's inputs report match = 0, never a false match.
 """
 
 import json
@@ -23,14 +25,20 @@ def doc(db, sql, *params):
 def last_receipt(db, **where):
     clauses = " AND ".join(f"{k} = ?" for k in where)
     sql = "SELECT receipt_id, anchor_kind, anchor, params, input_sql," \
-          " input_data, result_hash FROM _predict_receipts"
+          " result_hash FROM _predict_receipts"
     if where:
         sql += f" WHERE {clauses}"
     sql += " ORDER BY receipt_id DESC LIMIT 1"
     row = db.execute(sql, tuple(where.values())).fetchone()
     assert row is not None
     return dict(zip(("receipt_id", "anchor_kind", "anchor", "params",
-                     "input_sql", "input_data", "result_hash"), row))
+                     "input_sql", "result_hash"), row))
+
+
+def verify(db, receipt_id, query):
+    return db.execute(
+        "SELECT match, detail FROM predict_verify(?, ?)",
+        (receipt_id, query)).fetchone()
 
 
 # ---- shape and semantics ----
@@ -130,9 +138,9 @@ def test_aggregate_hash_equals_single_series_query_hash(db):
     db.execute(
         "SELECT count(*) FROM forecast('SELECT ts, value FROM series"
         " ORDER BY ts', 8)").fetchone()
-    inline = last_receipt(db, anchor_kind="inline-series")
+    agg = last_receipt(db, anchor_kind="input-digest")
     query = last_receipt(db, anchor_kind="logical-digest")
-    assert inline["result_hash"] == query["result_hash"]
+    assert agg["result_hash"] == query["result_hash"]
 
 
 def test_anomaly_aggregate_hash_parity(db):
@@ -143,86 +151,145 @@ def test_anomaly_aggregate_hash_parity(db):
     db.execute(
         "SELECT count(*) FROM detect_anomalies('SELECT ts, value FROM series"
         " ORDER BY ts')").fetchone()
-    inline = last_receipt(db, anchor_kind="inline-series")
+    agg = last_receipt(db, anchor_kind="input-digest")
     query = last_receipt(db, anchor_kind="logical-digest")
-    assert inline["result_hash"] == query["result_hash"]
+    assert agg["result_hash"] == query["result_hash"]
 
 
-# ---- conformance invariant 2: replay survives source mutation ----
+# ---- conformance invariant 2: predict_verify (§4.2.10) ----
 
 
-def test_inline_receipt_replays_after_source_mutation(db):
+def test_verify_round_trip_and_mutation_detection(db):
     rows, _ = syn.trend_season(n=96, seed=29)
     syn.load_into(db, rows)
     db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
-    rec = last_receipt(db, anchor_kind="inline-series")
+    rec = last_receipt(db, anchor_kind="input-digest")
 
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)",
-        (rec["receipt_id"],)).fetchone()
+    match, detail = verify(db, rec["receipt_id"],
+                           "SELECT ts, value FROM series")
     assert match == 1, detail
 
-    # the whole point: replay is independent of database state
-    db.execute("DELETE FROM series")
-    db.execute("INSERT INTO series VALUES ('1999-01-01T00:00:00Z', -1.0)")
+    # changed inputs are a finding (match = 0), never a false match
+    db.execute("UPDATE series SET value = value + 1 WHERE rowid = 5")
     db.commit()
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)",
-        (rec["receipt_id"],)).fetchone()
-    assert match == 1, detail
+    match, detail = verify(db, rec["receipt_id"],
+                           "SELECT ts, value FROM series")
+    assert match == 0
+    assert "input digest" in detail
 
 
-def test_anomaly_inline_replay_after_mutation(db):
+def test_verify_survives_source_drop_via_reconstruction(db):
     rows, _ = syn.trend_season(n=96, seed=30)
     syn.load_into(db, rows)
     db.execute("SELECT detect_anomalies(ts, value) FROM series").fetchone()
     rec = last_receipt(db, operation="detect_anomalies")
+
+    # the durability property: verification needs the rows, not the table
+    db.execute("CREATE TEMP TABLE recon AS SELECT ts, value FROM series")
     db.execute("DROP TABLE series")
     db.commit()
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)",
-        (rec["receipt_id"],)).fetchone()
+    match, detail = verify(db, rec["receipt_id"],
+                           "SELECT ts, value FROM recon")
     assert match == 1, detail
 
 
-def test_edited_receipt_input_data_is_rejected(db):
+def test_verify_applies_recorded_context_limit(db):
+    # the receipt commits to the rows the model read (the truncated
+    # window); verifying with the full history must still match
     rows, _ = syn.trend_season(n=96, seed=31)
     syn.load_into(db, rows)
+    db.execute("SELECT forecast(ts, value, 6,"
+               " '{\"context_limit\": 64}') FROM series").fetchone()
+    rec = last_receipt(db, anchor_kind="input-digest")
+    match, detail = verify(db, rec["receipt_id"],
+                           "SELECT ts, value FROM series")
+    assert match == 1, detail
+
+
+def test_replay_rejects_commitment_receipts(db):
+    rows, _ = syn.trend_season(n=96, seed=52)
+    syn.load_into(db, rows)
     db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
-    rec = last_receipt(db, anchor_kind="inline-series")
-    tampered = rec["input_data"].replace(
-        rec["input_data"][12:32], rec["input_data"][12:32], 1)
-    # actually change a value: bump the first numeric char after "value":[
-    head, _, tail = rec["input_data"].partition('"value":[')
-    tampered = head + '"value":[9' + tail[1:]
-    db.execute(
-        "UPDATE _predict_receipts SET input_data = ? WHERE receipt_id = ?",
-        (tampered, rec["receipt_id"]))
-    db.commit()
-    with pytest.raises(sqlite3.OperationalError, match="ANCHOR_UNAVAILABLE"):
+    rec = last_receipt(db, anchor_kind="input-digest")
+    with pytest.raises(sqlite3.OperationalError,
+                       match="ANCHOR_UNAVAILABLE.*predict_verify"):
         db.execute("SELECT match FROM predict_replay(?)",
                    (rec["receipt_id"],)).fetchone()
+
+
+def test_verify_rejects_query_form_receipts(db):
+    rows, _ = syn.trend_season(n=96, seed=53)
+    syn.load_into(db, rows)
+    db.execute("SELECT count(*) FROM forecast('SELECT ts, value FROM series"
+               " ORDER BY ts', 6)").fetchone()
+    rec = last_receipt(db, anchor_kind="logical-digest")
+    with pytest.raises(sqlite3.OperationalError,
+                       match="ANCHOR_UNAVAILABLE.*predict_replay"):
+        verify(db, rec["receipt_id"], "SELECT ts, value FROM series")
+
+
+def test_verify_argument_errors(db):
+    rows, _ = syn.trend_season(n=96, seed=54)
+    syn.load_into(db, rows)
+    db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
+    rec = last_receipt(db, anchor_kind="input-digest")
+    with pytest.raises(sqlite3.OperationalError, match="RECEIPT_NOT_FOUND"):
+        verify(db, "01NOPE", "SELECT ts, value FROM series")
+    with pytest.raises(sqlite3.OperationalError, match="NOT_READONLY"):
+        verify(db, rec["receipt_id"], "DELETE FROM series")
+
+
+def test_tampered_anchor_reports_mismatch(db):
+    rows, _ = syn.trend_season(n=96, seed=55)
+    syn.load_into(db, rows)
+    db.execute("SELECT forecast(ts, value, 6) FROM series").fetchone()
+    rec = last_receipt(db, anchor_kind="input-digest")
+    db.execute("UPDATE _predict_receipts SET anchor = ? WHERE receipt_id = ?",
+               ("0" * 64, rec["receipt_id"]))
+    db.commit()
+    match, detail = verify(db, rec["receipt_id"],
+                           "SELECT ts, value FROM series")
+    assert match == 0
+    assert "input digest" in detail
 
 
 # ---- receipts ----
 
 
-def test_inline_receipt_fields(db):
+def test_commitment_receipt_fields(db):
     rows, _ = syn.trend_season(n=96, seed=32)
     syn.load_into(db, rows)
     d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
-    rec = last_receipt(db, anchor_kind="inline-series")
+    rec = last_receipt(db, anchor_kind="input-digest")
     assert rec["receipt_id"] == d["receipt_id"]
     assert rec["input_sql"] is None
-    data = json.loads(rec["input_data"])
-    assert set(data) == {"ts", "value"}
-    assert len(data["ts"]) == len(data["value"]) == 96
-    assert data["ts"] == sorted(data["ts"])
+    assert len(rec["anchor"]) == 64  # a digest, never row values
     params = json.loads(rec["params"])
     # aggregate params carry no query-shape keys (RFC §4.2.8)
     for absent in ("time_col", "value_col", "group_cols"):
         assert absent not in params
     assert params["horizon"] == 6
+
+
+def test_receipt_is_constant_size(db):
+    # the commitment receipt's weight must not scale with the series
+    import conftest
+    sizes = {}
+    for n in (96, 4096):
+        c = conftest.connect()
+        c.execute("CREATE TABLE r(ts INTEGER, value REAL)")
+        c.executemany("INSERT INTO r VALUES (?,?)",
+                      [(1577836800 + i * 3600, 50.0 + i % 24)
+                       for i in range(n)])
+        c.execute("SELECT detect_anomalies(ts, value) FROM r").fetchone()
+        sizes[n] = c.execute(
+            "SELECT length(receipt_id)+length(operation)+length(model_id)"
+            "+length(model_hash)+length(anchor_kind)+length(anchor)"
+            "+length(params)+length(result_hash) FROM _predict_receipts"
+        ).fetchone()[0]
+        c.close()
+    assert sizes[96] == sizes[4096]
+    assert sizes[96] < 1000
 
 
 def test_receipt_opt_out(db):
@@ -273,7 +340,7 @@ def test_one_receipt_per_group(db):
     rids = {json.loads(d)["receipt_id"] for _, d in docs}
     assert len(rids) == 2 and None not in rids
     n = db.execute("SELECT count(*) FROM _predict_receipts WHERE"
-                   " anchor_kind = 'inline-series'").fetchone()[0]
+                   " anchor_kind = 'input-digest'").fetchone()[0]
     assert n == 2
 
 

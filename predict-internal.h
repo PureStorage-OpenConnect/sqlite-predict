@@ -251,19 +251,14 @@ int predict0_onnx_introspect(sqlite3 *db, const char *weights_uri,
  * excluding _predict_% and sqlite_%), hex into out[65]. */
 int predict0_logical_digest(sqlite3 *db, char out[PREDICT_HEX_BUFSIZE], char **errmsg);
 
-/* Digest of a canonical input-series JSON, RFC §4.1.4 'inline-series'
- * (per row: RFC 3339 timestamp as TEXT, value as REAL). */
-int predict0_series_digest(sqlite3 *db, const char *input_data,
-                           char out[PREDICT_HEX_BUFSIZE], char **errmsg);
-
-/* Insert one receipt row. anchor/params/input_sql/input_data/result_hash
- * owned by caller; exactly one of input_sql/input_data is non-NULL.
+/* Insert one receipt row. anchor/params/input_sql/result_hash owned by
+ * caller; input_sql is NULL for aggregate-form (input-digest) receipts.
  * receipt_id_out[27] receives the new ULID. */
 int predict0_receipt_insert(sqlite3 *db, const char *operation,
                             const char *model_id, const char *model_hash,
                             const char *anchor_kind, const char *anchor,
                             const char *params, const char *input_sql,
-                            const char *input_data, const char *result_hash,
+                            const char *result_hash,
                             char receipt_id_out[PREDICT_ULID_BUFSIZE],
                             char **errmsg);
 
@@ -275,14 +270,23 @@ int predict0_emit_receipt(sqlite3 *db, const char *op, const char *model_id,
                           char receipt_id_out[PREDICT_ULID_BUFSIZE],
                           char **errmsg);
 
-/* Aggregate-form receipt tail (RFC §4.2.8): input series embedded as
- * input_data, anchored by its own digest (anchor_kind 'inline-series'). */
-int predict0_emit_receipt_inline(sqlite3 *db, const char *op,
+/* Aggregate-form receipt tail (RFC §4.2.8): a constant-size commitment
+ * anchored by the digest of the input rows ('input-digest'); no row
+ * values stored. */
+int predict0_emit_receipt_digest(sqlite3 *db, const char *op,
                                  const char *model_id, const char *params,
-                                 const char *input_data,
                                  const char *series_digest,
                                  const char *result_hash,
                                  char receipt_id_out[PREDICT_ULID_BUFSIZE],
                                  char **errmsg);
+
+/* predict_verify's collection half (predict-forecast.c, RFC §4.2.10):
+ * collect `query` as one series under the aggregate form's rules and
+ * produce the §4.1.4 digest plus the canonical series JSON for the
+ * re-run. Caller owns *doc_out (sqlite3_malloc'd). */
+int predict0_verify_collect(sqlite3 *db, const char *query, int context_limit,
+                            char **doc_out,
+                            char digest_out[PREDICT_HEX_BUFSIZE],
+                            char **errmsg);
 
 #endif /* PREDICT_INTERNAL_H */

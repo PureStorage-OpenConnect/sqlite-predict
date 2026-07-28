@@ -44,8 +44,8 @@ SELECT match, detail FROM predict_replay(
 .print '\n== the aggregate form: plain SQL supplies the rows (the ORM path) =='
 -- forecast() also works as an aggregate in expression position: WHERE,
 -- joins, and GROUP BY compose, and each group returns one JSON document.
--- Its receipt embeds the input series ('inline-series'), so it replays
--- even after the source table changes.
+-- Its receipt is a constant-size commitment: a digest of the exact input
+-- rows, verifiable later by re-supplying them (no row values stored).
 SELECT json_extract(forecast(ts, value, 6), '$.status')  AS status,
        json_extract(forecast(ts, value, 6), '$.model')   AS model
 FROM readings;
@@ -55,8 +55,15 @@ SELECT r.step, r.forecast_timestamp, round(r.forecast, 1) AS forecast
 FROM forecast_rows((SELECT forecast(ts, value, 6, '{"receipt":0}')
                     FROM readings)) AS r;
 
-.print '\n== inline receipts survive source churn: mutate, then replay =='
-DELETE FROM readings WHERE rowid % 5 = 0;
-SELECT match, detail FROM predict_replay(
+.print '\n== verify a commitment receipt by re-supplying the rows =='
+SELECT match, detail FROM predict_verify(
   (SELECT receipt_id FROM _predict_receipts
-   WHERE anchor_kind = 'inline-series' ORDER BY receipt_id DESC LIMIT 1));
+   WHERE anchor_kind = 'input-digest' ORDER BY receipt_id DESC LIMIT 1),
+  'SELECT ts, value FROM readings');
+
+-- change the data and the same verification reports honestly
+DELETE FROM readings WHERE rowid % 5 = 0;
+SELECT match, detail FROM predict_verify(
+  (SELECT receipt_id FROM _predict_receipts
+   WHERE anchor_kind = 'input-digest' ORDER BY receipt_id DESC LIMIT 1),
+  'SELECT ts, value FROM readings');

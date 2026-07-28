@@ -124,18 +124,17 @@ static const char *DDL =
     "  model_hash  TEXT NOT NULL,\n"
     "  anchor_kind TEXT NOT NULL CHECK (anchor_kind IN\n"
     "    ('branch','generation','file-digest','logical-digest',\n"
-    "     'inline-series','none')),\n"
+    "     'input-digest','none')),\n"
     "  anchor      TEXT,\n"
     "  params      TEXT NOT NULL,\n"
     "  input_sql   TEXT,\n"
-    "  input_data  TEXT,\n"
     "  result_hash TEXT NOT NULL,\n"
     "  created_at  TEXT NOT NULL\n"
     "    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n"
     "  CHECK ((anchor_kind = 'none') = (anchor IS NULL)),\n"
-    /* exactly one input record: a query (query form) XOR embedded data
-     * (aggregate form, RFC §4.2.8) */
-    "  CHECK ((input_sql IS NULL) <> (input_data IS NULL))\n"
+    /* the aggregate form has no query text; it commits to its input
+     * rows by digest instead (RFC §4.2.8) */
+    "  CHECK ((input_sql IS NULL) = (anchor_kind = 'input-digest'))\n"
     ");\n"
     "CREATE INDEX IF NOT EXISTS idx_predict_receipts_model\n"
     "  ON _predict_receipts(model_id);\n";
@@ -181,12 +180,6 @@ int predict0_receipts_ensure(sqlite3 *db, char **errmsg) {
   sqlite3_exec(db, "ALTER TABLE _predict_models ADD COLUMN weights_uri TEXT",
                NULL, NULL, NULL);
   sqlite3_exec(db, "ALTER TABLE _predict_models ADD COLUMN io_spec TEXT",
-               NULL, NULL, NULL);
-  /* Receipts tables created before the aggregate forms lack input_data.
-   * Adding the column keeps them readable (and query-form-writable);
-   * aggregate-form inserts on such a table still fail loudly on its old
-   * anchor_kind CHECK, the documented recreate-to-upgrade boundary. */
-  sqlite3_exec(db, "ALTER TABLE _predict_receipts ADD COLUMN input_data TEXT",
                NULL, NULL, NULL);
   rc = bundled_model_row(db, "theta-classic", "ts-stat");
   if (rc == SQLITE_OK)
@@ -383,43 +376,6 @@ int predict0_logical_digest(sqlite3 *db, char out[PREDICT_HEX_BUFSIZE], char **e
   return SQLITE_OK;
 }
 
-/* Digest of a canonical input-series JSON ({"ts":[...],"value":[...]}),
- * RFC §4.1.4 'inline-series': per row, the RFC 3339 timestamp as TEXT
- * and the value as REAL under the §4.1.3 encoding. The aggregate write
- * path hashes its formatted rows with the same encoding, so this
- * recomputation verifies the embedded data against the anchor. */
-int predict0_series_digest(sqlite3 *db, const char *input_data,
-                           char out[PREDICT_HEX_BUFSIZE], char **errmsg) {
-  sqlite3_stmt *stmt = NULL;
-  int rc = sqlite3_prepare_v2(
-      db,
-      "SELECT t.value, v.value FROM json_each(?1,'$.ts') t"
-      " JOIN json_each(?1,'$.value') v ON t.key = v.key ORDER BY t.key",
-      -1, &stmt, NULL);
-  if (rc != SQLITE_OK) {
-    *errmsg = sqlite3_mprintf("%s: cannot parse input_data (%s)",
-                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
-    return SQLITE_ERROR;
-  }
-  sqlite3_bind_text(stmt, 1, input_data, -1, SQLITE_STATIC);
-  predict0_hasher h;
-  predict0_hash_init(&h);
-  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-    predict0_hash_text(&h, (const char *)sqlite3_column_text(stmt, 0));
-    predict0_hash_real(&h, sqlite3_column_double(stmt, 1));
-    predict0_hash_row_end(&h);
-  }
-  int done = rc == SQLITE_DONE;
-  sqlite3_finalize(stmt);
-  if (!done) {
-    *errmsg = sqlite3_mprintf("%s: input_data is not a valid series document",
-                              PREDICT_ERR_SCHEMA);
-    return SQLITE_ERROR;
-  }
-  predict0_hash_hex(&h, out);
-  return SQLITE_OK;
-}
-
 #pragma endregion
 
 #pragma region receipt insert
@@ -428,7 +384,7 @@ int predict0_receipt_insert(sqlite3 *db, const char *operation,
                             const char *model_id, const char *model_hash,
                             const char *anchor_kind, const char *anchor,
                             const char *params, const char *input_sql,
-                            const char *input_data, const char *result_hash,
+                            const char *result_hash,
                             char receipt_id_out[PREDICT_ULID_BUFSIZE],
                             char **errmsg) {
   i64 now_ms = 0;
@@ -447,8 +403,8 @@ int predict0_receipt_insert(sqlite3 *db, const char *operation,
   int rc = sqlite3_prepare_v2(
       db,
       "INSERT INTO _predict_receipts (receipt_id, operation, model_id,"
-      " model_hash, anchor_kind, anchor, params, input_sql, input_data,"
-      " result_hash) VALUES (?,?,?,?,?,?,?,?,?,?)",
+      " model_hash, anchor_kind, anchor, params, input_sql, result_hash)"
+      " VALUES (?,?,?,?,?,?,?,?,?)",
       -1, &ins, NULL);
   if (rc != SQLITE_OK) {
     *errmsg = sqlite3_mprintf("%s: receipt insert failed (%s)",
@@ -465,9 +421,7 @@ int predict0_receipt_insert(sqlite3 *db, const char *operation,
   sqlite3_bind_text(ins, 7, params, -1, SQLITE_STATIC);
   if (input_sql)
     sqlite3_bind_text(ins, 8, input_sql, -1, SQLITE_STATIC);
-  if (input_data)
-    sqlite3_bind_text(ins, 9, input_data, -1, SQLITE_STATIC);
-  sqlite3_bind_text(ins, 10, result_hash, -1, SQLITE_STATIC);
+  sqlite3_bind_text(ins, 9, result_hash, -1, SQLITE_STATIC);
   rc = sqlite3_step(ins);
   sqlite3_finalize(ins);
   if (rc != SQLITE_DONE) {
@@ -504,19 +458,18 @@ int predict0_emit_receipt(sqlite3 *db, const char *op, const char *model_id,
   }
   int rc = predict0_receipt_insert(db, op, model_id, model_hash,
                                    "logical-digest", digest, params,
-                                   input_sql, NULL, result_hash,
+                                   input_sql, result_hash,
                                    receipt_id_out, errmsg);
   sqlite3_free(model_hash);
   return rc;
 }
 
-/* The aggregate-form receipt tail (RFC §4.2.8): the input series is
- * embedded in the receipt (input_data) and the anchor is its digest, so
- * no database-state digest is taken; these receipts replay independent
- * of database state. */
-int predict0_emit_receipt_inline(sqlite3 *db, const char *op,
+/* The aggregate-form receipt tail (RFC §4.2.8): a constant-size
+ * commitment. The anchor is the digest of the exact input rows; no row
+ * values and no database-state digest are stored. Verification is
+ * predict_verify with caller-supplied rows. */
+int predict0_emit_receipt_digest(sqlite3 *db, const char *op,
                                  const char *model_id, const char *params,
-                                 const char *input_data,
                                  const char *series_digest,
                                  const char *result_hash,
                                  char receipt_id_out[PREDICT_ULID_BUFSIZE],
@@ -530,9 +483,8 @@ int predict0_emit_receipt_inline(sqlite3 *db, const char *op,
     return SQLITE_ERROR;
   }
   int rc = predict0_receipt_insert(db, op, model_id, model_hash,
-                                   "inline-series", series_digest, params,
-                                   NULL, input_data, result_hash,
-                                   receipt_id_out, errmsg);
+                                   "input-digest", series_digest, params,
+                                   NULL, result_hash, receipt_id_out, errmsg);
   sqlite3_free(model_hash);
   return rc;
 }
@@ -676,8 +628,7 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   int rc = sqlite3_prepare_v2(
       db,
       "SELECT operation, model_id, model_hash, anchor_kind, anchor, params,"
-      " input_sql, result_hash, input_data FROM _predict_receipts"
-      " WHERE receipt_id = ?",
+      " input_sql, result_hash FROM _predict_receipts WHERE receipt_id = ?",
       -1, &get, NULL);
   if (rc != SQLITE_OK)
     return rp_error(cur, PREDICT_ERR_RECEIPT_NOT_FOUND,
@@ -706,10 +657,6 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
           : sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 6));
   char *orig_hash =
       sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 7));
-  char *input_data =
-      sqlite3_column_type(get, 8) == SQLITE_NULL
-          ? NULL
-          : sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 8));
   sqlite3_finalize(get);
 
 #define RP_CLEANUP()                                                          \
@@ -721,7 +668,6 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     sqlite3_free(params);                                                     \
     sqlite3_free(input_sql);                                                  \
     sqlite3_free(orig_hash);                                                  \
-    sqlite3_free(input_data);                                                 \
   } while (0)
 
   int is_forecast = strcmp(operation, "forecast") == 0;
@@ -744,96 +690,15 @@ static int rp_filter(sqlite3_vtab_cursor *pCur, int idxNum,
   }
   sqlite3_free(cur_hash);
 
-  /* inline-series receipts (RFC §4.2.8): the anchored state is the
-   * receipt itself. Verify the embedded series against the anchor
-   * digest, then re-run the aggregate form on the embedded rows and
-   * hash through the expansion functions; database state is never
-   * consulted, so these receipts replay after the source data churns. */
-  if (strcmp(anchor_kind, "inline-series") == 0) {
-    if (!input_data || !anchor) {
-      int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
-                       "inline-series receipt has no embedded input series");
-      RP_CLEANUP();
-      return r;
-    }
-    if (!is_forecast && !is_anomalies) {
-      int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
-                       "inline-series replay is only defined for forecast and "
-                       "detect_anomalies");
-      RP_CLEANUP();
-      return r;
-    }
-    char sdig[PREDICT_HEX_BUFSIZE];
-    char *derr = NULL;
-    if (predict0_series_digest(db, input_data, sdig, &derr)) {
-      sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = derr;
-      RP_CLEANUP();
-      return SQLITE_ERROR;
-    }
-    if (strcmp(sdig, anchor) != 0) {
-      int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
-                       "embedded input series does not match the receipt "
-                       "anchor digest (edited receipt)");
-      RP_CLEANUP();
-      return r;
-    }
-
-    const char *rerun_sql =
-        is_forecast
-            ? "SELECT '', r.step, r.forecast_timestamp, r.forecast,"
-              " r.lower_bound, r.upper_bound FROM forecast_rows(("
-              " SELECT forecast(t.value, v.value,"
-              "   CAST(json_extract(?2,'$.horizon') AS INTEGER),"
-              "   json_set(json_remove(?2,'$.horizon'), '$.receipt', 0))"
-              " FROM json_each(?1,'$.ts') t"
-              " JOIN json_each(?1,'$.value') v ON t.key = v.key"
-              ")) r ORDER BY r.step"
-            : "SELECT '', r.ts, r.value, r.forecast, r.lower_bound,"
-              " r.upper_bound, r.is_anomaly, r.anomaly_probability"
-              " FROM anomaly_rows(("
-              " SELECT detect_anomalies(t.value, v.value,"
-              "   json_set(?2, '$.receipt', 0))"
-              " FROM json_each(?1,'$.ts') t"
-              " JOIN json_each(?1,'$.value') v ON t.key = v.key"
-              ")) r ORDER BY r.ts";
-    int ncols = is_forecast ? 6 : 8;
-    sqlite3_stmt *run5 = NULL;
-    rc = sqlite3_prepare_v2(db, rerun_sql, -1, &run5, NULL);
-    if (rc != SQLITE_OK) {
-      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH,
-                       "could not re-prepare the aggregate form");
-      RP_CLEANUP();
-      return r;
-    }
-    sqlite3_bind_text(run5, 1, input_data, -1, SQLITE_STATIC);
-    sqlite3_bind_text(run5, 2, params, -1, SQLITE_STATIC);
-    predict0_hasher h5;
-    predict0_hash_init(&h5);
-    int n5 = 0;
-    while ((rc = sqlite3_step(run5)) == SQLITE_ROW) {
-      for (int i = 0; i < ncols; i++)
-        hash_column_value(&h5, run5, i);
-      predict0_hash_row_end(&h5);
-      n5++;
-    }
-    int done = rc == SQLITE_DONE;
-    sqlite3_finalize(run5);
-    if (!done) {
-      int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH, sqlite3_errmsg(db));
-      RP_CLEANUP();
-      return r;
-    }
-    predict0_hash_hex(&h5, cur->hash);
-    cur->match = strcmp(cur->hash, orig_hash) == 0;
-    sqlite3_free(cur->orig);
-    cur->orig = sqlite3_mprintf("%s", orig_hash);
-    sqlite3_free(cur->detail);
-    cur->detail =
-        cur->match ? sqlite3_mprintf("reproduced (%d rows)", n5)
-                   : sqlite3_mprintf("result hash diverged over %d rows", n5);
+  /* input-digest (aggregate-form) receipts carry no inputs and no
+   * query: replay cannot re-derive their rows. predict_verify with
+   * caller-supplied rows is the verification path (RFC §4.2.10). */
+  if (strcmp(anchor_kind, "input-digest") == 0) {
+    int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
+                     "this receipt commits to its input rows by digest; "
+                     "verify it with predict_verify(receipt_id, query)");
     RP_CLEANUP();
-    return SQLITE_OK;
+    return r;
   }
 
   /* the anchored state must be the current state */
@@ -1172,8 +1037,288 @@ static sqlite3_module replayModule = {
     /* xShadowName */ NULL,
     /* xIntegrity  */ NULL};
 
+/* predict_verify(receipt_id, query): RFC §4.2.10 — the commitment
+ * counterpart of predict_replay for input-digest (aggregate-form)
+ * receipts. The caller supplies the rows; we collect them under the
+ * aggregate form's rules, compare the §4.1.4 digest to the anchor
+ * (mismatch is a finding: match = 0, not an error), and on a match
+ * re-run the recorded operation and compare result hashes. Shares the
+ * replay cursor and column shape. */
+
+#define VF_COL_RECEIPT 4
+#define VF_COL_QUERY 5
+
+static int vf_connect(sqlite3 *db, void *pAux, int argc,
+                      const char *const *argv, sqlite3_vtab **ppVtab,
+                      char **pzErr) {
+  UNUSED_PARAMETER(pAux);
+  UNUSED_PARAMETER(argc);
+  UNUSED_PARAMETER(argv);
+  UNUSED_PARAMETER(pzErr);
+  replay_vtab *v = sqlite3_malloc(sizeof(*v));
+  if (!v)
+    return SQLITE_NOMEM;
+  memset(v, 0, sizeof(*v));
+  v->db = db;
+  int rc = sqlite3_declare_vtab(
+      db, "CREATE TABLE x(match INTEGER, result_hash TEXT,"
+          " original_hash TEXT, detail TEXT, receipt_id HIDDEN,"
+          " query HIDDEN)");
+  if (rc != SQLITE_OK) {
+    sqlite3_free(v);
+    return rc;
+  }
+  *ppVtab = &v->base;
+  return SQLITE_OK;
+}
+
+static int vf_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdx) {
+  int seen_rid = 0, seen_query = 0;
+  for (int i = 0; i < pIdx->nConstraint; i++) {
+    const struct sqlite3_index_constraint *c = &pIdx->aConstraint[i];
+    if (c->op != SQLITE_INDEX_CONSTRAINT_EQ)
+      continue;
+    if (c->iColumn == VF_COL_RECEIPT) {
+      if (!c->usable)
+        return SQLITE_CONSTRAINT;
+      pIdx->aConstraintUsage[i].argvIndex = 1;
+      pIdx->aConstraintUsage[i].omit = 1;
+      seen_rid = 1;
+    } else if (c->iColumn == VF_COL_QUERY) {
+      if (!c->usable)
+        return SQLITE_CONSTRAINT;
+      pIdx->aConstraintUsage[i].argvIndex = 2;
+      pIdx->aConstraintUsage[i].omit = 1;
+      seen_query = 1;
+    }
+  }
+  if (!seen_rid || !seen_query) {
+    pVtab->zErrMsg = sqlite3_mprintf(
+        "%s: predict_verify(receipt_id, query) requires both arguments",
+        PREDICT_ERR_RECEIPT_NOT_FOUND);
+    return SQLITE_ERROR;
+  }
+  pIdx->estimatedCost = 1000;
+  return SQLITE_OK;
+}
+
+static int vf_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
+                     int argc, sqlite3_value **argv) {
+  UNUSED_PARAMETER(idxNum);
+  UNUSED_PARAMETER(idxStr);
+  replay_cursor *cur = (replay_cursor *)pCur;
+  replay_vtab *vtab = (replay_vtab *)cur->base.pVtab;
+  sqlite3 *db = vtab->db;
+  cur->done = 0;
+
+  if (argc < 2)
+    return rp_error(cur, PREDICT_ERR_RECEIPT_NOT_FOUND,
+                    "predict_verify(receipt_id, query) requires both"
+                    " arguments");
+  const char *rid = (const char *)sqlite3_value_text(argv[0]);
+  const char *query = (const char *)sqlite3_value_text(argv[1]);
+  if (!query)
+    return rp_error(cur, PREDICT_ERR_SCHEMA, "query must be text");
+
+  sqlite3_stmt *get = NULL;
+  int rc = sqlite3_prepare_v2(
+      db,
+      "SELECT operation, model_id, anchor_kind, anchor, params, result_hash"
+      " FROM _predict_receipts WHERE receipt_id = ?",
+      -1, &get, NULL);
+  if (rc != SQLITE_OK)
+    return rp_error(cur, PREDICT_ERR_RECEIPT_NOT_FOUND,
+                    "no receipt tables in this database");
+  sqlite3_bind_text(get, 1, rid, -1, SQLITE_STATIC);
+  if (sqlite3_step(get) != SQLITE_ROW) {
+    sqlite3_finalize(get);
+    return rp_error(cur, PREDICT_ERR_RECEIPT_NOT_FOUND, rid ? rid : "(null)");
+  }
+  char *operation =
+      sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 0));
+  char *model_id =
+      sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 1));
+  char *anchor_kind =
+      sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 2));
+  char *anchor =
+      sqlite3_column_type(get, 3) == SQLITE_NULL
+          ? NULL
+          : sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 3));
+  char *params =
+      sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 4));
+  char *orig_hash =
+      sqlite3_mprintf("%s", (const char *)sqlite3_column_text(get, 5));
+  sqlite3_finalize(get);
+
+#define VF_CLEANUP()                                                          \
+  do {                                                                        \
+    sqlite3_free(operation);                                                  \
+    sqlite3_free(model_id);                                                   \
+    sqlite3_free(anchor_kind);                                                \
+    sqlite3_free(anchor);                                                     \
+    sqlite3_free(params);                                                     \
+    sqlite3_free(orig_hash);                                                  \
+  } while (0)
+
+  if (!anchor_kind || strcmp(anchor_kind, "input-digest") != 0 || !anchor) {
+    int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
+                     "predict_verify is for aggregate-form (input-digest)"
+                     " receipts; use predict_replay for this receipt");
+    VF_CLEANUP();
+    return r;
+  }
+  int is_forecast = strcmp(operation, "forecast") == 0;
+  int is_anomalies = strcmp(operation, "detect_anomalies") == 0;
+  if (!is_forecast && !is_anomalies) {
+    int r = rp_error(cur, PREDICT_ERR_ANCHOR_UNAVAILABLE,
+                     "input-digest receipts exist only for forecast and"
+                     " detect_anomalies");
+    VF_CLEANUP();
+    return r;
+  }
+
+  /* model must still exist (its hash is re-checked at serve time) */
+  char *cur_hash = predict0_registry_model_hash(db, model_id);
+  if (!cur_hash) {
+    int r = rp_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, model_id);
+    VF_CLEANUP();
+    return r;
+  }
+  sqlite3_free(cur_hash);
+
+  /* the recorded context_limit governs which rows the model read */
+  int climit = 0;
+  sqlite3_stmt *cl = NULL;
+  if (sqlite3_prepare_v2(db,
+                         "SELECT CAST(coalesce(json_extract(?1,"
+                         "'$.context_limit'), 0) AS INTEGER)",
+                         -1, &cl, NULL) == SQLITE_OK) {
+    sqlite3_bind_text(cl, 1, params, -1, SQLITE_STATIC);
+    if (sqlite3_step(cl) == SQLITE_ROW)
+      climit = sqlite3_column_int(cl, 0);
+    sqlite3_finalize(cl);
+  }
+
+  char *doc = NULL;
+  char digest[PREDICT_HEX_BUFSIZE];
+  char *cerr = NULL;
+  if (predict0_verify_collect(db, query, climit, &doc, digest, &cerr) !=
+      SQLITE_OK) {
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = cerr;
+    VF_CLEANUP();
+    return SQLITE_ERROR;
+  }
+
+  if (strcmp(digest, anchor) != 0) {
+    /* a finding, not an error: these are not the receipt's inputs */
+    cur->match = 0;
+    cur->hash[0] = '\0';
+    sqlite3_free(cur->orig);
+    cur->orig = sqlite3_mprintf("%s", orig_hash);
+    sqlite3_free(cur->detail);
+    cur->detail = sqlite3_mprintf(
+        "supplied inputs do not match the receipt's input digest");
+    sqlite3_free(doc);
+    VF_CLEANUP();
+    return SQLITE_OK;
+  }
+
+  /* inputs confirmed: re-run the recorded operation on them, receipts
+   * off, and hash through the expansion functions (same encoding as the
+   * write path) */
+  const char *rerun_sql =
+      is_forecast
+          ? "SELECT '', r.step, r.forecast_timestamp, r.forecast,"
+            " r.lower_bound, r.upper_bound FROM forecast_rows(("
+            " SELECT forecast(t.value, v.value,"
+            "   CAST(json_extract(?2,'$.horizon') AS INTEGER),"
+            "   json_set(json_remove(?2,'$.horizon'), '$.receipt', 0))"
+            " FROM json_each(?1,'$.ts') t"
+            " JOIN json_each(?1,'$.value') v ON t.key = v.key"
+            ")) r ORDER BY r.step"
+          : "SELECT '', r.ts, r.value, r.forecast, r.lower_bound,"
+            " r.upper_bound, r.is_anomaly, r.anomaly_probability"
+            " FROM anomaly_rows(("
+            " SELECT detect_anomalies(t.value, v.value,"
+            "   json_set(?2, '$.receipt', 0))"
+            " FROM json_each(?1,'$.ts') t"
+            " JOIN json_each(?1,'$.value') v ON t.key = v.key"
+            ")) r ORDER BY r.ts";
+  int ncols = is_forecast ? 6 : 8;
+  sqlite3_stmt *run = NULL;
+  rc = sqlite3_prepare_v2(db, rerun_sql, -1, &run, NULL);
+  if (rc != SQLITE_OK) {
+    int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH,
+                     "could not re-prepare the aggregate form");
+    sqlite3_free(doc);
+    VF_CLEANUP();
+    return r;
+  }
+  sqlite3_bind_text(run, 1, doc, -1, SQLITE_STATIC);
+  sqlite3_bind_text(run, 2, params, -1, SQLITE_STATIC);
+  predict0_hasher h;
+  predict0_hash_init(&h);
+  int n = 0;
+  while ((rc = sqlite3_step(run)) == SQLITE_ROW) {
+    for (int i = 0; i < ncols; i++)
+      hash_column_value(&h, run, i);
+    predict0_hash_row_end(&h);
+    n++;
+  }
+  int done = rc == SQLITE_DONE;
+  sqlite3_finalize(run);
+  sqlite3_free(doc);
+  if (!done) {
+    int r = rp_error(cur, PREDICT_ERR_REPLAY_MISMATCH, sqlite3_errmsg(db));
+    VF_CLEANUP();
+    return r;
+  }
+  predict0_hash_hex(&h, cur->hash);
+  cur->match = strcmp(cur->hash, orig_hash) == 0;
+  sqlite3_free(cur->orig);
+  cur->orig = sqlite3_mprintf("%s", orig_hash);
+  sqlite3_free(cur->detail);
+  cur->detail =
+      cur->match ? sqlite3_mprintf("verified (%d rows)", n)
+                 : sqlite3_mprintf("result hash diverged over %d rows", n);
+  VF_CLEANUP();
+#undef VF_CLEANUP
+  return SQLITE_OK;
+}
+
+static sqlite3_module verifyModule = {
+    /* iVersion    */ 0,
+    /* xCreate     */ NULL,
+    /* xConnect    */ vf_connect,
+    /* xBestIndex  */ vf_best_index,
+    /* xDisconnect */ rp_disconnect,
+    /* xDestroy    */ NULL,
+    /* xOpen       */ rp_open,
+    /* xClose      */ rp_close,
+    /* xFilter     */ vf_filter,
+    /* xNext       */ rp_next,
+    /* xEof        */ rp_eof,
+    /* xColumn     */ rp_column,
+    /* xRowid      */ rp_rowid,
+    /* xUpdate     */ NULL,
+    /* xBegin      */ NULL,
+    /* xSync       */ NULL,
+    /* xCommit     */ NULL,
+    /* xRollback   */ NULL,
+    /* xFindMethod */ NULL,
+    /* xRename     */ NULL,
+    /* xSavepoint  */ NULL,
+    /* xRelease    */ NULL,
+    /* xRollbackTo */ NULL,
+    /* xShadowName */ NULL,
+    /* xIntegrity  */ NULL};
+
 #pragma endregion
 
 int predict0_receipts_init(sqlite3 *db) {
-  return sqlite3_create_module(db, "predict_replay", &replayModule, NULL);
+  int rc = sqlite3_create_module(db, "predict_replay", &replayModule, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  return sqlite3_create_module(db, "predict_verify", &verifyModule, NULL);
 }

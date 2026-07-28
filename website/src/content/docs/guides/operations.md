@@ -16,6 +16,7 @@ trailing JSON object, e.g. `'{"group_cols":["region"],"confidence_level":0.9}'`.
 | `distill_predict(train_query [, options])` | Compress a teacher into a fast student | a registered native tabular model |
 | `distill_forecast(train_query [, options])` | Compress a forecast model into a student | a registered native forecast model |
 | `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag from re-running the recorded call |
+| `predict_verify(receipt_id, query)` | Are these the rows behind this prediction? | a match flag from checking supplied rows against a commitment receipt |
 
 ## Two forms: table-valued and aggregate
 
@@ -34,11 +35,12 @@ SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 anchored to a re-runnable query against database state. **Use the aggregate
 form** from application code and ORMs: rows flow in through ordinary SQL (with
 `WHERE`, joins, and bound parameters), `GROUP BY` replaces `group_cols`, input
-order never matters (it sorts by `ts` internally), and the receipt embeds the
-input series so it [replays even after the source table
-changes](../receipts/#inline-series-receipts-the-aggregate-form). The aggregate
-returns one JSON document per group; parse it in your app or expand it with
-`forecast_rows()` / `anomaly_rows()`. See [Using with ORMs](../orms/).
+order never matters (it sorts by `ts` internally), and its receipt is a
+constant-size [commitment to the exact
+inputs](../receipts/#commitment-receipts-the-aggregate-form), verifiable later
+by re-supplying the rows. The aggregate returns one JSON document per group;
+parse it in your app or expand it with `forecast_rows()` / `anomaly_rows()`.
+See [Using with ORMs](../orms/).
 
 ## Column inference
 

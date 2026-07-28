@@ -39,7 +39,7 @@ programmatically.
 | Code | Raised when |
 | --- | --- |
 | `PREDICT_ERR_RECEIPT_NOT_FOUND` | `predict_replay` given an unknown receipt id. |
-| `PREDICT_ERR_ANCHOR_UNAVAILABLE` | The anchored data has changed (query-anchored receipts) or an inline-series receipt's embedded data fails its digest check; replay can't be trusted. |
+| `PREDICT_ERR_ANCHOR_UNAVAILABLE` | The anchored data has changed, or the wrong verifier was used (`predict_replay` on a commitment receipt, `predict_verify` on a query-anchored one). |
 | `PREDICT_ERR_REPLAY_MISMATCH` | The replayed result hash differs from the original. |
 
 ## Resources
