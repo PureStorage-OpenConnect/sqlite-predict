@@ -8,40 +8,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Aggregate forms of `forecast` and `detect_anomalies`** (RFC 0005 §4.2.8),
-  registered under the same names and resolved by position: FROM clause =
-  table-valued, expression position = aggregate. The statement supplies the
-  rows (`forecast(ts, value, horizon[, options])`), so WHERE / joins / bound
-  parameters compose and `GROUP BY` replaces `group_cols`; input rows are
-  sorted by `ts` internally, killing the ORDER BY footgun. Each group returns
-  one JSON document (`model`, `receipt`, `status`, `rows`), expandable back
-  to typed rows with the new `forecast_rows()` / `anomaly_rows()` table-valued
-  functions. This is the ORM-native interface: Drizzle and SQLAlchemy smoke
-  tests run in CI, and a "Using with ORMs" guide covers Drizzle, SQLAlchemy,
-  Diesel, Prisma, and the `_predict_*` migration-diff exclusions.
-- **Document receipts + `predict_verify`.** The aggregate form is a pure
-  function: it writes nothing, and its receipt comes back inside the result
-  document — a constant-size (~450 byte) attestation carrying `op`, `model`,
-  `model_hash`, canonical `params`, `input_digest` (a digest of the exact
-  rows the model read), and `result_hash`. No row values are ever stored
-  anywhere, storing the receipt is the caller's decision made above the
-  database, and read paths stay read-only: aggregates work on read-only
-  databases (receipts included) and inside views (no `SQLITE_DIRECTONLY`).
-  The new `predict_verify(receipt, query)` TVF verifies a document (or a
-  whole result document) statelessly: the caller supplies the rows, their
-  digest is checked against the receipt (a mismatch is a match = 0 finding,
-  never a false match; a model-hash mismatch is a hard error), and on a
-  match the recorded call re-runs and result hashes are compared —
-  succeeding from any source that reproduces the rows, including after the
-  original table is mutated or dropped. Conformance invariants, all tested:
-  cross-form result-hash parity, verify round trip, honest mismatch
-  reporting, and read-only serving. Degraded series carry `receipt` null.
-
-- `forecast()`, `detect_anomalies()`, `predict()`, `distill_predict()`, and
-  `backtest()` table-valued functions with a trailing JSON options argument.
+- **One calling convention per operation; receipts removed.**
+  `forecast(ts, value, horizon[, options])` and `detect_anomalies(ts, value
+  [, options])` are aggregate functions, full stop: the statement supplies
+  the rows, so WHERE / joins / bound parameters compose from any ORM or
+  plain SQL, `GROUP BY` splits series, and input rows are sorted by `ts`
+  internally (input order cannot matter). Each group returns one JSON
+  document (`model`, `status`, `rows`), expandable back to typed rows with
+  `forecast_rows()` / `anomaly_rows()` or parsed in the app. Both are pure
+  functions: nothing is ever written, so they work on read-only databases
+  and inside views, and a serving call creates no tables. `backtest`,
+  `predict`, and `distill_*` keep their query-shaped table-valued form
+  (training and evaluation need row sets a single aggregate cannot
+  express). A BigQuery-style `forecast('SELECT…', 24)` gets a
+  self-correcting error. The receipts/replay system explored during
+  development (in-DB anchored receipts, then input-digest commitments,
+  then document receipts) was removed before release: prediction is the
+  product, provenance was drag; the designs live in git history and the
+  RFC's deferred appendix. The model registry (`_predict_models`) remains:
+  content-addressed models and distilled students, hashes verified before
+  deserialization.
 - **Auto model selection, conformal intervals, and `backtest()`.**
-  `forecast('...', h, '{"model":"auto"}')` selects the statistical model with the
-  lowest rolling-origin MASE per series (deterministic and replayable).
+  `'{"model":"auto"}'` selects the statistical model with the
+  lowest rolling-origin MASE per series, deterministically.
   `'{"interval_method":"conformal"}'` swaps the default Gaussian prediction band
   for a distribution-free one calibrated on out-of-sample residuals: on smooth
   series the in-sample band is overconfident (measured 0.57 empirical coverage at
@@ -49,8 +38,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   horizon, options)` reports per-fold MAE/RMSE/MASE/sMAPE and interval coverage
   from a rolling-origin evaluation, with `folds` and a `gap` leakage guard, so a
   caller can score forecasts and validate conformal coverage on-device
-  (conformal via leave-fold-out calibration). All three share one rolling-origin
-  backtest core, carry exact-replay receipts, and are covered by ASan/UBSan.
+  (conformal via leave-fold-out calibration). All three share one
+  rolling-origin backtest core and are covered by ASan/UBSan.
 - **Intermittent-demand model + explicit auto candidates.** `tsb`
   (Teunter-Syntetos-Babai) joins the bundled statistical models and the `auto`
   pool, for the sparse, mostly-zero series (rare events: errors, retries) that
@@ -58,9 +47,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `detect_anomalies`). `'{"model":"auto","candidates":[...]}'` sets the auto
   pool explicitly, and a candidate may be a distilled forecast student, so an
   agent's own foundation-model student competes with the cheap baselines per
-  series. Candidates are recorded canonically in the receipt for deterministic
-  replay; `conformal` and an over-long horizon are rejected for a student
-  candidate.
+  series. Candidate selection is deterministic; `conformal` and an
+  over-long horizon are rejected for a student candidate.
 - `distill_predict()` trains a native student, stored as an inline BLOB and executed
   by the zero-dependency core with no onnxruntime. By default it trains on the
   target column — your labels, or a strong teacher's predictions computed
@@ -75,8 +63,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gbt and mlp students distill the teacher's full probability distribution
   (soft-label distillation) instead of its hard argmax, preserving the
   calibration a foundation-model teacher provides. Both serve in microseconds,
-  are deterministic, and carry the same exact-replay receipts as the stat
-  models. The student blob is bounds-checked on read (caller-writable
+  are deterministic, like the stat models. The student blob is bounds-checked on read (caller-writable
   registry).
 - `distill_forecast()` trains a native **forecast student**: a regression net
   that maps an instance-normalized context window to future values, distilled
@@ -121,7 +108,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rank; there is no forecast/interval. On a broad 200-series TSB-AD-U sample it
   scores 0.44 median VUS-PR (at the published SOTA level) versus the theta
   residual detector's 0.23 -- roughly 2x on the typical series, all in zero-
-  dependency C with exact-replay receipts. Two honest caveats: the *mean* gap is
+  dependency C. Two honest caveats: the *mean* gap is
   much smaller (0.41 vs 0.38) because sub-pca fails badly on weakly-periodic or
   very long series where the fixed-window PCA does not fit, so the two are partly
   complementary; and on a subset filtered to moderate-length periodic series the
@@ -129,7 +116,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   NOT close it: a stronger forecaster masks anomalies by predicting them (verified
   against a Chronos one-step baseline on TSB-AD-U, which only tied the theta
   z-score), so the win comes from the detector family, not a better forecaster.
-- Replayable receipts on every prediction, and `predict_replay()` to verify
   a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`,
   `sub-pca` (time series) and `knn5-incontext` (tabular). Forecast prediction intervals
@@ -143,7 +129,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `io_spec` layouts. The `vector` layout serves a self-contained model (a
   distilled student or classifier/regressor) for `predict()`; the `in_context`
   layout serves a teacher that ingests the `train_query` rows as context
-  each call (TabFM-shaped), anchoring those rows in the receipt. The `sequence`
+  each call (TabFM-shaped). The `sequence`
   layout serves a **forecast foundation model** for `forecast()` and as an in-DB
   `distill_forecast` teacher: it feeds a context window as a tensor and reads the
   point + interval off the model's quantile fan. Two exporters ship:
@@ -170,7 +156,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dedicated GPU job. The default build stays zero-dependency.
 - `predict_register(model_id, config)` to register an external model,
   pinning its weights by content hash. `_predict_models` gains `weights_uri`
-  and `io_spec`; receipts record the execution provider and precision. The
+  and `io_spec`; the execution provider and precision are explicit options. The
   config can be a bare weights path: the io_spec is read off the model
   (tensor names, output kind, class count) and feature columns map by
   position, so the common case is one line. An explicit io_spec overrides.

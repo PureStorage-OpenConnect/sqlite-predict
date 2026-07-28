@@ -1,8 +1,8 @@
 ---
 title: sqlite-predict
-description: Forecasting, anomaly detection, and prediction as SQL primitives for SQLite, with replayable receipts.
+description: Forecasting, anomaly detection, and prediction as SQL primitives for SQLite.
 hero:
-  tagline: Forecasting, anomaly detection, and prediction as SQL primitives. Runs wherever SQLite already does, and every result carries a replayable receipt.
+  tagline: Forecasting, anomaly detection, and prediction as SQL primitives. Runs wherever SQLite already does.
   actions:
     - text: Get started
       link: /getting-started/python/
@@ -18,18 +18,16 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 ## Prediction as a SQL primitive
 
 `forecast()`, `detect_anomalies()`, and `predict()` become functions you call
-over an ordinary `SELECT`. The core is one small C99 file with no dependencies,
+over your own rows. The core is one small C99 file with no dependencies,
 so it runs in your app, on a phone, in the browser, or in the per-database state
-an AI agent keeps. Every result carries a **replayable receipt**, so an agent
-can cite the number and an auditor can reproduce it byte-for-byte.
+an AI agent keeps.
 
 ```sql
--- forecast a metric 24 steps ahead. rows in, rows out.
-SELECT step, forecast, lower_bound, upper_bound
-FROM forecast('SELECT ts, value FROM readings', 24);
+-- forecast a metric 24 steps ahead: plain SQL supplies the rows
+SELECT forecast(ts, value, 24) FROM readings;
 
--- or as an aggregate: plain SQL supplies the rows, GROUP BY splits
--- the series. This is the form ORMs and query builders compose.
+-- GROUP BY splits the series. WHERE, joins, and bound parameters
+-- compose, so ORMs and query builders work unchanged.
 SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 ```
 
@@ -40,8 +38,8 @@ SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
   <Card title="Zero dependencies" icon="approve-check">
     Pure C99. No ONNX runtime, no GPU, no network at serve time.
   </Card>
-  <Card title="Auditable" icon="seti:lock">
-    Receipts pin the model and the exact data; `predict_replay()` reproduces byte-for-byte.
+  <Card title="Composable" icon="seti:db">
+    An aggregate that works with GROUP BY, views, ORMs, and read-only databases. It writes nothing.
   </Card>
   <Card title="Honest, reproducible numbers" icon="bars">
     ~0.89 MASE distilled forecasting, SOTA-level anomaly detection, calibrated intervals. See [Benchmarks](./benchmarks/).
@@ -49,6 +47,6 @@ SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 </CardGrid>
 
 :::caution[Pre-alpha]
-The API, the on-disk receipt format, and the SQL surface are unstable and may
-change without notice. Not yet recommended for production.
+The API and the SQL surface are unstable and may change without notice. Not yet
+recommended for production.
 :::

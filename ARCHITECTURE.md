@@ -15,9 +15,9 @@ Source layout:
 | File | Responsibility |
 | --- | --- |
 | `sqlite-predict.c` | entry point, function registration, shared helpers (timestamp parse/format, ULID, options parsing, normal-quantile) |
-| `predict-forecast.c` | `forecast()` and `detect_anomalies()` vtabs, the statistical models, the native forecast-student serving path, and the shared `collect_series()` helper |
+| `predict-forecast.c` | the `forecast()` and `detect_anomalies()` aggregates, `backtest()`, the expansion TVFs, the statistical models, the native forecast-student serving path, and the shared `collect_series()` helper |
 | `predict-tabular.c` | `predict()` vtab, the in-context k-NN model, and dispatch to a runtime backend for registered models |
-| `predict-receipts.c` | model registry, receipts, canonical hashing, the logical-digest anchor, and `predict_replay()` |
+| `predict-receipts.c` | the model registry (`_predict_models`) and content hashing |
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
 | `predict-student.c` | the native student **serving** runtime: blob (de)serialization and tree / forest / MLP inference (`predict0_tree_run`). The serve side of the train/serve boundary |
 | `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on (RFC §4.1.6) |
@@ -56,8 +56,8 @@ that context. The **sequence** layout is a forecast foundation model served by
 as a `[1, ctx]` tensor (truncated to a multiple of the model's patch size) and
 reads a `[1, Q, H]` quantile fan back, from which the point and the interval at
 the requested confidence are interpolated over the io_spec's quantile levels.
-Chronos-Bolt exports cleanly to this shape (`scripts/export_chronos_onnx.py`);
-the receipt anchors the series, and the served MASE matches the Python model.
+Chronos-Bolt exports cleanly to this shape (`scripts/export_chronos_onnx.py`),
+and the served MASE matches the Python model.
 
 The `io_spec` is usually derived, not written. `predict_register` reads the
 model's input/output tensors (`predict0_onnx_introspect`) to fill in the
@@ -71,15 +71,14 @@ SQLite's JSON1 (`json_extract`/`json_each`/`json_object`), never a hand-rolled
 parser. Both cache one onnxruntime session per (weights, device,
 precision), run query rows in batches, and select the execution provider
 explicitly, erasing no failure into a silent CPU fallback. Weights are pinned
-by content hash, so a receipt records exactly which bytes ran, and the
-in-context receipt anchors the training rows too, so mutating the context
-breaks replay. Both run on CPU. A GPU build (`make loadable-onnx-gpu`,
+by content hash, verified before deserialization, so exactly the registered
+bytes run. Both run on CPU. A GPU build (`make loadable-onnx-gpu`,
 `-DSQLITE_PREDICT_ONNX_GPU`) wires the CUDA and TensorRT providers and
 fp16/int8 precision; the provider-options symbols are in every onnxruntime
 C API, so it compiles and links against the CPU onnxruntime for a CI
 compile-check, while real GPU execution is validated on a dedicated GPU job.
-The receipt records the execution provider and precision, which is what
-makes GPU results honestly distinguishable from the deterministic CPU path.
+GPU results are honestly distinguishable from the deterministic CPU path
+(provider and precision are explicit options, never silent fallbacks).
 Even so, the `benchmarks/` numbers (and the TabFM→ONNX eval in
 `benchmarks/results/tabfm-onnx.md`) are why the default answer for a
 teacher's accuracy is usually distillation to a small student.
@@ -124,8 +123,8 @@ servable across upgrades, snapshots, and forks, and a serving-only module can
 execute a blob it never trained. They are rigorously bounds-checked on read,
 because the registry is
 writable by any SQL caller (RFC §6.2) — a hand-crafted blob is rejected,
-never crashed on. Because the student is native and deterministic, its
-predictions carry the same exact-replay receipt as the stat models.
+never crashed on. The student is native and deterministic, like the stat
+models.
 
 Forecasting has its own student. `distill_forecast()` (`predict-distill.c`)
 fits a regression MLP that maps an instance-normalized context window of `nfeat`
@@ -144,44 +143,21 @@ distilled once offline, become a microsecond native student. A tree cannot
 represent that temporal function, so `distill_forecast` uses the MLP trainer
 specifically.
 
-## Receipts, anchoring, and replay
-
-Every operation writes a row to `_predict_receipts` (unless
-`'{"receipt":0}'`): the model id and hash, an anchor for the data state
-read, the canonical call parameters, the inner SQL, and a hash of the
-result set.
-
-- **Canonical result hash** (`predict-receipts.c`): rows are hashed in a
-  defined order with type-tagged fields, separated by `0x1F` between fields
-  and `0x1E` between rows. Integers hash as decimal text, reals as their
-  big-endian IEEE-754 bit pattern, and text as UTF-8. This keeps the hash
-  stable across runs on the same machine.
-- **Logical-digest anchor**: a hash of the user tables' schema and rows
-  (excluding `_predict_%` and `sqlite_%`). A page-level file digest can
-  never replay-match, because writing the receipt itself changes the file;
-  the logical digest is indifferent to receipt writes and to `VACUUM`.
-- **Replay** re-executes the recorded call read-only against the anchored
-  state and compares result hashes. It refuses to run if the current state
-  no longer matches the anchor.
-
 ## Determinism
 
-Statistical inference is deterministic on a given machine, which is what
-makes replay meaningful. The ONNX CPU-fp32 path is deterministic too, so
-its receipts replay bit-exact; the receipt records the execution provider
-and precision. GPU and fp16 inference is not bit-reproducible across
-machines (different hardware and kernels round differently), so that path
-carries a `nondeterministic` receipt and replays within a tolerance,
-reporting a `match_kind` rather than a bit-exact hash — that tiered replay
-lands with the GPU backend. Cross-machine, cross-backend bit-equality is
-never claimed (see `benchmarks/notes.md`).
+Statistical inference is deterministic on a given machine: same rows in,
+same document out, byte for byte (canonical `%.17g` float formatting in
+the JSON documents). The ONNX CPU-fp32 path is deterministic too. GPU and
+fp16 inference is not bit-reproducible across machines (different hardware
+and kernels round differently). Cross-machine, cross-backend bit-equality
+is never claimed (see `benchmarks/notes.md`).
 
 ## Deviations from the spec
 
 The implementation surfaced amendments queued for the design spec: the
-`ts-stat`/`tabular-stat` model kinds, the `logical-digest` anchor kind, a
-`{"train","apply"}` JSON `input_sql` for two-query operations, and null
-option values meaning "key omitted." These are noted at the top of the
-files that introduce them.
+`ts-stat`/`tabular-stat` model kinds, aggregate-form `forecast`/
+`detect_anomalies` as the one calling convention for series operations,
+the removal of receipts, and null option values meaning "key omitted."
+These are noted at the top of the files that introduce them.
 
 [tvf]: https://www.sqlite.org/vtab.html#tabfunc2

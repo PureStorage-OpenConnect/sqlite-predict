@@ -5,8 +5,7 @@ description: Compress a slow teacher into a tiny native student that runs anywhe
 
 Foundation models are accurate but too heavy to call per query on CPU. The
 answer is distillation: run the teacher once to label your data, then fit a small
-**native student** that runs in the zero-dependency core with no runtime, and
-carries the same replayable receipts.
+**native student** that runs in the zero-dependency core with no runtime.
 
 ## Tabular: `distill_predict`
 

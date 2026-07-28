@@ -58,19 +58,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   sqlite3_predict_init(db, NULL, NULL);
   seed_tables(db);
 
-  switch (data[0] % 7) {
-  case 0: /* fuzz forecast options */
-    run_sql_discard(db, "SELECT * FROM forecast("
-                        "'SELECT ts, value FROM series', 3, ?1)",
+  switch (data[0] % 6) {
+  case 0: /* fuzz forecast aggregate options */
+    run_sql_discard(db,
+                    "SELECT forecast(ts, value, 3, ?1) FROM series"
+                    " GROUP BY grp",
                     text, NULL, NULL);
     break;
-  case 1: /* fuzz forecast inner query */
-    run_sql_discard(db, "SELECT * FROM forecast(?1, 3, '{\"receipt\":0}')",
-                    text, NULL, NULL);
+  case 1: /* fuzz the aggregate ts argument + the misuse stub */
+    run_sql_discard(db, "SELECT forecast(?1, value, 3) FROM series", text,
+                    NULL, NULL);
+    run_sql_discard(db, "SELECT forecast(?1, 3)", text, NULL, NULL);
     break;
   case 2: /* fuzz detect_anomalies options */
-    run_sql_discard(db, "SELECT * FROM detect_anomalies("
-                        "'SELECT ts, value FROM series', ?1)",
+    run_sql_discard(db, "SELECT detect_anomalies(ts, value, ?1) FROM series",
                     text, NULL, NULL);
     break;
   case 3: /* fuzz predict: input as options, and as apply query */
@@ -80,35 +81,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     text, NULL, NULL);
     run_sql_discard(db,
                     "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
-                    " ?1, '{\"target\":\"label\",\"receipt\":0}')",
+                    " ?1, '{\"target\":\"label\"}')",
                     text, NULL, NULL);
     break;
-  case 5: /* fuzz the aggregate forms: options JSON and the ts argument */
-    run_sql_discard(db,
-                    "SELECT forecast(ts, value, 3, ?1) FROM series"
-                    " GROUP BY grp",
+  case 4: /* fuzz backtest: options and the inner query */
+    run_sql_discard(db, "SELECT * FROM backtest("
+                        "'SELECT ts, value FROM series', 3, ?1)",
                     text, NULL, NULL);
-    run_sql_discard(db, "SELECT detect_anomalies(ts, value, ?1) FROM series",
-                    text, NULL, NULL);
-    run_sql_discard(db, "SELECT forecast(?1, value, 3) FROM series", text,
-                    NULL, NULL);
+    run_sql_discard(db, "SELECT * FROM backtest(?1, 3)", text, NULL, NULL);
     break;
-  case 6: /* fuzz the expansion functions' document parser + verify */
+  default: /* fuzz the expansion functions' document parser + predict_ulid */
     run_sql_discard(db, "SELECT * FROM forecast_rows(?1)", text, NULL, NULL);
     run_sql_discard(db, "SELECT * FROM anomaly_rows(?1)", text, NULL, NULL);
-    run_sql_discard(db,
-                    "SELECT * FROM predict_verify(?1,"
-                    " 'SELECT ts, value FROM series')",
-                    text, NULL, NULL);
-    run_sql_discard(db,
-                    "SELECT match FROM predict_verify((SELECT forecast(ts,"
-                    " value, 2) FROM series), ?1)",
-                    text, NULL, NULL);
-    break;
-  default: /* fuzz predict_ulid + predict_replay lookups */
     run_sql_discard(db, "SELECT predict_ulid(?1)", text, NULL, NULL);
-    run_sql_discard(db, "SELECT * FROM predict_replay(?1)", text, NULL,
-                    NULL);
     break;
   }
 

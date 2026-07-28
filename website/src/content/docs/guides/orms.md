@@ -1,13 +1,11 @@
 ---
 title: Using with ORMs
-description: Compose forecasts through Drizzle, SQLAlchemy, or Diesel with the aggregate form, and keep migration tools away from the receipt tables.
+description: Compose forecasts through Drizzle, SQLAlchemy, or Diesel, and keep migration tools away from the model registry.
 ---
 
-The table-valued form (`FROM forecast('SELECT …', 24)`) takes its data as a SQL
-string, which an ORM's query builder can't compose or bind parameters into. The
-**aggregate form** exists for exactly this: the statement supplies the rows, so
-filtering, joins, parameters, and `GROUP BY` series-splitting are all ordinary
-query-builder territory.
+`forecast` and `detect_anomalies` are aggregate functions: the statement
+supplies the rows, so filtering, joins, parameters, and `GROUP BY`
+series-splitting are all ordinary query-builder territory.
 
 ```sql
 SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
@@ -45,8 +43,7 @@ const out = db
   .groupBy(readings.city)
   .all();
 
-const { rows, receipt } = JSON.parse(out[0].doc);
-// store `receipt` in your own provenance table if you want it kept
+const { rows } = JSON.parse(out[0].doc);
 ```
 
 ## SQLAlchemy (Python)
@@ -101,9 +98,10 @@ Drizzle example.
 
 ## Keep migration tools away from `_predict_*`
 
-sqlite-predict stores its model registry and receipts in `_predict_models` and
-`_predict_receipts`, inside your database. Schema-diffing tools see tables they
-don't own and will happily generate `DROP TABLE` for them. Exclude the prefix:
+sqlite-predict stores its model registry (bundled models and distilled
+students) in `_predict_models`, inside your database. Schema-diffing tools see
+a table they don't own and will happily generate `DROP TABLE` for it. Exclude
+the prefix:
 
 **drizzle-kit** (`drizzle.config.ts`):
 
@@ -124,8 +122,5 @@ context.configure(include_name=include_name, ...)
 drift detection flags them; keep predict tables in a separate attached
 database, or use `migrate diff` reviews rather than auto-apply.
 
-A note on receipts: the aggregate form never writes to the database. Its
-receipt is a ~450-byte document returned inside the result (never your data,
-only digests); store it in your own provenance table or pipeline if you want
-it kept, and verify it later with `predict_verify`. Read paths stay read-only,
-replicas included. See [Receipts & replay](../receipts/).
+Reads stay reads: the aggregate writes nothing, so replicas and read-only
+databases just work.

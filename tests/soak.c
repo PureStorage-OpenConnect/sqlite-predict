@@ -127,23 +127,18 @@ int main(void) {
               1);
 
   for (int i = 0; i < 50; i++) {
-    if (run_discard(db,
-                    "SELECT * FROM forecast('SELECT ts, value FROM series',"
-                    " 6)",
+    /* serving loop: the aggregate forms (the one calling convention for
+     * forecast/detect_anomalies) + predict, across models and options */
+    if (run_discard(db, "SELECT forecast(ts, value, 6) FROM series", 1) ||
+        run_discard(db,
+                    "SELECT grp, forecast(ts, value, 4) FROM series"
+                    " GROUP BY grp",
+                    1) ||
+        run_discard(db, "SELECT detect_anomalies(ts, value) FROM series",
                     1) ||
         run_discard(db,
-                    "SELECT * FROM forecast('SELECT ts, value, grp FROM"
-                    " series', 4,"
-                    " '{\"group_cols\":[\"grp\"],\"receipt\":0}')",
-                    1) ||
-        run_discard(db,
-                    "SELECT * FROM detect_anomalies("
-                    "'SELECT ts, value FROM series', '{\"receipt\":0}')",
-                    1) ||
-        run_discard(db,
-                    "SELECT * FROM detect_anomalies("
-                    "'SELECT ts, value FROM series',"
-                    " '{\"model\":\"sub-pca\",\"receipt\":0}')",
+                    "SELECT detect_anomalies(ts, value,"
+                    " '{\"model\":\"sub-pca\"}') FROM series",
                     1) ||
         run_discard(db,
                     "SELECT * FROM predict("
@@ -151,33 +146,32 @@ int main(void) {
                     "'SELECT id, f1, f2 FROM tab WHERE id >= 100',"
                     " '{\"target\":\"label\"}')",
                     1) ||
-        run_discard(db,
-                    "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_student\",\"receipt\":0}')",
+        run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+                        " '{\"model\":\"soak_student\"}')",
                     1))
       goto done_fail;
 
     /* gbt-student (forest runtime) + tree/forest error paths */
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_gbt\",\"receipt\":0}')",
+                    " '{\"model\":\"soak_gbt\"}')",
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_knn\",\"receipt\":0}')",
+                    " '{\"model\":\"soak_knn\"}')",
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_soft\",\"receipt\":0}')",
+                    " '{\"model\":\"soak_soft\"}')",
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_mlp\",\"receipt\":0}')",
+                    " '{\"model\":\"soak_mlp\"}')",
                 1);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_bad\",\"receipt\":0}')",
+                    " '{\"model\":\"soak_bad\"}')",
                 0);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_gbt_bad\",\"receipt\":0}')",
+                    " '{\"model\":\"soak_gbt_bad\"}')",
                 0);
     run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-                    " '{\"model\":\"soak_mlp_bad\",\"receipt\":0}')",
+                    " '{\"model\":\"soak_mlp_bad\"}')",
                 0);
     run_discard(db,
                 "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
@@ -187,111 +181,124 @@ int main(void) {
                     " '{\"student_id\":\"nope\"}')",
                 0);
 
-    /* Phase-1: auto selection, conformal intervals, backtest() (with and
-     * without receipts, grouped, gapped) — exercises the rolling-origin
-     * backtest scratch allocations and the backtest receipt path */
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
-                    " '{\"model\":\"auto\",\"receipt\":0}')",
+    /* auto selection, conformal intervals, backtest() (grouped, gapped) --
+     * exercises the rolling-origin backtest scratch allocations */
+    run_discard(db, "SELECT forecast(ts, value, 6,"
+                    " '{\"model\":\"auto\"}') FROM series",
                 1);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
-                    " '{\"interval_method\":\"conformal\",\"receipt\":0}')",
+    run_discard(db, "SELECT forecast(ts, value, 6,"
+                    " '{\"interval_method\":\"conformal\"}') FROM series",
                 1);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
-                    " 4, '{\"model\":\"auto\",\"interval_method\":\"conformal\","
-                    "\"group_cols\":[\"grp\"],\"folds\":8,\"gap\":2}')",
+    run_discard(db, "SELECT grp, forecast(ts, value, 4,"
+                    " '{\"model\":\"auto\",\"interval_method\":"
+                    "\"conformal\",\"folds\":8,\"gap\":2}')"
+                    " FROM series GROUP BY grp",
                 1);
     run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
-                    " '{\"folds\":10,\"receipt\":0}')",
+                    " '{\"folds\":10}')",
                 1);
     run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
                     " '{\"model\":\"auto\",\"interval_method\":\"conformal\","
                     "\"folds\":12}')",
                 1);
     run_discard(db, "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
-                    " 5, '{\"group_cols\":[\"grp\"],\"gap\":3,\"receipt\":0}')",
+                    " 5, '{\"group_cols\":[\"grp\"],\"gap\":3}')",
                 1);
-    /* new option error + edge paths */
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
-                    " '{\"interval_method\":\"bogus\"}')",
+    /* option error + edge paths */
+    run_discard(db, "SELECT forecast(ts, value, 6,"
+                    " '{\"interval_method\":\"bogus\"}') FROM series",
                 0);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
-                    " '{\"folds\":0}')",
+    run_discard(db, "SELECT forecast(ts, value, 6, '{\"folds\":0}')"
+                    " FROM series",
                 0);
     run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
                     " '{\"model\":\"nope\"}')",
                 0);
     run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
-                    " '{\"gap\":100000,\"receipt\":0}')",
+                    " '{\"gap\":100000}')",
                 1);
 
     /* tsb + auto candidate sets (statistical models; the student-candidate
      * path is exercised by the onnx build) */
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
-                    " '{\"model\":\"tsb\",\"receipt\":0}')",
+    run_discard(db, "SELECT forecast(ts, value, 6,"
+                    " '{\"model\":\"tsb\"}') FROM series",
                 1);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
+    run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"model\":\"auto\",\"candidates\":[\"tsb\","
-                    "\"theta-classic\"],\"receipt\":0}')",
+                    "\"theta-classic\"]}') FROM series",
                 1);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
-                    " 4, '{\"model\":\"auto\",\"candidates\":"
-                    "[\"stub-seasonal-naive\",\"tsb\"],\"gap\":2}')",
+    run_discard(db, "SELECT grp, forecast(ts, value, 4,"
+                    " '{\"model\":\"auto\",\"candidates\":"
+                    "[\"stub-seasonal-naive\",\"tsb\"],\"gap\":2}')"
+                    " FROM series GROUP BY grp",
                 1);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
-                    " '{\"candidates\":[\"tsb\"]}')",
+    run_discard(db, "SELECT forecast(ts, value, 6,"
+                    " '{\"candidates\":[\"tsb\"]}') FROM series",
                 0);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 6,"
-                    " '{\"model\":\"auto\",\"candidates\":[\"nope\"]}')",
+    run_discard(db, "SELECT forecast(ts, value, 6,"
+                    " '{\"model\":\"auto\",\"candidates\":[\"nope\"]}')"
+                    " FROM series",
                 0);
-    run_discard(db, "SELECT * FROM detect_anomalies('SELECT ts, value FROM"
-                    " series', '{\"model\":\"tsb\"}')",
+    run_discard(db, "SELECT detect_anomalies(ts, value,"
+                    " '{\"model\":\"tsb\"}') FROM series",
                 0);
 
     /* forecast student: direct serve, and as an auto candidate (exercises
      * resolve_candidates student load/free + fcst_point + fcst_run) */
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 2,"
-                    " '{\"model\":\"soak_fcst\",\"receipt\":0}')",
+    run_discard(db, "SELECT forecast(ts, value, 2,"
+                    " '{\"model\":\"soak_fcst\"}') FROM series",
                 1);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 2,"
+    run_discard(db, "SELECT forecast(ts, value, 2,"
                     " '{\"model\":\"auto\",\"candidates\":[\"theta-classic\","
-                    "\"soak_fcst\"],\"receipt\":0}')",
+                    "\"soak_fcst\"]}') FROM series",
                 1);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts, value FROM series', 2,"
+    run_discard(db, "SELECT forecast(ts, value, 2,"
                     " '{\"model\":\"auto\",\"candidates\":[\"soak_fcst\"],"
-                    "\"interval_method\":\"conformal\"}')",
+                    "\"interval_method\":\"conformal\"}') FROM series",
                 0);
 
-    /* error paths every iteration too — including every collect_series
-     * failure branch, for both ops, so valgrind sees the partial-series
-     * cleanup under load */
-    run_discard(db, "SELECT * FROM forecast('DELETE FROM series', 3)", 0);
-    run_discard(db,
-                "SELECT * FROM forecast('SELECT ts, value FROM series', 3,"
-                " '{\"bogus\":1}')",
+    /* error paths every iteration too: aggregate misuse and option
+     * rejection, plus backtest's collect_series failure branches, so
+     * valgrind sees the partial-series cleanup under load */
+    run_discard(db, "SELECT forecast('SELECT ts FROM series', value, 3)"
+                    " FROM series",
                 0);
-    run_discard(db, "SELECT * FROM forecast('NOT SQL', 3)", 0);
-    run_discard(db, "SELECT * FROM forecast('SELECT ts FROM series', 3)", 0);
-    run_discard(db,
-                "SELECT * FROM forecast('SELECT ts, value FROM series', 3,"
-                " '{\"time_col\":\"nope\"}')",
+    run_discard(db, "SELECT forecast('SELECT ts, value FROM series', 3)", 0);
+    run_discard(db, "SELECT forecast(ts, value, 3, '{\"bogus\":1}')"
+                    " FROM series",
                 0);
-    run_discard(db,
-                "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
-                " 3, '{\"group_cols\":[\"nope\"]}')",
+    run_discard(db, "SELECT forecast(ts, value, 3,"
+                    " '{\"time_col\":\"nope\"}') FROM series",
                 0);
-    run_discard(db,
-                "SELECT * FROM detect_anomalies('SELECT grp AS a, grp AS b"
-                " FROM series')",
+    run_discard(db, "SELECT forecast(ts, value, 3,"
+                    " '{\"group_cols\":[\"grp\"]}') FROM series",
                 0);
-    run_discard(db,
-                "SELECT * FROM detect_anomalies('DELETE FROM series')", 0);
-    run_discard(db,
-                "SELECT * FROM detect_anomalies('SELECT ts, value FROM"
-                " series', '{\"value_col\":\"nope\"}')",
+    run_discard(db, "SELECT forecast(ts, value, 3, '{\"receipt\":0}')"
+                    " FROM series",
+                0);
+    run_discard(db, "SELECT forecast(ts, value, rowid % 2 + 1) FROM series",
+                0);
+    run_discard(db, "SELECT forecast(ts, value, 4, CASE WHEN rowid % 2"
+                    " THEN '{}' ELSE NULL END) FROM series",
+                0);
+    run_discard(db, "SELECT forecast(ts, value, 0) FROM series", 0);
+    run_discard(db, "SELECT forecast(ts, value, 4) FROM series WHERE 0", 1);
+    run_discard(db, "SELECT * FROM backtest('DELETE FROM series', 3)", 0);
+    run_discard(db, "SELECT * FROM backtest('NOT SQL', 3)", 0);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts FROM series', 3)", 0);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 3,"
+                    " '{\"time_col\":\"nope\"}')",
+                0);
+    run_discard(db, "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
+                    " 3, '{\"group_cols\":[\"nope\"]}')",
                 0);
     /* duplicate option keys (the CI fuzzer's leak): last-wins, no leak */
+    run_discard(db, "SELECT forecast(ts, value, 3,"
+                    " '{\"model\":\"theta-classic\",\"model\":"
+                    "\"stub-seasonal-naive\"}') FROM series",
+                1);
     run_discard(db,
-                "SELECT * FROM forecast('SELECT ts, value, grp FROM series',"
+                "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
                 " 3, '{\"model\":\"theta-classic\",\"model\":"
                 "\"stub-seasonal-naive\",\"time_col\":\"ts\",\"time_col\":"
                 "\"ts\",\"group_cols\":[\"grp\"],\"group_cols\":[\"grp\"]}')",
@@ -307,82 +314,19 @@ int main(void) {
                 "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
                 " 'SELECT id, f1 FROM tab', '{\"target\":\"label\"}')",
                 0);
-    run_discard(db, "SELECT * FROM predict_replay('01NOPE')", 0);
     run_discard(db, "SELECT predict_ulid('not a time')", 0);
 
-    /* aggregate forms (RFC §4.2.8) + expansion functions (§4.2.9):
-     * happy path, GROUP BY, receipts on and off, and the error paths
-     * (constant options/horizon, query-shape keys, misuse redirect,
-     * garbage documents) so the sanitizers see the xStep/xFinal
-     * cleanup under load */
-    run_discard(db, "SELECT forecast(ts, value, 4) FROM series", 1);
-    run_discard(db, "SELECT grp, forecast(ts, value, 3,"
-                    " '{\"receipt\":0}') FROM series GROUP BY grp",
-                1);
-    run_discard(db, "SELECT detect_anomalies(ts, value) FROM series", 1);
-    run_discard(db, "SELECT grp, detect_anomalies(ts, value,"
-                    " '{\"model\":\"sub-pca\",\"receipt\":0}')"
-                    " FROM series GROUP BY grp",
-                1);
+    /* expansion functions: round trips + garbage documents */
     run_discard(db, "SELECT * FROM forecast_rows((SELECT forecast(ts, value,"
-                    " 4, '{\"receipt\":0}') FROM series))",
+                    " 4) FROM series))",
                 1);
     run_discard(db, "SELECT * FROM anomaly_rows((SELECT detect_anomalies(ts,"
-                    " value, '{\"receipt\":0}') FROM series))",
+                    " value) FROM series))",
                 1);
-    run_discard(db, "SELECT forecast(ts, value, 4) FROM series WHERE 0", 1);
-    run_discard(db, "SELECT forecast(ts, value, 4,"
-                    " '{\"time_col\":\"ts\"}') FROM series",
-                0);
-    run_discard(db, "SELECT forecast(ts, value, rowid % 2 + 1) FROM series",
-                0);
-    run_discard(db, "SELECT forecast(ts, value, 4, CASE WHEN rowid % 2"
-                    " THEN '{}' ELSE NULL END) FROM series",
-                0);
-    run_discard(db, "SELECT forecast('SELECT ts FROM series', 4)", 0);
-    run_discard(db, "SELECT forecast(ts, value, 0) FROM series", 0);
-    run_discard(db, "SELECT detect_anomalies(ts, value,"
-                    " '{\"model\":\"tsb\"}') FROM series",
-                0);
     run_discard(db, "SELECT * FROM forecast_rows('not json')", 0);
     run_discard(db, "SELECT * FROM anomaly_rows('[1,2]')", 0);
     run_discard(db, "SELECT * FROM forecast_rows(NULL)", 1);
   }
-
-  /* one replay round-trip on the last query-form receipt */
-  if (run_discard(db,
-                  "SELECT match FROM predict_replay("
-                  "(SELECT receipt_id FROM _predict_receipts WHERE"
-                  " anchor_kind = 'logical-digest' ORDER BY receipt_id DESC"
-                  " LIMIT 1))",
-                  1))
-    goto done_fail;
-
-  /* predict_verify round-trips on a document receipt (§4.2.10): whole
-   * result documents are accepted, mutation is a match=0 finding
-   * (statement still succeeds), and the error paths are loud */
-  if (run_discard(db,
-                  "SELECT match FROM predict_verify("
-                  "(SELECT forecast(ts, value, 4) FROM series),"
-                  " 'SELECT ts, value FROM series')",
-                  1))
-    goto done_fail;
-  run_discard(db, "DELETE FROM series WHERE rowid % 3 = 0", 1);
-  if (run_discard(db,
-                  "SELECT match FROM predict_verify("
-                  "(SELECT detect_anomalies(ts, value) FROM series),"
-                  " 'SELECT ts, value FROM series')",
-                  1))
-    goto done_fail;
-  run_discard(db,
-              "SELECT match FROM predict_verify('01NOPE',"
-              " 'SELECT ts, value FROM series')",
-              0);
-  run_discard(db,
-              "SELECT match FROM predict_verify("
-              "(SELECT forecast(ts, value, 2) FROM series),"
-              " 'DELETE FROM series')",
-              0);
 
   sqlite3_close(db);
   fprintf(stderr, "soak ok\n");

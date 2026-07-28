@@ -38,5 +38,3 @@ confirm the conformal band actually covers at the nominal level on your data:
 SELECT avg(coverage) FROM backtest('SELECT ts, value FROM readings', 6,
   '{"interval_method":"conformal","confidence_level":0.9,"folds":25}');
 ```
-
-Every backtest is receipt-anchored and replayable.

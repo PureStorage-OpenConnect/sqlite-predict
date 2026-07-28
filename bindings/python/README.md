@@ -1,8 +1,8 @@
 # everpure-sqlite-predict
 
 Prediction as a SQL primitive for SQLite: `forecast()`, `detect_anomalies()`,
-`predict()`, with replayable receipts. The wheel bundles the zero-dependency
-loadable extension for your platform.
+`predict()`. The wheel bundles the zero-dependency loadable extension for your
+platform.
 
 ```python
 import sqlite3
@@ -13,10 +13,11 @@ sqlite_predict.load(db)
 
 db.execute("CREATE TABLE readings(ts TEXT, value REAL)")
 # ... insert rows ...
-for row in db.execute(
-    "SELECT * FROM forecast('SELECT ts, value FROM readings', 24)"
-):
-    print(row)
+
+# forecast() is an aggregate: your query supplies the rows, and each
+# group returns one JSON document
+doc = db.execute("SELECT forecast(ts, value, 24) FROM readings").fetchone()[0]
+print(doc)
 ```
 
 See the [project README](https://github.com/PureStorage-OpenConnect/sqlite-predict)

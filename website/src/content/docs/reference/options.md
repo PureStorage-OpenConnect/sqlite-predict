@@ -11,9 +11,6 @@ rather than being ignored.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `time_col` | string | inferred | Name of the time column. |
-| `value_col` | string | inferred | Name of the value column. |
-| `group_cols` | string[] | none | Split into series keyed by these columns. |
 | `model` | string | `theta-classic` | Forecast model, or `auto`. |
 | `confidence_level` | number (0,1) | 0.9 | Nominal coverage of the interval. |
 | `interval_method` | `residual` \| `conformal` | `residual` | Interval construction. |
@@ -21,36 +18,34 @@ rather than being ignored.
 | `gap` | integer | 0 | Leakage guard between train and target. |
 | `candidates` | string[] | bundled stat models | Candidate pool for `auto`. |
 | `context_limit` | integer | model default | Cap on points fed to the model. |
-| `receipt` | 0 \| 1 | 1 | Write a receipt. |
+
+Aggregate rules: the `options` argument and `horizon` must be the same value
+on every row of a group, and a `SELECT` string passed as the first argument is
+rejected with an error explaining that `forecast` is an aggregate over your
+rows. There are no column-naming keys: the argument positions carry the
+columns and `GROUP BY` carries the series split.
 
 ## detect_anomalies
 
-`time_col`, `value_col`, `group_cols`, `context_limit`, `model`, `receipt` as
-above, plus:
+`model` and `context_limit` as above, plus:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `anomaly_prob_threshold` | number (0,1) | 0.99 | Probability above which a point is flagged. |
 
-## The aggregate forms
-
-The [aggregate forms](../functions/#aggregate-forms) of `forecast` and
-`detect_anomalies` take the same options **minus the query-shape keys**:
-`time_col`, `value_col`, and `group_cols` are rejected with
-`PREDICT_ERR_OPTIONS`, because the argument positions carry the columns and
-`GROUP BY` carries the series split. Everything else applies unchanged
-(`model`, `confidence_level` / `anomaly_prob_threshold`, `interval_method`,
-`folds`, `gap`, `candidates`, `context_limit`, `receipt`).
-
-Two aggregate-only rules: the `options` argument (and `horizon`, for
-`forecast`) must be the same value on every row of a group, and a `SELECT`
-string passed as the first argument is redirected with an error pointing at
-the table-valued form.
+The same aggregate rules apply.
 
 ## backtest
 
-`time_col`, `value_col`, `group_cols`, `confidence_level`, `context_limit`,
-`model`, `folds`, `gap`, `interval_method`, `receipt` as for `forecast`.
+`confidence_level`, `interval_method`, `folds`, `gap`, `context_limit`, and
+`model` as for `forecast`, plus the query-shape keys (backtest takes its data
+as a query, so columns must be resolvable):
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `time_col` | string | inferred | Name of the time column. |
+| `value_col` | string | inferred | Name of the value column. |
+| `group_cols` | string[] | none | Split into series keyed by these columns. |
 
 ## predict
 
@@ -62,7 +57,6 @@ the table-valued form.
 | `device` | `cpu` \| `gpu` | `cpu` | Inference device (onnx build). |
 | `precision` | string | model default | Inference precision (onnx build). |
 | `accept_license` | 0 \| 1 | 0 | Accept a license-tagged model. |
-| `receipt` | 0 \| 1 | 1 | Write a receipt. |
 
 ## distill_predict
 
@@ -74,7 +68,6 @@ the table-valued form.
 | `student_kind` | `tree` \| `gbt` \| `mlp` | Student architecture. |
 | `teacher` | string | Teacher model (onnx build) for soft labels. |
 | `proba`, `classes` | | Soft-label distillation of a probability distribution. |
-| `receipt` | 0 \| 1 | Write a receipt. |
 
 ## distill_forecast
 
@@ -86,4 +79,3 @@ the table-valued form.
 | `horizon` | integer | Forecast length the student is trained for. |
 | `hidden` | integer | Residual-net hidden width. |
 | `epochs`, `lr` | | Training epochs and learning rate. |
-| `receipt` | 0 \| 1 | Write a receipt. |

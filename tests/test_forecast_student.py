@@ -9,6 +9,7 @@ The tests train small and fast via the `epochs`/`hidden` options and use a
 clean, learnable multi-seasonal wave so the student's forecast is checkable.
 """
 
+import json
 import math
 import sqlite3
 
@@ -41,9 +42,8 @@ def _train(db, student_id="f", **over):
     ncol = _load_windows(db)
     opts = {"context": L, "horizon": H, "student_id": student_id,
             "hidden": 32, "epochs": 250, **over}
-    import json
     return db.execute(
-        f"SELECT model_id, content_hash, train_rows, train_rmse, receipt_id"
+        f"SELECT model_id, content_hash, train_rows, train_rmse"
         f" FROM distill_forecast('SELECT {_cols(ncol)} FROM w', json(?))",
         (json.dumps(opts),)).fetchone()
 
@@ -56,12 +56,11 @@ def _load_series(db, n=64, base=1000):
 
 
 def test_distill_forecast_registers_a_student(db):
-    model_id, chash, rows, rmse, receipt = _train(db)
+    model_id, chash, rows, rmse = _train(db)
     assert model_id == "f"
     assert len(chash) == 64
     assert rows == 300
     assert rmse >= 0.0
-    assert receipt
     kind, runtime, wlen, rhash = db.execute(
         "SELECT kind, runtime, length(weights), content_hash"
         " FROM _predict_models WHERE model_id='f'").fetchone()
@@ -72,14 +71,14 @@ def test_distill_forecast_registers_a_student(db):
 def test_forecast_student_serves_and_tracks_the_signal(db):
     _train(db)
     _load_series(db)
-    rows = db.execute(
-        "SELECT step, forecast, lower_bound, upper_bound, status FROM forecast("
-        "'SELECT ts, value FROM s', ?, json_object('model','f','receipt',0))"
-        " ORDER BY step", (H,)).fetchall()
-    assert len(rows) == H
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, ?, json_object('model','f')) FROM s",
+        (H,)).fetchone()[0])
+    assert doc["status"] == "ok"
+    assert len(doc["rows"]) == H
     fc = []
-    for step, f, lo, hi, status in rows:
-        assert status == "ok"
+    for r in doc["rows"]:
+        f, lo, hi = r["forecast"], r["lower_bound"], r["upper_bound"]
         assert f == f and lo == lo and hi == hi  # finite, not NaN
         assert lo <= f <= hi
         fc.append(f)
@@ -104,14 +103,14 @@ def test_linear_forecast_student_serves_and_tracks(db):
         (mid,)).fetchone()[0] for mid in ("lin", "tide"))
     assert lin_len < tide_len  # no hidden layer => smaller blob
     _load_series(db)
-    rows = db.execute(
-        "SELECT step, forecast, lower_bound, upper_bound, status FROM forecast("
-        "'SELECT ts, value FROM s', ?, json_object('model','lin','receipt',0))"
-        " ORDER BY step", (H,)).fetchall()
-    assert len(rows) == H
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, ?, json_object('model','lin')) FROM s",
+        (H,)).fetchone()[0])
+    assert doc["status"] == "ok"
+    assert len(doc["rows"]) == H
     fc = []
-    for step, f, lo, hi, status in rows:
-        assert status == "ok"
+    for r in doc["rows"]:
+        f, lo, hi = r["forecast"], r["lower_bound"], r["upper_bound"]
         assert f == f and lo <= f <= hi
         fc.append(f)
     truth = [_wave(1000 + 64 + j) for j in range(H)]
@@ -127,8 +126,8 @@ def test_forecast_horizon_may_not_exceed_the_student(db):
     _load_series(db)
     with pytest.raises(sqlite3.OperationalError, match="horizon"):
         db.execute(
-            "SELECT * FROM forecast('SELECT ts, value FROM s', ?,"
-            " json_object('model','f','receipt',0))", (H + 1,)).fetchall()
+            "SELECT forecast(ts, value, ?, json_object('model','f'))"
+            " FROM s", (H + 1,)).fetchall()
 
 
 def test_predict_rejects_a_forecast_student(db):
@@ -176,7 +175,6 @@ def _load_qwindows(db, n_windows=300):
 
 
 def _train_q(db, sid="qf"):
-    import json
     ncol = _load_qwindows(db)
     opts = {"context": L, "horizon": H, "student_id": sid, "hidden": 32,
             "epochs": 300, "quantiles": QL3}
@@ -186,10 +184,12 @@ def _train_q(db, sid="qf"):
 
 
 def _serve(db, sid, conf):
-    return db.execute(
-        "SELECT forecast, lower_bound, upper_bound FROM forecast("
-        "'SELECT ts, value FROM s', ?, json_object('model',?,'confidence_level',"
-        "?,'receipt',0)) ORDER BY step", (H, sid, conf)).fetchall()
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, ?, json_object('model',?,"
+        "'confidence_level',?)) FROM s", (H, sid, conf)).fetchone()[0])
+    assert doc["status"] == "ok"
+    return [(r["forecast"], r["lower_bound"], r["upper_bound"])
+            for r in doc["rows"]]
 
 
 def test_quantile_student_serves_a_calibrated_fan(db):
@@ -220,7 +220,6 @@ def test_quantile_interval_widens_with_confidence(db):
 
 
 def test_quantile_bad_levels_rejected(db):
-    import json
     ncol = L + H * len(QL3)
     db.execute(f"CREATE TABLE qw({', '.join(f'c{i} REAL' for i in range(ncol))})")
     db.execute(f"INSERT INTO qw VALUES ({','.join('0' for _ in range(ncol))})")
@@ -242,17 +241,14 @@ def test_forecast_rejects_a_malformed_student_blob(db):
         " content_hash, license) VALUES ('bad','student','tree',?,'x',"
         "'unspecified')", (b"PSFCST01\x05\x00\x00\x00",))
     with pytest.raises(sqlite3.OperationalError):
-        db.execute("SELECT * FROM forecast('SELECT ts, value FROM s', ?,"
-                   " json_object('model','bad','receipt',0))", (H,)).fetchall()
+        db.execute("SELECT forecast(ts, value, ?,"
+                   " json_object('model','bad')) FROM s", (H,)).fetchall()
 
 
-def test_forecast_student_replays(db):
+def test_forecast_student_is_deterministic(db):
     _train(db)
     _load_series(db)
-    r1 = db.execute("SELECT step, forecast FROM forecast('SELECT ts, value FROM"
-                    " s', ?, json_object('model','f','receipt',0)) ORDER BY step",
-                    (H,)).fetchall()
-    r2 = db.execute("SELECT step, forecast FROM forecast('SELECT ts, value FROM"
-                    " s', ?, json_object('model','f','receipt',0)) ORDER BY step",
-                    (H,)).fetchall()
-    assert r1 == r2  # deterministic serving
+    q = "SELECT forecast(ts, value, ?, json_object('model','f')) FROM s"
+    r1 = db.execute(q, (H,)).fetchone()[0]
+    r2 = db.execute(q, (H,)).fetchone()[0]
+    assert r1 and r1 == r2  # deterministic serving, byte for byte

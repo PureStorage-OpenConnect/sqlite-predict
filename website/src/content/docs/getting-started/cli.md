@@ -18,8 +18,9 @@ sqlite3 mydata.db
 
 SELECT predict_version();
 
-SELECT step, forecast, lower_bound, upper_bound
-FROM forecast('SELECT ts, value FROM readings', 24);
+-- forecast() is an aggregate like sum(): your query supplies the rows,
+-- and each group returns one JSON document
+SELECT forecast(ts, value, 24) FROM readings;
 ```
 
 ## Vendor the single C file

@@ -5,31 +5,29 @@
 ![C99](https://img.shields.io/badge/C99-zero%20dependencies-brightgreen.svg)
 
 **Prediction as a SQL primitive.** `forecast()`, `detect_anomalies()`, and
-`predict()` become functions you call over an ordinary `SELECT`. The core is
-one small C99 file with no dependencies, so it runs wherever SQLite already
-does: in your app, on a phone, in the browser, in the per-database state an AI
-agent keeps. And every result carries a **replayable receipt**, so an agent can
-cite the number and an auditor can reproduce it byte-for-byte.
+`predict()` become SQL functions. The core is one small C99 file with no
+dependencies, so it runs wherever SQLite already does: in your app, on a
+phone, in the browser, in the per-database state an AI agent keeps.
 
 ```sql
 .load ./predict0
 
--- forecast a metric 24 steps ahead. rows in, rows out.
-SELECT * FROM forecast('SELECT ts, value FROM readings', 24);
--- ┌────────────┬──────┬──────────────────────┬──────────┬───────┬───────┬────────┬──────────────┐
--- │ series_key │ step │  forecast_timestamp  │ forecast │  lo   │  hi   │ status │  receipt_id  │
--- └────────────┴──────┴──────────────────────┴──────────┴───────┴───────┴────────┴──────────────┘
-
--- or as an aggregate: plain SQL supplies the rows, GROUP BY splits the
--- series, and each group returns a JSON document. This is the form ORMs
--- and query builders compose (Drizzle, SQLAlchemy, Diesel).
+-- forecast() is an aggregate: your statement supplies the rows, WHERE and
+-- joins and bound parameters compose, and GROUP BY splits the series.
+-- Each group returns one JSON document: {"model", "status", "rows"}.
 SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
+
+-- want typed rows instead? expand the document in SQL:
+SELECT r.* FROM forecast_rows((SELECT forecast(ts, value, 24)
+                               FROM readings)) AS r;
+-- ┌──────┬──────────────────────┬──────────┬─────────────┬─────────────┬────────┐
+-- │ step │  forecast_timestamp  │ forecast │ lower_bound │ upper_bound │ status │
+-- └──────┴──────────────────────┴──────────┴─────────────┴─────────────┴────────┘
 ```
 
 None of this ships your data to a cloud model. It runs in-process, on CPU, in
 microseconds, and where a foundation model would be too heavy to call per query,
-you **distill it once into a tiny native student** that carries the same
-receipts and runs anywhere.
+you **distill it once into a tiny native student** that runs anywhere.
 
 ## Is it accurate?
 
@@ -56,7 +54,7 @@ a toy series.
 All of it runs on CPU, in-process, with no network and no GPU.
 
 > [!WARNING]
-> **Pre-alpha.** The API, the on-disk receipt format, and the SQL surface are
+> **Pre-alpha.** The API and the SQL surface are
 > unstable and may change without notice. Not yet recommended for production.
 
 ## Why
@@ -69,9 +67,7 @@ the browser, and in the per-database state AI agents increasingly keep.
 
 That last one is the point. Agents are getting a database each. This is the
 layer that lets an agent forecast its own metrics, flag anomalies in what it
-observes, and predict outcomes, right where its state already sits, and then
-answer for those calls: every result carries a **receipt** that pins the model
-and the exact data it read, so the prediction reproduces byte-for-byte later.
+observes, and predict outcomes, right where its state already sits.
 
 Two things follow from being a SQL primitive instead of a service. It is
 permissively licensed (MIT/Apache-2.0), so you ship it inside your product
@@ -82,37 +78,32 @@ toolbox: sqlite-vec gave SQLite vector search; this gives it prediction.
 
 | Function | Question | Returns |
 | --- | --- | --- |
-| `forecast(query, horizon [, options])` | Where is this metric going? | future rows with prediction intervals and per-series status |
-| `detect_anomalies(query [, options])` | Which points are abnormal? | anomaly-scored rows with expected value and probability |
+| `forecast(ts, value, horizon [, options])` | Where is this metric going? | an aggregate over your rows: forecast steps with prediction intervals, one JSON document per group |
+| `detect_anomalies(ts, value [, options])` | Which points are abnormal? | an aggregate over your rows: per-point anomaly probability and interval, one JSON document per group |
 | `predict(train_query, apply_query [, options])` | Classify/regress unseen rows | a prediction and confidence per row, zero-shot from in-context examples |
 | `distill_predict(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree or gradient-boosted forest), registered and ready for `predict()` |
 | `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native DLinear/TiDE forecast net (a linear skip plus a small residual), registered and ready for `forecast()` |
 | `backtest(query, horizon [, options])` | How accurate is the model here? | per-fold accuracy (MAE, RMSE, MASE, sMAPE) and interval coverage from a rolling-origin evaluation |
-| `predict_replay(receipt_id)` | Did this prediction reproduce? | a match flag by re-running the recorded call against its anchored data state |
-| `predict_verify(receipt, query)` | Are these the rows behind this prediction? | a match flag by checking supplied rows against a receipt document's input digest and re-running |
 
-`query` is any read-only `SELECT`; results are ordinary rows you can join,
-filter, and materialize. Options are a trailing JSON object
-(`'{"group_cols":["region"],"confidence_level":0.9}'`). The interface
-deliberately mirrors BigQuery's `AI.FORECAST`: rows in, rows out.
-
-`forecast` and `detect_anomalies` also register as **aggregate functions**
-under the same names, for callers that compose SQL programmatically: the
-statement supplies the rows (`WHERE`, joins, and bound parameters all work)
-and `GROUP BY` replaces `group_cols`. The aggregate is a **pure function**:
-it writes nothing, so it runs on read-only databases and inside views, and
-its receipt comes back *inside* the result document (~450 bytes of digests,
-never your data) for you to store wherever provenance lives; verify it later
-with `predict_verify(receipt, query)` against re-supplied rows. Expand the
-document back to typed rows with `forecast_rows()` / `anomaly_rows()`, or
-just `JSON.parse` it in your app. See [Using with
+One calling convention per operation. `forecast` and `detect_anomalies` are
+**aggregates**: your statement supplies the rows, so `WHERE`, joins, bound
+parameters, and `GROUP BY` all compose naturally, from the CLI or from an ORM
+(Drizzle, SQLAlchemy, Diesel). They are **pure functions**: nothing is ever
+written, so they run on read-only databases and inside views. Each group
+returns one JSON document; expand it with `forecast_rows()` /
+`anomaly_rows()`, or `JSON.parse` it in your app. See [Using with
 ORMs](https://purestorage-openconnect.github.io/sqlite-predict/guides/orms/).
+
+`backtest`, `predict`, and the `distill_*` operations take read-only SELECT
+queries (training needs labeled or windowed row sets); their results are
+ordinary rows you can join, filter, and materialize. Options everywhere are a
+trailing JSON object (`'{"confidence_level":0.9}'`).
 
 ### Calibrated intervals, auto-selection, and backtesting
 
 - **Auto-selection.** `'{"model":"auto"}'` picks the model with the lowest
   rolling-origin error per series, so you don't hand-tune the choice. It is
-  deterministic and replayable. `'{"model":"auto","candidates":[...]}'` sets the
+  deterministic. `'{"model":"auto","candidates":[...]}'` sets the
   pool explicitly, and a candidate may be a distilled forecast student, so the
   agent's own model competes head-to-head with the baselines per series.
 - **Conformal intervals.** `'{"interval_method":"conformal"}'` replaces the
@@ -131,33 +122,6 @@ SELECT avg(coverage) FROM backtest('SELECT ts, value FROM readings', 6,
   '{"interval_method":"conformal","confidence_level":0.9,"folds":25}');
 ```
 
-### Receipts and replay
-
-Every prediction is bound to a receipt: the model identity and content
-hash, an anchor for the exact data it read, the call parameters, and a
-canonical hash of the result — never the data itself. Table-valued calls
-write theirs to `_predict_receipts` and `predict_replay()` re-executes
-them against the anchored database state. Aggregate calls return theirs
-*inside the result document* — the extension never writes on a read
-path; storing the receipt is the caller's tool call — and
-`predict_verify()` checks a document against rows you re-supply, from
-any database or none.
-
-```sql
-SELECT receipt_id FROM forecast('SELECT ts, value FROM readings', 12);
--- 01J...  (a ULID, stamped on every result row)
-
-SELECT match, detail FROM predict_replay('01J...');
--- 1 | reproduced (12 rows)
-
-SELECT match, detail FROM predict_verify(:receipt_json,
-  'SELECT ts, value FROM readings WHERE city = ''SF''');
--- 1 | verified (24 rows)
-```
-
-Pass `'{"receipt": 0}'` on the aggregate to omit the receipt object from
-the document; on the table-valued form it skips the receipt write.
-
 ## Models
 
 The default build is **pure C with no dependencies**. It ships small,
@@ -169,7 +133,7 @@ honest statistical models:
   `auto` picks among them per series by rolling-origin error, and a
   `candidates` list sets the pool explicitly, a distilled forecast student
   included
-- `sub-pca` for `detect_anomalies('...', '{"model":"sub-pca"}')`: a
+- `sub-pca` for `detect_anomalies(ts, value, '{"model":"sub-pca"}')`: a
   subsequence-reconstruction detector (windowed PCA reconstruction error), the
   method family that leads the TSB-AD-U benchmark; ~2x the residual detector on
   the typical series there
@@ -179,7 +143,7 @@ Foundation models are treated as *teachers*, not serving paths: in
 benchmarking they were far too slow to call per query on CPU. The path to
 their accuracy is distillation into a small native student that runs in the
 zero-dependency core with no onnxruntime, serves in microseconds, and carries
-the same receipts. `distill_predict()` does this for the tabular side (the
+`distill_predict()` does this for the tabular side (the
 teacher we benchmark is **TabFM**, see
 [`benchmarks/results/tabarena-full.md`](benchmarks/results/tabarena-full.md)),
 and `distill_forecast()` does it for time series: a **Chronos** teacher
@@ -214,8 +178,8 @@ interpretable); `'gbt'` is a gradient-boosted forest with second-order
 (Newton) leaves that on the [TabArena benchmark](benchmarks/results/tabarena-full.md)
 matches or beats tuned XGBoost on most tasks; `'mlp'` is a one-hidden-layer
 neural net (classification only) for boundaries an axis-aligned tree ensemble
-renders poorly. All three run in the zero-dependency core, are deterministic,
-and replay exactly.
+renders poorly. All three run in the zero-dependency core and are
+deterministic.
 
 When the teacher gives calibrated probabilities (as a foundation model does),
 distill its whole distribution instead of its hard label with `proba` and
@@ -325,12 +289,13 @@ build `make loadable-onnx-gpu`.
 
 ## How it works
 
-Each operation is an [eponymous table-valued function][tvf] (a virtual
-table module) over the rows of an inner query. Statistical models run
-in-process on CPU. Receipts and the logical-digest anchor live in
-`_predict_receipts` / `_predict_models` tables the extension manages;
-canonical result hashing (type-tagged fields, big-endian float bit
-patterns) makes replay deterministic across runs on the same machine.
+`forecast` and `detect_anomalies` are SQL aggregate functions; `backtest`,
+`predict`, and the `distill_*` operations are [eponymous table-valued
+functions][tvf] (virtual table modules) over the rows of an inner query.
+Statistical models run in-process on CPU and are deterministic. Registered
+models and distilled students live in one `_predict_models` table the
+extension manages, content-addressed so the exact bytes are pinned and
+verified before deserialization.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and
 [`SECURITY.md`](SECURITY.md) for the trust model.

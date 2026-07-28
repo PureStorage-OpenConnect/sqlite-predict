@@ -61,25 +61,6 @@ def test_row_ref_echoed_any_type(db):
     assert out[0][0].startswith("row-")
 
 
-def test_receipt_and_replay(db):
-    X, y, _ = syt.two_moons(n=200)
-    syt.load_tabular(db, X, y)
-    out = run_predict(db, "SELECT f1, f2, label FROM tab WHERE id < 150",
-                      "SELECT id, f1, f2 FROM tab WHERE id >= 150")
-    rid = out[0][4]
-    op, = db.execute(
-        "SELECT operation FROM _predict_receipts WHERE receipt_id = ?",
-        (rid,)).fetchone()
-    assert op == "predict"
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
-    assert match == 1, detail
-    db.execute("UPDATE tab SET f1 = f1 + 1 WHERE id = 3")
-    with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict_replay(?)", (rid,)).fetchall()
-    assert "PREDICT_ERR_ANCHOR_UNAVAILABLE" in str(e.value)
-
-
 def test_null_feature_is_status_row(db):
     X, y, _ = syt.two_moons(n=100)
     syt.load_tabular(db, X, y)
@@ -122,12 +103,11 @@ def test_errors(db):
            '{"target":"label"}')  # train smaller than k
 
 
-def test_deterministic_and_distinct_receipts(db):
+def test_deterministic(db):
     X, y, _ = syt.two_moons(n=150)
     syt.load_tabular(db, X, y)
     a = run_predict(db, "SELECT f1, f2, label FROM tab WHERE id < 100",
                     "SELECT id, f1, f2 FROM tab WHERE id >= 100")
     b = run_predict(db, "SELECT f1, f2, label FROM tab WHERE id < 100",
                     "SELECT id, f1, f2 FROM tab WHERE id >= 100")
-    assert [r[:4] for r in a] == [r[:4] for r in b]
-    assert a[0][4] != b[0][4]
+    assert a and a == b

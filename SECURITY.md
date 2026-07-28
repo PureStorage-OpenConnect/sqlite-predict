@@ -34,7 +34,7 @@ particular attention:
   the default build carries no such parser.
 - **SQL arguments and inner queries.** Callers may be agents executing
   partially untrusted plans. Inner queries are enforced read-only and
-  single-statement; stored receipt SQL is re-executed read-only on replay.
+  single-statement, and the serving aggregates write nothing at all.
 - **Resource exhaustion.** Inference runs in-process; input row counts,
   forecast horizons, and per-call work are bounded, and interrupts are
   honored between batches.

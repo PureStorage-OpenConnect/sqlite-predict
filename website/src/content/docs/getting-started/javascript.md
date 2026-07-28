@@ -29,24 +29,18 @@ for (let h = 0; h < 24; h++) {
   ins.run(`2024-01-01T${String(h).padStart(2, "0")}:00:00`, 50 + h);
 }
 
-const rows = db
-  .prepare("select step, forecast from forecast('select ts, value from readings', 6)")
-  .all();
-console.log(rows);
-```
-
-The same call also exists as an **aggregate**, where your statement supplies
-the rows (with `WHERE`, joins, bound parameters, and `GROUP BY` for
-multi-series) and each group returns one JSON document. This is the form
-Drizzle and other query builders compose:
-
-```js
+// forecast() is an aggregate like sum(): your statement supplies the
+// rows, and each group returns one JSON document
 const { doc } = db
   .prepare("select forecast(ts, value, 6) as doc from readings")
   .get();
 console.log(JSON.parse(doc).rows[0]);
 // { step, forecast_timestamp, forecast, lower_bound, upper_bound }
 ```
+
+Because it is an aggregate, `WHERE`, joins, and bound parameters compose, and
+`GROUP BY city` returns one document per city. This is the form Drizzle and
+other query builders build naturally.
 
 With `node:sqlite` you need `--experimental-sqlite` on Node 22, or a recent Node
 where it is stable. `sqlitePredict.getLoadablePath()` returns the binary path if

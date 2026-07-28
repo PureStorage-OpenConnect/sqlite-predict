@@ -5,7 +5,7 @@
 
     db = sqlite3.connect(":memory:")
     sqlite_predict.load(db)
-    db.execute("SELECT * FROM forecast('SELECT ts, value FROM readings', 24)")
+    db.execute("SELECT forecast(ts, value, 24) FROM readings")
 
 The wheel bundles the zero-dependency loadable extension for your platform.
 """

@@ -14,9 +14,13 @@ fn registers_and_forecasts() {
         )
         .unwrap();
     }
+    let doc: String = conn
+        .query_row("SELECT forecast(ts, value, 6) FROM r", [], |row| row.get(0))
+        .unwrap();
+    assert!(doc.contains("\"status\":\"ok\""), "doc should be ok: {doc}");
     let n: i64 = conn
         .query_row(
-            "SELECT count(*) FROM forecast('SELECT ts, value FROM r ORDER BY ts', 6)",
+            "SELECT count(*) FROM forecast_rows((SELECT forecast(ts, value, 6) FROM r))",
             [],
             |row| row.get(0),
         )

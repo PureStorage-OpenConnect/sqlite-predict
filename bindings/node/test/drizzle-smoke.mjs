@@ -40,7 +40,7 @@ db.insert(readings).values(rows).run();
 const out = db
   .select({
     city: readings.city,
-    doc: sql`forecast(${readings.ts}, ${readings.value}, 4, ${'{"receipt":0}'})`,
+    doc: sql`forecast(${readings.ts}, ${readings.value}, 4)`,
   })
   .from(readings)
   .where(eq(readings.city, "SF"))

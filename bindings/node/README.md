@@ -1,8 +1,7 @@
 # sqlite-predict
 
 Prediction as a SQL primitive for SQLite: `forecast()`, `detect_anomalies()`,
-`predict()`, with replayable receipts. Bundles the zero-dependency loadable
-extension for your platform.
+`predict()`. Bundles the zero-dependency loadable extension for your platform.
 
 ```js
 const Database = require("better-sqlite3");
@@ -11,11 +10,12 @@ const sqlitePredict = require("sqlite-predict");
 const db = new Database(":memory:");
 sqlitePredict.load(db);
 
-for (const row of db
-  .prepare("SELECT * FROM forecast('SELECT ts, value FROM readings', 24)")
-  .all()) {
-  console.log(row);
-}
+// forecast() is an aggregate: your query supplies the rows, and each
+// group returns one JSON document
+const { doc } = db
+  .prepare("SELECT forecast(ts, value, 24) AS doc FROM readings")
+  .get();
+console.log(JSON.parse(doc));
 ```
 
 Also works with Node's built-in `node:sqlite`:

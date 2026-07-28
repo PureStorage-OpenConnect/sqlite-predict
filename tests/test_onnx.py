@@ -181,13 +181,12 @@ def test_classifier_matches_reference(db):
         " json_object('model','clf'))").fetchall()
     assert len(rows) == len(cases)
     exp = {c["id"]: c for c in cases}
-    for rid, pred, conf, status, receipt, *_ in rows:
+    for rid, pred, conf, status in rows:
         e = exp[rid]
         assert status == "ok"
         assert pred == e["label"]
         p_pred = e["p1"] if pred == "1" else 1 - e["p1"]
         assert abs(conf - p_pred) < 1e-4
-        assert receipt  # a receipt id came back
 
 
 def test_regressor_matches_reference(db):
@@ -215,36 +214,10 @@ def test_incontext_matches_reference(db):
     ).fetchall()
     assert len(rows) == len(data["apply"])
     exp = {c["id"]: c["label"] for c in data["apply"]}
-    for rid, pred, conf, status, receipt, *_ in rows:
+    for rid, pred, conf, status in rows:
         assert status == "ok"
         assert pred == exp[rid]
         assert abs(conf - 1.0) < 1e-6  # one-hot output
-        assert receipt
-
-
-def test_incontext_replays_exactly(db):
-    _load_incontext(db)
-    rid = db.execute(
-        "SELECT receipt_id FROM predict('SELECT f1, f2, label FROM tr',"
-        " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1')) LIMIT 1"
-    ).fetchone()[0]
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
-    assert match == 1, detail
-
-
-def test_incontext_replay_detects_train_mutation(db):
-    """Because the training rows are the context, changing them must break
-    the receipt anchor."""
-    _load_incontext(db)
-    rid = db.execute(
-        "SELECT receipt_id FROM predict('SELECT f1, f2, label FROM tr',"
-        " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1')) LIMIT 1"
-    ).fetchone()[0]
-    db.execute("UPDATE tr SET label = '1' WHERE label = '0'")
-    with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT match FROM predict_replay(?)", (rid,)).fetchone()
-    assert "PREDICT_ERR_ANCHOR_UNAVAILABLE" in str(e.value)
 
 
 def test_incontext_requires_train_query(db):
@@ -300,7 +273,7 @@ def test_incontext_nonnumeric_query_row_flagged(db):
     rows = {r[0]: r for r in db.execute(
         "SELECT row_ref, prediction, status FROM predict("
         " 'SELECT f1, f2, label FROM tr', 'SELECT id, f1, f2 FROM ap',"
-        " json_object('model','knn1','receipt',0))").fetchall()}
+        " json_object('model','knn1'))").fetchall()}
     assert rows[0][2] == "ok"
     assert rows[1][2] == "non_numeric" and rows[1][1] is None
 
@@ -317,7 +290,7 @@ def test_incontext_batch_boundary(db):
     rows = db.execute(
         "SELECT row_ref, prediction FROM predict("
         " 'SELECT f1, f2, label FROM tr', 'SELECT id, f1, f2 FROM bigq"
-        " ORDER BY id', json_object('model','knn1','receipt',0))").fetchall()
+        " ORDER BY id', json_object('model','knn1'))").fetchall()
     assert len(rows) == n
     assert [r[0] for r in rows] == list(range(n))
 
@@ -332,29 +305,6 @@ def test_incontext_batch_boundary(db):
     assert mism == 0
 
 
-def test_receipt_replays_exactly(db):
-    _register(db, "clf", "logreg.onnx", CLF_IO)
-    _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
-    rid = db.execute(
-        "SELECT receipt_id FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-        " json_object('model','clf')) LIMIT 1").fetchone()[0]
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
-    assert match == 1, detail
-
-
-def test_replay_detects_mutation(db):
-    _register(db, "clf", "logreg.onnx", CLF_IO)
-    _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
-    rid = db.execute(
-        "SELECT receipt_id FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-        " json_object('model','clf')) LIMIT 1").fetchone()[0]
-    db.execute("UPDATE apply SET f1 = f1 + 100 WHERE id = 0")
-    with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT match FROM predict_replay(?)", (rid,)).fetchone()
-    assert "PREDICT_ERR_ANCHOR_UNAVAILABLE" in str(e.value)
-
-
 def test_batch_boundary_many_rows(db):
     """Cross the 1024-row batch boundary to exercise multi-batch inference
     and confirm every row still comes back in order."""
@@ -367,7 +317,7 @@ def test_batch_boundary_many_rows(db):
     rows = db.execute(
         "SELECT row_ref, prediction FROM predict(NULL,"
         " 'SELECT id, f1, f2 FROM big ORDER BY id',"
-        " json_object('model','clf','receipt',0))").fetchall()
+        " json_object('model','clf'))").fetchall()
     assert len(rows) == n
     assert [r[0] for r in rows] == list(range(n))  # order preserved
     # every prediction agrees with the boundary rule (argmax of softmax)
@@ -382,8 +332,8 @@ def test_non_numeric_feature_is_flagged_not_fed(db):
     db.execute("INSERT INTO mixed VALUES (1, 0.5, 0.5), (2, 0.5, 'oops')")
     rows = {r[0]: r for r in db.execute(
         "SELECT row_ref, prediction, status FROM predict(NULL,"
-        " 'SELECT id, f1, f2 FROM mixed', json_object('model','clf',"
-        "'receipt',0))").fetchall()}
+        " 'SELECT id, f1, f2 FROM mixed',"
+        " json_object('model','clf'))").fetchall()}
     assert rows[1][2] == "ok"
     assert rows[2][2] == "non_numeric"
     assert rows[2][1] is None
@@ -473,7 +423,7 @@ def test_onnx_options_rejected_on_stat_model(db):
 
 def test_no_memory_growth_over_many_calls(db):
     """Per-call leak soak for the onnx path: the session is cached once, so
-    every later call must free its rows/batch/io_spec/receipt allocations.
+    every later call must free its rows/batch/io_spec allocations.
     RSS growth over hundreds of calls must stay bounded."""
     import resource
     _register(db, "clf", "logreg.onnx", CLF_IO)
@@ -499,8 +449,7 @@ def test_session_cache_reuse_is_fast(db):
     _register(db, "clf", "logreg.onnx", CLF_IO)
     _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
     q = ("SELECT row_ref, prediction FROM predict(NULL,"
-         " 'SELECT id, f1, f2 FROM apply', json_object('model','clf',"
-         "'receipt',0))")
+         " 'SELECT id, f1, f2 FROM apply', json_object('model','clf'))")
     first = db.execute(q).fetchall()
     second = db.execute(q).fetchall()
     assert first == second
@@ -526,16 +475,15 @@ def test_onnx_forecast_sequence(db):
             "INSERT INTO s VALUES (?,?)",
             [(f"2020-01-01T{i // 24:02d}:{i % 24:02d}:00", v)
              for i, v in enumerate(sv)])
-        rows = db.execute(
-            "SELECT step, forecast, lower_bound, upper_bound FROM forecast("
-            "'SELECT ts, value FROM s', ?, json_object('model','fcast',"
-            "'confidence_level',?,'receipt',0)) ORDER BY step",
-            (H, conf)).fetchall()
-        assert len(rows) == H
-        for _step, fc, lo, hi in rows:
-            assert abs(fc - case["point"]) < 1e-3
-            assert abs(lo - case["lower"]) < 1e-3
-            assert abs(hi - case["upper"]) < 1e-3
+        d = json.loads(db.execute(
+            "SELECT forecast(ts, value, ?, json_object('model','fcast',"
+            "'confidence_level',?)) FROM s", (H, conf)).fetchone()[0])
+        assert d["status"] == "ok" and d["model"] == "fcast"
+        assert len(d["rows"]) == H
+        for r in d["rows"]:
+            assert abs(r["forecast"] - case["point"]) < 1e-3
+            assert abs(r["lower_bound"] - case["lower"]) < 1e-3
+            assert abs(r["upper_bound"] - case["upper"]) < 1e-3
 
 
 def test_conformal_interval_rejected_for_onnx_forecast_model(db):
@@ -549,9 +497,8 @@ def test_conformal_interval_rejected_for_onnx_forecast_model(db):
         [(f"2020-01-01T{i // 24:02d}:{i % 24:02d}:00", 10.0 + i) for i in range(40)])
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM forecast('SELECT ts, value FROM s', 6,"
-            " json_object('model', 'fcast', 'interval_method', 'conformal'))"
-        ).fetchall()
+            "SELECT forecast(ts, value, 6, json_object('model', 'fcast',"
+            " 'interval_method', 'conformal')) FROM s").fetchall()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
 
 
@@ -580,16 +527,15 @@ def test_onnx_forecast_two_head_reconstruction(db):
             "INSERT INTO s VALUES (?,?)",
             [(f"2020-01-01T{i // 24:02d}:{i % 24:02d}:00", v)
              for i, v in enumerate(case["series"])])
-        rows = db.execute(
-            "SELECT step, forecast, lower_bound, upper_bound FROM forecast("
-            "'SELECT ts, value FROM s', ?, json_object('model','th',"
-            "'confidence_level',?,'receipt',0)) ORDER BY step",
-            (H, conf)).fetchall()
-        assert len(rows) == H
-        for _step, fc, lo, hi in rows:
-            assert abs(fc - case["point"]) < 1e-3
-            assert abs(lo - case["lower"]) < 1e-3
-            assert abs(hi - case["upper"]) < 1e-3
+        d = json.loads(db.execute(
+            "SELECT forecast(ts, value, ?, json_object('model','th',"
+            "'confidence_level',?)) FROM s", (H, conf)).fetchone()[0])
+        assert d["status"] == "ok"
+        assert len(d["rows"]) == H
+        for r in d["rows"]:
+            assert abs(r["forecast"] - case["point"]) < 1e-3
+            assert abs(r["lower_bound"] - case["lower"]) < 1e-3
+            assert abs(r["upper_bound"] - case["upper"]) < 1e-3
 
 
 def test_onnx_forecast_two_head_short_series_status(db):
@@ -599,10 +545,11 @@ def test_onnx_forecast_two_head_short_series_status(db):
     db.execute("CREATE TABLE s(ts TEXT, value REAL)")
     db.executemany("INSERT INTO s VALUES (?,?)",
                    [(f"2020-01-01T00:{i:02d}:00", float(i)) for i in range(5)])
-    rows = db.execute(
-        "SELECT step, forecast, status FROM forecast('SELECT ts, value FROM s',"
-        " 3, json_object('model','th','receipt',0))").fetchall()
-    assert rows == [(None, None, "insufficient_history")]
+    d = json.loads(db.execute(
+        "SELECT forecast(ts, value, 3, json_object('model','th'))"
+        " FROM s").fetchone()[0])
+    assert d["status"] == "insufficient_history"
+    assert d["rows"] == []
 
 
 def test_onnx_forecast_flip_requires_two_head(db):
@@ -616,8 +563,8 @@ def test_onnx_forecast_flip_requires_two_head(db):
     db.executemany("INSERT INTO s VALUES (?,?)",
                    [(f"2020-01-01T00:{i:02d}:00", float(i)) for i in range(10)])
     with pytest.raises(sqlite3.OperationalError, match="two-head core"):
-        db.execute("SELECT * FROM forecast('SELECT ts, value FROM s', 3,"
-                   " json_object('model','badf','receipt',0))").fetchall()
+        db.execute("SELECT forecast(ts, value, 3,"
+                   " json_object('model','badf')) FROM s").fetchall()
 
 
 def test_onnx_forecast_horizon_exceeds_model(db):
@@ -626,8 +573,8 @@ def test_onnx_forecast_horizon_exceeds_model(db):
     db.executemany("INSERT INTO s VALUES (?,?)",
                    [(f"2020-01-01T00:{i:02d}:00", float(i)) for i in range(10)])
     with pytest.raises(sqlite3.OperationalError, match="steps"):
-        db.execute("SELECT * FROM forecast('SELECT ts, value FROM s', 99,"
-                   " json_object('model','fcast','receipt',0))").fetchall()
+        db.execute("SELECT forecast(ts, value, 99,"
+                   " json_object('model','fcast')) FROM s").fetchall()
 
 
 def test_onnx_teacher_distill_forecast(db):
@@ -655,11 +602,13 @@ def test_onnx_teacher_distill_forecast(db):
     db.execute("CREATE TABLE q(ts TEXT, value REAL)")
     db.executemany("INSERT INTO q VALUES (?,?)",
                    [(f"2020-01-01T00:{i:02d}:00", 30.0 + (i % 8)) for i in range(20)])
-    r = db.execute("SELECT forecast, lower_bound, upper_bound FROM forecast("
-                   "'SELECT ts, value FROM q', 4, json_object('model','qs',"
-                   "'confidence_level',0.6,'receipt',0)) ORDER BY step").fetchall()
-    assert len(r) == 4
-    for f, lo, hi in r:
+    d = json.loads(db.execute(
+        "SELECT forecast(ts, value, 4, json_object('model','qs',"
+        "'confidence_level',0.6)) FROM q").fetchone()[0])
+    assert d["status"] == "ok"
+    assert len(d["rows"]) == 4
+    for r in d["rows"]:
+        f, lo, hi = r["forecast"], r["lower_bound"], r["upper_bound"]
         assert f == f and lo <= f <= hi     # finite, ordered interval
         assert 24.0 < f < 44.0              # near the recent mean (~33.5)
 
@@ -682,29 +631,27 @@ def test_auto_candidates_include_a_distilled_student(db):
     db.execute("CREATE TABLE q(ts TEXT, value REAL)")
     db.executemany("INSERT INTO q VALUES (?,?)",
                    [(f"2020-01-01T00:{i:02d}:00", 30.0 + (i % 8)) for i in range(40)])
-    fcq = "SELECT ts, value FROM q"
 
-    # auto over {stat model, distilled student}: full horizon + deterministic replay
-    out = db.execute(
-        "SELECT step, forecast, receipt_id FROM forecast(?, 4,"
-        " json_object('model','auto','candidates',"
-        " json_array('theta-classic','stud'))) ORDER BY step", (fcq,)).fetchall()
-    assert len(out) == 4
-    assert db.execute("SELECT match FROM predict_replay(?)",
-                      (out[0][2],)).fetchone()[0] == 1
+    # auto over {stat model, distilled student}: full horizon comes back
+    d = json.loads(db.execute(
+        "SELECT forecast(ts, value, 4, json_object('model','auto',"
+        "'candidates', json_array('theta-classic','stud'))) FROM q"
+    ).fetchone()[0])
+    assert d["status"] == "ok"
+    assert len(d["rows"]) == 4
 
     # conformal is rejected for a student candidate
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM forecast(?, 4, json_object('model','auto',"
+        db.execute("SELECT forecast(ts, value, 4, json_object('model','auto',"
                    "'candidates', json_array('theta-classic','stud'),"
-                   "'interval_method','conformal'))", (fcq,)).fetchall()
+                   "'interval_method','conformal')) FROM q").fetchall()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
 
     # a horizon beyond the student's trained horizon (4) is rejected
     with pytest.raises(sqlite3.OperationalError) as e2:
-        db.execute("SELECT * FROM forecast(?, 8, json_object('model','auto',"
-                   "'candidates', json_array('theta-classic','stud')))",
-                   (fcq,)).fetchall()
+        db.execute("SELECT forecast(ts, value, 8, json_object('model','auto',"
+                   "'candidates', json_array('theta-classic','stud'))) FROM q"
+                   ).fetchall()
     assert "PREDICT_ERR_HORIZON" in str(e2.value)
 
 

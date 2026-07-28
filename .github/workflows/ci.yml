@@ -65,13 +65,11 @@ jobs:
             const ins = db.prepare("INSERT INTO r VALUES (?,?)");
             for (let i = 0; i < 96; i++)
               ins.run("2024-01-01T" + String(i % 24).padStart(2, "0") + ":00:00", 50 + 10 * Math.sin(i));
-            const n = db.prepare("SELECT count(*) c FROM forecast(\x27SELECT ts,value FROM r ORDER BY ts\x27, 6)").get().c;
-            if (n !== 6) { console.error("expected 6, got", n); process.exit(1); }
-            const doc = JSON.parse(db.prepare("SELECT forecast(ts, value, 6, \x27{\"receipt\":0}\x27) d FROM r").get().d);
-            if (doc.status !== "ok" || doc.rows.length !== 6) { console.error("bad aggregate doc"); process.exit(1); }
+            const doc = JSON.parse(db.prepare("SELECT forecast(ts, value, 6) d FROM r").get().d);
+            if (doc.status !== "ok" || doc.rows.length !== 6) { console.error("bad forecast doc"); process.exit(1); }
             const x = db.prepare("SELECT count(*) c FROM forecast_rows(\x27" + JSON.stringify(doc).replaceAll("\x27","") + "\x27)").get().c;
             if (x !== 6) { console.error("expected 6 expanded rows, got", x); process.exit(1); }
-            console.log("node binding OK (query + aggregate forms)");
+            console.log("node binding OK");
           '
       # drizzle ORM smoke: the aggregate form composed through a query
       # builder end to end (the RFC §4.2.8 ORM path)

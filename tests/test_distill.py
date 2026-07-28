@@ -19,15 +19,14 @@ def _train_table(db, n=240, seed=3):
 def test_distill_produces_a_student(db):
     _train_table(db)
     r = db.execute(
-        "SELECT model_id, content_hash, train_rows, holdout_metric, receipt_id"
+        "SELECT model_id, content_hash, train_rows, holdout_metric"
         " FROM distill_predict('SELECT f1, f2, label FROM tab',"
         " json_object('target','label','student_id','s1'))").fetchone()
-    model_id, chash, rows, metric, receipt = r
+    model_id, chash, rows, metric = r
     assert model_id == "s1"
     assert len(chash) == 64
     assert rows == 240
     assert 0.7 <= metric <= 1.0  # holdout accuracy on a learnable boundary
-    assert receipt
 
     row = db.execute("SELECT kind, runtime, length(weights), content_hash"
                      " FROM _predict_models WHERE model_id='s1'").fetchone()
@@ -35,7 +34,7 @@ def test_distill_produces_a_student(db):
     assert row[2] > 0 and row[3] == chash
 
 
-def test_student_predicts_and_replays(db):
+def test_student_predicts(db):
     _train_table(db)
     db.execute("SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                " json_object('target','label','student_id','s1'))").fetchone()
@@ -49,13 +48,6 @@ def test_student_predicts_and_replays(db):
         assert status == "ok"
         assert pred in labels  # student round-trips the teacher's labels
         assert 0.0 <= conf <= 1.0
-    # deterministic -> exact replay
-    rid = db.execute(
-        "SELECT receipt_id FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
-        " json_object('model','s1')) LIMIT 1").fetchone()[0]
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
-    assert match == 1, detail
 
 
 def test_student_is_deterministic(db):
@@ -63,7 +55,7 @@ def test_student_is_deterministic(db):
     db.execute("SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                " json_object('target','label','student_id','s1'))").fetchone()
     q = ("SELECT row_ref, prediction FROM predict(NULL,"
-         " 'SELECT id, f1, f2 FROM tab', json_object('model','s1','receipt',0))")
+         " 'SELECT id, f1, f2 FROM tab', json_object('model','s1'))")
     assert db.execute(q).fetchall() == db.execute(q).fetchall()
 
 
@@ -107,7 +99,7 @@ def test_regress_distill(db):
     assert kind == "tree"
     out = db.execute(
         "SELECT prediction, status FROM predict(NULL,'SELECT id, f1, f2 FROM r',"
-        " json_object('model','rs','receipt',0))").fetchall()
+        " json_object('model','rs'))").fetchall()
     assert all(s == "ok" and float(p) == float(p) for p, s in out)
 
 
@@ -138,7 +130,7 @@ def test_bad_task_errors(db):
 
 def test_mlp_student(db):
     """The mlp student: a smooth softmax net, trained deterministically, that
-    predicts valid classes, replays exactly, and is a tiny blob."""
+    predicts valid classes and is a tiny blob."""
     _train_table(db)
     metric = db.execute(
         "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,label FROM tab',"
@@ -150,15 +142,10 @@ def test_mlp_student(db):
     assert row[0] == "tree" and row[1] > 0  # inline student runtime
     labels = {str(x[0]) for x in db.execute("SELECT DISTINCT label FROM tab")}
     q = ("SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM"
-         " tab', json_object('model','m','receipt',0))")
+         " tab', json_object('model','m'))")
     rows = db.execute(q).fetchall()
     assert len(rows) == 240 and {p for _, p in rows} <= labels
     assert db.execute(q).fetchall() == rows  # deterministic
-    rid = db.execute("SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM"
-                     " tab', json_object('model','m')) LIMIT 1").fetchone()[0]
-    m, d = db.execute("SELECT match, detail FROM predict_replay(?)",
-                      (rid,)).fetchone()
-    assert m == 1, d
 
 
 def test_mlp_soft_and_regress_guard(db):
@@ -196,7 +183,7 @@ def test_corrupt_mlp_blob_rejected(db):
             "'unspecified')", (blob,))
         with pytest.raises(sqlite3.OperationalError) as e:
             db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
-                       " json_object('model','bad','receipt',0))").fetchall()
+                       " json_object('model','bad'))").fetchall()
         assert "PREDICT_ERR" in str(e.value)
 
 
@@ -239,7 +226,7 @@ def test_gbt_student_beats_single_tree(db):
     assert gm >= tm
 
 
-def test_gbt_student_predicts_and_replays(db):
+def test_gbt_student_predicts(db):
     _angular3(db)
     db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tr3',"
                " json_object('target','label','student_id','g',"
@@ -251,17 +238,11 @@ def test_gbt_student_predicts_and_replays(db):
     db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 REAL)")
     db.execute("INSERT INTO ap VALUES (0,0.5,0.5),(1,-1.0,-1.0),(2,-1.0,1.0)")
     q = ("SELECT row_ref, prediction, confidence, status FROM predict(NULL,"
-         " 'SELECT id,f1,f2 FROM ap', json_object('model','g','receipt',0))")
+         " 'SELECT id,f1,f2 FROM ap', json_object('model','g'))")
     r1 = db.execute(q).fetchall()
     assert all(s == "ok" and p in ("0", "1", "2") and 0 <= c <= 1
                for _, p, c, s in r1)
     assert r1 == db.execute(q).fetchall()  # deterministic
-    rid = db.execute(
-        "SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM ap',"
-        " json_object('model','g')) LIMIT 1").fetchone()[0]
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
-    assert match == 1, detail
 
 
 def test_gbt_regression(db):
@@ -277,7 +258,7 @@ def test_gbt_regression(db):
     assert m >= 0
     out = db.execute(
         "SELECT prediction, status FROM predict(NULL,'SELECT id,f1,f2 FROM r',"
-        " json_object('model','rg','receipt',0))").fetchall()
+        " json_object('model','rg'))").fetchall()
     assert all(s == "ok" and float(p) == float(p) for p, s in out)
 
 
@@ -296,7 +277,7 @@ def test_corrupt_gbt_blob_rejected(db):
             "'unspecified')", (blob,))
         with pytest.raises(sqlite3.OperationalError) as e:
             db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
-                       " json_object('model','bad','receipt',0))").fetchall()
+                       " json_object('model','bad'))").fetchall()
         assert "PREDICT_ERR" in str(e.value)
 
 
@@ -315,12 +296,6 @@ def test_default_trains_on_target_column(db):
         "SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM"
         " tab', json_object('model','s'))").fetchall()
     assert len(rows) == 240
-    rid = db.execute(
-        "SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM tab',"
-        " json_object('model','s')) LIMIT 1").fetchone()[0]
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
-    assert match == 1, detail
 
 
 def test_default_learns_target_not_a_live_teacher(db):
@@ -338,7 +313,7 @@ def test_default_learns_target_not_a_live_teacher(db):
         "'student_kind','gbt'))").fetchone()
     preds = {r[0] for r in db.execute(
         "SELECT DISTINCT prediction FROM predict(NULL,'SELECT id,f1,f2 FROM p',"
-        " json_object('model','s','receipt',0))")}
+        " json_object('model','s'))")}
     assert preds and preds <= {"ALPHA", "OMEGA"}
 
 
@@ -347,19 +322,15 @@ def test_named_teacher_relabels_via_model(db):
     re-runs over the rows to relabel them before fitting the student -- e.g.
     compressing the in-context knn5 into a standalone tree."""
     _train_table(db)
-    r = db.execute(
-        "SELECT holdout_metric, receipt_id FROM distill_predict('SELECT f1,f2,label"
+    metric = db.execute(
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,label"
         " FROM tab', json_object('target','label','teacher','knn5-incontext',"
-        "'student_id','s'))").fetchone()
-    assert 0.5 <= r[0] <= 1.0
-    # the receipt records the teacher lineage
-    params = db.execute("SELECT params FROM _predict_receipts WHERE receipt_id=?",
-                        (r[1],)).fetchone()[0]
-    assert "knn5-incontext" in params
+        "'student_id','s'))").fetchone()[0]
+    assert 0.5 <= metric <= 1.0
     labels = {str(x[0]) for x in db.execute("SELECT DISTINCT label FROM tab")}
     preds = {x[0] for x in db.execute(
         "SELECT DISTINCT prediction FROM predict(NULL,'SELECT id,f1,f2 FROM tab',"
-        " json_object('model','s','receipt',0))")}
+        " json_object('model','s'))")}
     assert preds <= labels
 
 
@@ -384,18 +355,18 @@ def _soft_table(db, n=360, seed=5):
     db.executemany("INSERT INTO st VALUES (?,?,?,?,?,?,?)", rows)
 
 
-def test_soft_distillation_produces_and_replays(db):
+def test_soft_distillation_produces(db):
     """Soft-label distillation: the student learns the teacher's per-class
     probability columns (proba) instead of a hard label, and is scored on the
     holdout against the true labels (target)."""
     _soft_table(db)
-    r = db.execute(
-        "SELECT holdout_metric, receipt_id FROM distill_predict('SELECT f1,f2,pA,pB,"
+    metric = db.execute(
+        "SELECT holdout_metric FROM distill_predict('SELECT f1,f2,pA,pB,"
         "pC,label FROM st', json_object('target','label','proba',"
         "json_array('pA','pB','pC'),'classes',json_array('A','B','C'),"
-        "'student_id','s'))").fetchone()
-    assert r[0] >= 0.7  # recovers the boundary the confident teacher describes
-    # it is a gbt forest (tree runtime), predicts valid classes, replays exactly
+        "'student_id','s'))").fetchone()[0]
+    assert metric >= 0.7  # recovers the boundary the confident teacher describes
+    # it is a gbt forest (tree runtime) and predicts valid classes
     row = db.execute("SELECT runtime, length(weights) FROM _predict_models"
                      " WHERE model_id='s'").fetchone()
     assert row[0] == "tree" and row[1] > 0
@@ -403,15 +374,6 @@ def test_soft_distillation_produces_and_replays(db):
         "SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM st',"
         " json_object('model','s'))").fetchall()
     assert len(out) == 360 and {p for _, p in out} <= {"A", "B", "C"}
-    params = db.execute("SELECT params FROM _predict_receipts WHERE receipt_id=?",
-                        (r[1],)).fetchone()[0]
-    assert '"pA"' in params  # proba lineage recorded
-    rid = db.execute(
-        "SELECT receipt_id FROM predict(NULL,'SELECT id,f1,f2 FROM st',"
-        " json_object('model','s')) LIMIT 1").fetchone()[0]
-    match, detail = db.execute(
-        "SELECT match, detail FROM predict_replay(?)", (rid,)).fetchone()
-    assert match == 1, detail
 
 
 def test_soft_distillation_sharper_than_hard(db):
@@ -472,20 +434,5 @@ def test_corrupt_student_blob_errors_not_crashes(db):
             " 'x','unspecified')", (blob,))
         with pytest.raises(sqlite3.OperationalError) as e:
             db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
-                       " json_object('model','bad','receipt',0))").fetchall()
+                       " json_object('model','bad'))").fetchall()
         assert "PREDICT_ERR" in str(e.value)
-
-
-def test_distill_receipt_records_lineage(db):
-    """A distill receipt exists and anchors the training data; predict_replay
-    of a distill receipt is not supported (lineage only) and says so."""
-    _train_table(db)
-    rid = db.execute(
-        "SELECT receipt_id FROM distill_predict('SELECT f1,f2,label FROM tab',"
-        " json_object('target','label','student_id','s1'))").fetchone()[0]
-    n = db.execute("SELECT count(*) FROM _predict_receipts WHERE"
-                   " receipt_id=? AND operation='distill'", (rid,)).fetchone()[0]
-    assert n == 1
-    with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict_replay(?)", (rid,)).fetchall()
-    assert "PREDICT_ERR_ANCHOR_UNAVAILABLE" in str(e.value)

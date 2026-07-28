@@ -19,7 +19,7 @@ export default defineConfig({
     starlight({
       title: "sqlite-predict",
       description:
-        "Forecasting, anomaly detection, and prediction as SQL primitives for SQLite, with replayable receipts.",
+        "Forecasting, anomaly detection, and prediction as SQL primitives for SQLite.",
       customCss: ["./src/styles/theme.css"],
       // Pages are short; the "On this page" TOC adds clutter and forces a third
       // column. Drop it site-wide for a clean nav + content layout.
@@ -56,7 +56,6 @@ export default defineConfig({
             },
             { label: "Backtesting", link: "/guides/backtesting/" },
             { label: "Using with ORMs", link: "/guides/orms/" },
-            { label: "Receipts & replay", link: "/guides/receipts/" },
             { label: "Distillation", link: "/guides/distillation/" },
           ],
         },

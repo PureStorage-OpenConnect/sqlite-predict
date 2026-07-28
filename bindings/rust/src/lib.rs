@@ -8,7 +8,7 @@
 //! ```no_run
 //! unsafe { sqlite_predict::register().unwrap() };
 //! let conn = rusqlite::Connection::open_in_memory().unwrap();
-//! conn.prepare("SELECT * FROM forecast('SELECT ts, value FROM readings', 24)").unwrap();
+//! conn.prepare("SELECT forecast(ts, value, 24) FROM readings").unwrap();
 //! ```
 use std::os::raw::{c_char, c_int, c_void};
 

@@ -28,6 +28,19 @@ def avg_mase(db, model, horizon=12, folds=10):
                 json.dumps({"model": model, "folds": folds}))[0][0]
 
 
+def fc(db, horizon, table="series", **options):
+    """Aggregate-form forecast: one JSON document {model, status, rows}."""
+    if options:
+        doc, = db.execute(
+            "SELECT forecast(ts, value, ?, ?) FROM %s" % table,
+            (horizon, json.dumps(options))).fetchone()
+    else:
+        doc, = db.execute(
+            "SELECT forecast(ts, value, ?) FROM %s" % table,
+            (horizon,)).fetchone()
+    return json.loads(doc)
+
+
 # ---------------------------------------------------------------- auto select
 
 def test_auto_equals_the_best_fixed_model(db):
@@ -52,17 +65,9 @@ def test_auto_reports_a_real_model_name(db):
 def test_forecast_auto_produces_a_full_horizon(db):
     series, _ = syn.trend_season(n=200, noise=1.0, seed=9)
     syn.load_into(db, series)
-    out = rows(db, "SELECT step, forecast, status FROM forecast(?, 6, ?)",
-               FC, json.dumps({"model": "auto"}))
-    assert len(out) == 6 and all(r[2] == "ok" for r in out)
-
-
-def test_auto_replays_exactly(db):
-    series, _ = syn.trend_season(n=200, noise=1.0, seed=10)
-    syn.load_into(db, series)
-    rid = rows(db, "SELECT receipt_id FROM forecast(?, 6, ?) LIMIT 1",
-               FC, json.dumps({"model": "auto"}))[0][0]
-    assert rows(db, "SELECT match FROM predict_replay(?)", rid)[0][0] == 1
+    d = fc(db, 6, model="auto")
+    assert d["status"] == "ok"
+    assert len(d["rows"]) == 6
 
 
 # ---------------------------------------------------------------- conformal
@@ -90,30 +95,20 @@ def test_conformal_beats_residual_coverage_on_smooth_data(db):
 def test_conformal_band_differs_from_residual(db):
     series, _ = syn.trend_season(n=200, noise=1.0, seed=4)
     syn.load_into(db, series)
-    r = rows(db, "SELECT lower_bound, upper_bound FROM forecast(?, 6)", FC)
-    c = rows(db, "SELECT lower_bound, upper_bound FROM forecast(?, 6, ?)",
-             FC, json.dumps({"interval_method": "conformal"}))
-    rw = sum(hi - lo for lo, hi in r)
-    cw = sum(hi - lo for lo, hi in c)
+    r = fc(db, 6)["rows"]
+    c = fc(db, 6, interval_method="conformal")["rows"]
+    rw = sum(x["upper_bound"] - x["lower_bound"] for x in r)
+    cw = sum(x["upper_bound"] - x["lower_bound"] for x in c)
     assert abs(rw - cw) > 1e-6
-
-
-def test_conformal_replays_exactly(db):
-    series, _ = syn.trend_season(n=200, noise=1.0, seed=5)
-    syn.load_into(db, series)
-    rid = rows(db, "SELECT receipt_id FROM forecast(?, 6, ?) LIMIT 1",
-               FC, json.dumps({"interval_method": "conformal"}))[0][0]
-    assert rows(db, "SELECT match FROM predict_replay(?)", rid)[0][0] == 1
 
 
 def test_conformal_and_auto_compose(db):
     series, _ = syn.trend_season(n=220, noise=1.5, seed=6)
     syn.load_into(db, series)
-    out = rows(db, "SELECT step, lower_bound, upper_bound, status "
-                   "FROM forecast(?, 6, ?)",
-               FC, json.dumps({"model": "auto", "interval_method": "conformal"}))
-    assert len(out) == 6
-    assert all(lo <= hi for _s, lo, hi, _st in out)
+    d = fc(db, 6, model="auto", interval_method="conformal")
+    assert d["status"] == "ok"
+    assert len(d["rows"]) == 6
+    assert all(x["lower_bound"] <= x["upper_bound"] for x in d["rows"])
 
 
 def test_conformal_rejects_series_too_short_to_calibrate(db):
@@ -121,9 +116,9 @@ def test_conformal_rejects_series_too_short_to_calibrate(db):
     conformal band -> insufficient_history, no bogus interval."""
     series, _ = syn.trend_season(n=14, noise=0.5, seed=2)
     syn.load_into(db, series)
-    out = rows(db, "SELECT status FROM forecast(?, 6, ?)",
-               FC, json.dumps({"interval_method": "conformal"}))
-    assert len(out) == 1 and out[0][0] == "insufficient_history"
+    d = fc(db, 6, interval_method="conformal")
+    assert d["status"] == "insufficient_history"
+    assert d["rows"] == []
 
 
 # ---------------------------------------------------------------- backtest()
@@ -178,14 +173,6 @@ def test_backtest_auto_selection_matches_best(db):
                      avg_mase(db, "stub-seasonal-naive"))) < 1e-9
 
 
-def test_backtest_replays_exactly(db):
-    series, _ = syn.trend_season(n=200, noise=1.0, seed=12)
-    syn.load_into(db, series)
-    rid = rows(db, "SELECT receipt_id FROM backtest(?, 6, ?) LIMIT 1",
-               FC, json.dumps({"folds": 8}))[0][0]
-    assert rows(db, "SELECT match FROM predict_replay(?)", rid)[0][0] == 1
-
-
 def test_backtest_grouped_series(db):
     a, _ = syn.trend_season(n=120, noise=1.0, seed=1)
     b, _ = syn.trend_season(n=120, noise=1.0, seed=2)
@@ -210,7 +197,8 @@ def test_forecast_rejects_bad_options(db, opts):
     series, _ = syn.trend_season(n=100, noise=1.0, seed=1)
     syn.load_into(db, series)
     with pytest.raises(sqlite3.OperationalError):
-        rows(db, "SELECT * FROM forecast(?, 6, ?)", FC, json.dumps(opts))
+        db.execute("SELECT forecast(ts, value, 6, ?) FROM series",
+                   (json.dumps(opts),)).fetchone()
 
 
 def test_backtest_rejects_unknown_model(db):
@@ -233,8 +221,8 @@ def _intermittent_trailing_zeros(n=200, active=25):
 
 def test_tsb_forecast_is_flat_and_nonnegative(db):
     syn.load_into(db, _intermittent_trailing_zeros())
-    fcs = [r[0] for r in rows(db, "SELECT forecast FROM forecast(?, 5, ?)",
-                              FC, json.dumps({"model": "tsb"}))]
+    d = fc(db, 5, model="tsb")
+    fcs = [x["forecast"] for x in d["rows"]]
     assert len(fcs) == 5
     assert all(abs(f - fcs[0]) < 1e-12 for f in fcs)   # intermittent = flat rate
     assert fcs[0] >= 0
@@ -243,8 +231,8 @@ def test_tsb_forecast_is_flat_and_nonnegative(db):
 def test_tsb_rejected_in_detect_anomalies(db):
     syn.load_into(db, _intermittent_trailing_zeros())
     with pytest.raises(sqlite3.OperationalError) as e:
-        rows(db, "SELECT * FROM detect_anomalies(?, ?)", FC,
-             json.dumps({"model": "tsb"}))
+        db.execute("SELECT detect_anomalies(ts, value, ?) FROM series",
+                   (json.dumps({"model": "tsb"}),)).fetchone()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
 
 
@@ -269,9 +257,8 @@ def test_auto_pool_includes_tsb(db):
 # ------------------------------------------------------------- auto candidates
 
 def _fc_auto(db, cands, horizon=4):
-    return [r[0] for r in rows(
-        db, "SELECT forecast FROM forecast(?, ?, ?)", FC, horizon,
-        json.dumps({"model": "auto", "candidates": cands, "receipt": 0}))]
+    d = fc(db, horizon, model="auto", candidates=cands)
+    return [x["forecast"] for x in d["rows"]]
 
 
 def test_candidates_restrict_and_select_pool(db):
@@ -286,30 +273,12 @@ def test_candidates_restrict_and_select_pool(db):
     assert both == tsb_only                           # auto picks tsb (the better)
 
 
-def test_candidates_replay(db):
-    syn.load_into(db, _intermittent_trailing_zeros())
-    rid = rows(db, "SELECT receipt_id FROM forecast(?, 6, ?) LIMIT 1", FC,
-               json.dumps({"model": "auto",
-                           "candidates": ["tsb", "theta-classic"]}))[0][0]
-    assert rows(db, "SELECT match FROM predict_replay(?)", rid)[0][0] == 1
-
-
-def test_candidates_recorded_in_receipt(db):
-    syn.load_into(db, _intermittent_trailing_zeros())
-    rid = rows(db, "SELECT receipt_id FROM forecast(?, 6, ?) LIMIT 1", FC,
-               json.dumps({"model": "auto",
-                           "candidates": ["tsb", "theta-classic"]}))[0][0]
-    params = rows(db, "SELECT params FROM _predict_receipts WHERE receipt_id=?",
-                  rid)[0][0]
-    assert json.loads(params)["candidates"] == ["tsb", "theta-classic"]
-
-
 def test_candidates_requires_auto(db):
     series, _ = syn.trend_season(n=100, seed=1)
     syn.load_into(db, series)
     with pytest.raises(sqlite3.OperationalError) as e:
-        rows(db, "SELECT * FROM forecast(?, 6, ?)", FC,
-             json.dumps({"candidates": ["theta-classic"]}))
+        db.execute("SELECT forecast(ts, value, 6, ?) FROM series",
+                   (json.dumps({"candidates": ["theta-classic"]}),)).fetchone()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
 
 
@@ -317,18 +286,20 @@ def test_candidates_reject_unknown(db):
     series, _ = syn.trend_season(n=100, seed=1)
     syn.load_into(db, series)
     with pytest.raises(sqlite3.OperationalError):
-        rows(db, "SELECT * FROM forecast(?, 6, ?)", FC,
-             json.dumps({"model": "auto", "candidates": ["theta-classic", "nope"]}))
+        db.execute("SELECT forecast(ts, value, 6, ?) FROM series",
+                   (json.dumps({"model": "auto",
+                                "candidates": ["theta-classic", "nope"]}),
+                    )).fetchone()
 
 
 def test_candidates_conformal_with_stat_models_ok(db):
     series, _ = syn.trend_season(n=200, noise=1.0, seed=3)
     syn.load_into(db, series)
-    out = rows(db, "SELECT lower_bound, upper_bound FROM forecast(?, 6, ?)", FC,
-               json.dumps({"model": "auto",
-                           "candidates": ["theta-classic", "stub-seasonal-naive"],
-                           "interval_method": "conformal"}))
-    assert len(out) == 6 and all(lo <= hi for lo, hi in out)
+    d = fc(db, 6, model="auto",
+           candidates=["theta-classic", "stub-seasonal-naive"],
+           interval_method="conformal")
+    assert len(d["rows"]) == 6
+    assert all(x["lower_bound"] <= x["upper_bound"] for x in d["rows"])
 
 
 # ------------------------- distilled student: distributable + auto candidate
@@ -372,15 +343,15 @@ def _wave_series(db, n=64, base=1000):
 
 def test_distilled_student_competes_as_auto_candidate(db):
     """No onnx: a student distilled from its own target columns competes in the
-    auto pool alongside the baselines, and the run replays deterministically."""
+    auto pool alongside the baselines, deterministically."""
     _distill_student(db, "stud")
     _wave_series(db)
-    out = rows(db, "SELECT step, forecast, receipt_id FROM forecast(?, 6, ?)"
-                   " ORDER BY step",
-               "SELECT ts, value FROM s",
-               json.dumps({"model": "auto", "candidates": ["theta-classic", "stud"]}))
-    assert len(out) == 6
-    assert rows(db, "SELECT match FROM predict_replay(?)", out[0][2])[0][0] == 1
+    d = fc(db, 6, table="s", model="auto",
+           candidates=["theta-classic", "stud"])
+    assert d["status"] == "ok"
+    assert len(d["rows"]) == 6
+    assert fc(db, 6, table="s", model="auto",
+              candidates=["theta-classic", "stud"]) == d  # deterministic
 
 
 def test_distilled_student_is_distributable(db):
@@ -391,6 +362,9 @@ def test_distilled_student_is_distributable(db):
     _distill_student(db, "stud")
     src = rows(db, "SELECT model_id, kind, runtime, weights, content_hash, license"
                    " FROM _predict_models WHERE model_id='stud'")[0]
+    # the registry is plain data: transplant its schema and the student row
+    ddl = rows(db, "SELECT sql FROM sqlite_master"
+                   " WHERE name='_predict_models'")[0][0]
 
     db2 = sqlite3.connect(":memory:")
     db2.enable_load_extension(True)
@@ -398,15 +372,15 @@ def test_distilled_student_is_distributable(db):
                                     "predict0"))
     try:
         _wave_series(db2)
-        # a forecast ensures the registry tables exist, then transplant the row
-        db2.execute("SELECT count(*) FROM forecast('SELECT ts, value FROM s', 2)")
+        db2.execute(ddl)
         db2.execute(
             "INSERT INTO _predict_models"
             " (model_id, kind, runtime, weights, content_hash, license)"
             " VALUES (?,?,?,?,?,?)", src)
-        n = db2.execute(
-            "SELECT count(*) FROM forecast('SELECT ts, value FROM s', 4,"
-            " '{\"model\":\"stud\",\"receipt\":0}')").fetchone()[0]
-        assert n == 4
+        d = json.loads(db2.execute(
+            "SELECT forecast(ts, value, 4, '{\"model\":\"stud\"}') FROM s"
+        ).fetchone()[0])
+        assert d["status"] == "ok"
+        assert len(d["rows"]) == 4
     finally:
         db2.close()

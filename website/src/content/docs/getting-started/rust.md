@@ -32,15 +32,9 @@ fn main() -> rusqlite::Result<()> {
                  select n from c);",
     )?;
 
-    let mut stmt =
-        db.prepare("select step, forecast from forecast('select ts, value from readings', 6)")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
-    for row in rows {
-        println!("{:?}", row?);
-    }
-
-    // the aggregate form: plain SQL supplies the rows (WHERE, joins, bound
-    // params compose), and each group returns one JSON document
+    // forecast() is an aggregate like sum(): plain SQL supplies the rows
+    // (WHERE, joins, bound params compose, GROUP BY splits the series),
+    // and each group returns one JSON document
     let doc: String = db.query_row(
         "select forecast(ts, value, 6) from readings", [], |r| r.get(0))?;
     println!("{doc}");

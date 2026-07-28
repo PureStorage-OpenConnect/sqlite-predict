@@ -10,7 +10,7 @@ step:
 pip install sqlite-predict
 ```
 
-Load it into any `sqlite3` connection and call the primitives over a `SELECT`:
+Load it into any `sqlite3` connection and call the primitives over your rows:
 
 ```python
 import sqlite3
@@ -31,25 +31,22 @@ db.executemany(
     [(f"2024-01-01T{h:02d}:00:00", 50 + h) for h in range(24)],
 )
 
-# forecast 6 steps ahead, with prediction intervals
-for step, fc, lo, hi in db.execute(
-    "select step, forecast, lower_bound, upper_bound "
-    "from forecast('select ts, value from readings', 6)"
-):
-    print(step, round(fc, 1), round(lo, 1), round(hi, 1))
-```
-
-The same call also exists as an **aggregate**, where your statement supplies
-the rows and the result is one JSON document per group. This is the form to
-compose from SQLAlchemy and friends:
-
-```python
+# forecast 6 steps ahead, with prediction intervals. forecast() is an
+# aggregate like sum(): your statement supplies the rows, and each
+# group returns one JSON document.
 import json
 
 doc = json.loads(db.execute(
     "select forecast(ts, value, 6) from readings").fetchone()[0])
-print(doc["status"], doc["rows"][0])
+print(doc["status"])
+for row in doc["rows"]:
+    print(row["step"], round(row["forecast"], 1),
+          round(row["lower_bound"], 1), round(row["upper_bound"], 1))
 ```
+
+Because it is an aggregate, `WHERE`, joins, and bound parameters compose, and
+`GROUP BY city` returns one document per city. This is the form SQLAlchemy and
+friends build naturally.
 
 `sqlite_predict.loadable_path()` returns the path to the loadable if you need to
 load it into another connection library yourself.

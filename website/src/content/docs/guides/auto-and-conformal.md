@@ -7,11 +7,10 @@ description: Let sqlite-predict pick the model, and get calibrated prediction in
 
 You don't have to hand-pick a model. `'{"model":"auto"}'` runs a rolling-origin
 backtest of each candidate on the series and forecasts with the lowest-error one.
-The choice is deterministic, so it replays to the same result.
+The choice is deterministic: the same rows pick the same winner.
 
 ```sql
-SELECT step, forecast FROM forecast(
-  'SELECT ts, value FROM readings', 12, '{"model":"auto"}');
+SELECT forecast(ts, value, 12, '{"model":"auto"}') FROM readings;
 ```
 
 The default pool is the bundled statistical models (`theta-classic`,
@@ -21,12 +20,12 @@ your own compressed foundation model competes with the cheap baselines per
 series:
 
 ```sql
-SELECT step, forecast FROM forecast('SELECT ts, value FROM readings', 12,
-  '{"model":"auto","candidates":["theta-classic","tsb","my-student"]}');
+SELECT forecast(ts, value, 12,
+  '{"model":"auto","candidates":["theta-classic","tsb","my-student"]}')
+FROM readings;
 ```
 
-The candidate set is recorded in the receipt, so an auto forecast replays to the
-same winner.
+The winning model's id comes back in the result document's `model` field.
 
 ## Conformal intervals
 
@@ -36,8 +35,8 @@ replaces it with a distribution-free band calibrated on the model's
 **out-of-sample** rolling residuals:
 
 ```sql
-SELECT step, forecast, lower_bound, upper_bound FROM forecast(
-  'SELECT ts, value FROM readings', 6, '{"interval_method":"conformal"}');
+SELECT forecast(ts, value, 6, '{"interval_method":"conformal"}')
+FROM readings;
 ```
 
 On a smooth synthetic series the default band covered only 57% of points at a
