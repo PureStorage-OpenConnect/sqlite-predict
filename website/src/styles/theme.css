@@ -48,3 +48,13 @@ div.hero {
   --sl-color-gray-7: hsl(38, 52%, 94%);
   --sl-color-black: hsl(40, 60%, 96%); /* cream page background */
 }
+
+/* Inline code inside headings: the mono face has a larger x-height than the
+ * heading face, so at the inherited size it reads oversized (and its padded
+ * background exaggerates it). Scale it down to sit optically level with the
+ * surrounding heading text. `.sl-markdown-content` matches Starlight's own
+ * scoping so this wins without !important. */
+.sl-markdown-content :is(h1, h2, h3, h4, h5) code {
+  font-size: 0.8em;
+  padding-block: 0.05em;
+}
