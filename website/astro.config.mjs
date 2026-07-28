@@ -21,6 +21,9 @@ export default defineConfig({
       description:
         "Forecasting, anomaly detection, and prediction as SQL primitives for SQLite, with replayable receipts.",
       customCss: ["./src/styles/theme.css"],
+      // Pages are short; the "On this page" TOC adds clutter and forces a third
+      // column. Drop it site-wide for a clean nav + content layout.
+      tableOfContents: false,
       social: [
         {
           icon: "github",
