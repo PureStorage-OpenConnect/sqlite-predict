@@ -36,4 +36,4 @@ To statically link into your app, compile with `-DSQLITE_CORE
 -DSQLITE_PREDICT_STATIC` and call `sqlite3_predict_init(db, 0, 0)` after opening
 each connection.
 
-Next: [Operations](/guides/operations/).
+Next: [Operations](../../guides/operations/).

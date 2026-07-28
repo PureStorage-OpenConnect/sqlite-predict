@@ -42,7 +42,7 @@ SELECT step, forecast, lower_bound, upper_bound FROM forecast(
 
 On a smooth synthetic series the default band covered only 57% of points at a
 nominal 90% level; the conformal band landed at 90%. You can check coverage on
-your own data with [`backtest()`](/guides/backtesting/).
+your own data with [`backtest()`](../backtesting/).
 
 Conformal applies to the statistical models. A foundation-model student already
 emits its own quantile band, so asking for conformal on one is rejected rather

@@ -42,4 +42,4 @@ fn main() -> rusqlite::Result<()> {
 }
 ```
 
-Next: [Operations](/guides/operations/).
+Next: [Operations](../../guides/operations/).

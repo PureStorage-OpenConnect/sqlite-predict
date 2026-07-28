@@ -42,5 +42,5 @@ for step, fc, lo, hi in db.execute(
 `sqlite_predict.loadable_path()` returns the path to the loadable if you need to
 load it into another connection library yourself.
 
-Next: [Operations](/guides/operations/) for what else you can call, or
-[Auto-selection & conformal intervals](/guides/auto-and-conformal/).
+Next: [Operations](../../guides/operations/) for what else you can call, or
+[Auto-selection & conformal intervals](../../guides/auto-and-conformal/).

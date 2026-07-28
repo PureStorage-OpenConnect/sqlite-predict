@@ -53,5 +53,5 @@ Re-executes a recorded call against its anchored data. Columns: `match`,
 | `predict_ulid([ts])` | a fresh ULID, optionally seeded with an epoch-ms timestamp |
 | `predict_debug()` | build info: profile, compiled features, available runtimes |
 
-See [Options](/reference/options/) for the per-function option set and
-[Models](/reference/models/) for the `model` values.
+See [Options](../options/) for the per-function option set and
+[Models](../models/) for the `model` values.

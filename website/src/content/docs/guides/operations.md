@@ -37,5 +37,5 @@ Each series carries a `status`: `ok`, `truncated` (the context was capped by
 minimum of 8 points; series below that come back as a single status row rather
 than a guess.
 
-See the [Functions reference](/reference/functions/) for every signature and the
-[Options reference](/reference/options/) for the full option set.
+See the [Functions reference](../../reference/functions/) for every signature and the
+[Options reference](../../reference/options/) for the full option set.

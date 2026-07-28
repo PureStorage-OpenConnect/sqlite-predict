@@ -2,11 +2,14 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
-// site: set to the deployed URL for correct canonical links + sitemap.
-// (Cloudflare Pages recommended for a private repo; GitHub Pages needs a public
-// repo or a paid plan.)
+// Deployed to GitHub Pages as a project site under /sqlite-predict. On this
+// Enterprise Cloud org the internal repo publishes with Pages visibility set to
+// Private (viewable by enterprise members only) until we flip it public.
+// `site` + `base` drive canonical links and asset paths; internal doc links are
+// path-relative so they survive any base or a future custom domain.
 export default defineConfig({
-  site: "https://sqlite-predict.pages.dev",
+  site: "https://purestorage-openconnect.github.io",
+  base: "/sqlite-predict",
   integrations: [
     starlight({
       title: "sqlite-predict",

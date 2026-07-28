@@ -22,7 +22,7 @@ seasonal-naive floor of 1.0.
 
 The point of the middle two rows: distilling the foundation model into a native
 student recovers most of the teacher's accuracy (0.89 vs 0.80) while serving in
-the zero-dependency core. See [Distillation](/guides/distillation/).
+the zero-dependency core. See [Distillation](../guides/distillation/).
 
 ## Anomaly detection (VUS-PR, higher is better)
 
@@ -53,8 +53,8 @@ On a smooth synthetic series at a nominal 90% level:
 
 The default Gaussian band is overconfident on smooth data; the conformal band
 hits nominal coverage. You can reproduce this on your own data with
-[`backtest()`](/guides/backtesting/). See
-[Auto-selection & conformal intervals](/guides/auto-and-conformal/).
+[`backtest()`](../guides/backtesting/). See
+[Auto-selection & conformal intervals](../guides/auto-and-conformal/).
 
 ## Reproducing
 

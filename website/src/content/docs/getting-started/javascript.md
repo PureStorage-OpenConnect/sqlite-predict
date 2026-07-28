@@ -39,4 +39,4 @@ With `node:sqlite` you need `--experimental-sqlite` on Node 22, or a recent Node
 where it is stable. `sqlitePredict.getLoadablePath()` returns the binary path if
 you load it yourself.
 
-Next: [Operations](/guides/operations/).
+Next: [Operations](../../guides/operations/).

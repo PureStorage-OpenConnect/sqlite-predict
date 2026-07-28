@@ -21,7 +21,7 @@ second-order leaves, which matches or beats tuned XGBoost on most tasks), or
 `mlp` (a one-hidden-layer net for boundaries a tree renders poorly). With `proba`
 and `classes` the student learns the teacher's full probability distribution
 (soft-label distillation), not just its argmax. The result registers a model you
-call with [`predict()`](/reference/functions/).
+call with [`predict()`](../../reference/functions/).
 
 ## Forecasting: `distill_forecast`
 
@@ -32,8 +32,8 @@ SELECT model_id, train_rmse FROM distill_forecast(
 ```
 
 The student is a DLinear/TiDE-style net (a linear skip plus a small residual). It
-serves through [`forecast()`](/reference/functions/) like any other model, and
-can compete in [`auto`](/guides/auto-and-conformal/) selection.
+serves through [`forecast()`](../../reference/functions/) like any other model, and
+can compete in [`auto`](../auto-and-conformal/) selection.
 
 ## Distribute the student
 

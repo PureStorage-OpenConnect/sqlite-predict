@@ -13,7 +13,7 @@ bundled model ships in the zero-dependency core, no ONNX runtime required.
 | `theta-classic` | statistical | The Theta method. Default (`default-ts` aliases to it). Strong, cheap trend + seasonality baseline. |
 | `stub-seasonal-naive` | statistical | Seasonal-naive with drift. The benchmark floor every forecasting paper reports against. |
 | `tsb` | statistical | Teunter-Syntetos-Babai, for intermittent demand (many zeros). Forecast-only. |
-| `auto` | meta | Rolling-origin backtests each candidate per series and forecasts with the lowest-error one. See [Auto-selection](/guides/auto-and-conformal/). |
+| `auto` | meta | Rolling-origin backtests each candidate per series and forecasts with the lowest-error one. See [Auto-selection](../../guides/auto-and-conformal/). |
 
 ## Anomaly detection
 
@@ -33,7 +33,7 @@ bundled model ships in the zero-dependency core, no ONNX runtime required.
 `distill_forecast` registers a DLinear/TiDE-style native student under the
 `student_id` you choose. Serve it through `forecast()` with `'{"model":"<id>"}'`,
 or enter it as a candidate in `auto`. These are portable blobs: copy the model
-row to another database and it works there. See [Distillation](/guides/distillation/).
+row to another database and it works there. See [Distillation](../../guides/distillation/).
 
 ## Foundation-model teachers (optional ONNX build)
 
