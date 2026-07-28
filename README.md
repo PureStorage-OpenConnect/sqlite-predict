@@ -26,8 +26,9 @@ SELECT r.* FROM forecast_rows((SELECT forecast(ts, value, 24)
 ```
 
 None of this ships your data to a cloud model. It runs in-process, on CPU, in
-microseconds, and where a foundation model would be too heavy to call per query,
-you **distill it once into a tiny native student** that runs anywhere.
+microseconds. And where a foundation model would be too heavy to call per
+query, you [**distill it once into a tiny native student**](#distill-a-foundation-model-into-your-database)
+that lives inside your database and runs anywhere.
 
 ## Is it accurate?
 
@@ -56,6 +57,43 @@ All of it runs on CPU, in-process, with no network and no GPU.
 > [!WARNING]
 > **Pre-alpha.** The API and the SQL surface are
 > unstable and may change without notice. Not yet recommended for production.
+
+## Distill a foundation model into your database
+
+Foundation models are the accuracy ceiling and the deployment problem: too
+slow to call per query on CPU, too heavy to ship inside an app. Distillation
+is sqlite-predict's answer, and it is a SQL primitive like everything else:
+run the big model once as a teacher, compress what it learned into a native
+student a few kilobytes big, and serve that student in microseconds from the
+zero-dependency core.
+
+The student is not a file on the side. **It is a row in your database**, so it
+snapshots, forks, branches, and syncs with the data it predicts, and it
+travels wherever the database file goes. An agent that distills a model owns
+that model the same way it owns its tables.
+
+```sql
+-- once: distill (your labels, or a teacher's precomputed predictions)
+SELECT model_id, holdout_metric FROM distill_predict(
+  'SELECT tenure, spend, plan, churned FROM customers',
+  '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
+
+-- forever: serve the student per row, in microseconds, no runtime attached
+SELECT * FROM predict(NULL, 'SELECT id, tenure, spend, plan FROM customers',
+                      '{"model":"churn-v1"}');
+
+-- the same move for time series: distill a Chronos-class teacher's forecasts
+-- into a DLinear/TiDE student, then serve it through forecast()
+SELECT forecast(ts, value, 24, '{"model":"traffic-v1"}') FROM readings;
+```
+
+The numbers above are this mechanism measured: the distilled forecast student
+reaches **0.89 MASE** where the teacher sits at ~0.80 and every classical
+method is above 1.0, and the distilled `gbt` student **matches or beats tuned
+XGBoost** on most TabArena tasks. The [Models](#models) section covers the
+student architectures and soft-label distillation; the
+[distillation guide](https://purestorage-openconnect.github.io/sqlite-predict/guides/distillation/)
+walks the whole flow.
 
 ## Why
 
@@ -142,7 +180,7 @@ honest statistical models:
 Foundation models are treated as *teachers*, not serving paths: in
 benchmarking they were far too slow to call per query on CPU. The path to
 their accuracy is distillation into a small native student that runs in the
-zero-dependency core with no onnxruntime, serves in microseconds, and carries
+zero-dependency core with no onnxruntime and serves in microseconds.
 `distill_predict()` does this for the tabular side (the
 teacher we benchmark is **TabFM**, see
 [`benchmarks/results/tabarena-full.md`](benchmarks/results/tabarena-full.md)),
@@ -152,23 +190,11 @@ small nonlinear residual, the architecture that actually fits seasonal data
 where a plain MLP does not) closes most of the gap to the FM (see
 [`benchmarks/results/forecast.md`](benchmarks/results/forecast.md)).
 
-By default `distill_predict()` trains directly on the target column. That column can
-hold your labels, or a strong teacher's predictions computed offline: run
-TabFM once over your training rows on a GPU box, store what it predicts, and
-distill compresses it into a student that runs anywhere.
-
-```sql
--- distill whatever the target column holds (labels, or a teacher's
--- precomputed predictions) into a fast native student, once
-SELECT model_id, holdout_metric FROM distill_predict(
-  'SELECT tenure, spend, plan, churned FROM customers',
-  '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
-
--- then serve it per row, forever
-SELECT * FROM predict(NULL, 'SELECT id, tenure, spend, plan FROM customers',
-                      '{"model":"churn-v1"}');
-```
-
+By default `distill_predict()` trains directly on the target column. That
+column can hold your labels, or a strong teacher's predictions computed
+offline: run TabFM once over your training rows on a GPU box, store what it
+predicts, and distill compresses it into a student that runs anywhere
+([example above](#distill-a-foundation-model-into-your-database)).
 Pass a `teacher` to instead relabel the rows with a registered model first
 (for example, `'{"teacher":"knn5-incontext", ...}'` compresses the in-context
 k-NN into a standalone tree).

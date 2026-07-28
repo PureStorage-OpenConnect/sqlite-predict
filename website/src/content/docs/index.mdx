@@ -18,9 +18,10 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 ## Prediction as a SQL primitive
 
 `forecast()`, `detect_anomalies()`, and `predict()` become functions you call
-over your own rows. The core is one small C99 file with no dependencies,
-so it runs in your app, on a phone, in the browser, or in the per-database state
-an AI agent keeps.
+over your own rows. The serving functions are pure aggregates: they write
+nothing, so they work in views, on read-only databases, and from any ORM. The
+core is one small C99 file with no dependencies, so it runs in your app, on a
+phone, in the browser, or in the per-database state an AI agent keeps.
 
 ```sql
 -- forecast a metric 24 steps ahead: plain SQL supplies the rows
@@ -29,6 +30,13 @@ SELECT forecast(ts, value, 24) FROM readings;
 -- GROUP BY splits the series. WHERE, joins, and bound parameters
 -- compose, so ORMs and query builders work unchanged.
 SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
+
+-- and when a foundation model is too heavy to call per query:
+-- distill it once into a few-KB native student that lives in your
+-- database, then serve the student in microseconds
+SELECT model_id FROM distill_forecast('SELECT * FROM windows',
+  '{"context":96,"horizon":24,"student_id":"traffic-v1"}');
+SELECT forecast(ts, value, 24, '{"model":"traffic-v1"}') FROM readings;
 ```
 
 <CardGrid>
@@ -38,8 +46,9 @@ SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
   <Card title="Zero dependencies" icon="approve-check">
     Pure C99. No ONNX runtime, no GPU, no network at serve time.
   </Card>
-  <Card title="Composable" icon="seti:db">
-    An aggregate that works with GROUP BY, views, ORMs, and read-only databases. It writes nothing.
+  <Card title="Distill once, serve forever" icon="seti:shell">
+    Compress a foundation model into a few-KB student that lives in your
+    database and snapshots, forks, and syncs with it. See [Distillation](./guides/distillation/).
   </Card>
   <Card title="Honest, reproducible numbers" icon="bars">
     ~0.89 MASE distilled forecasting, SOTA-level anomaly detection, calibrated intervals. See [Benchmarks](./benchmarks/).

@@ -50,13 +50,13 @@ export default defineConfig({
           label: "Guides",
           items: [
             { label: "Operations", link: "/guides/operations/" },
+            { label: "Distillation", link: "/guides/distillation/" },
             {
               label: "Auto-selection & conformal intervals",
               link: "/guides/auto-and-conformal/",
             },
             { label: "Backtesting", link: "/guides/backtesting/" },
             { label: "Using with ORMs", link: "/guides/orms/" },
-            { label: "Distillation", link: "/guides/distillation/" },
           ],
         },
         {
