@@ -85,8 +85,10 @@ Any teacher works, and the common ones rank by what you may ship:
    you already trust into a student that serves inside SQLite, no Python at
    serve time.
 2. **Permissively licensed foundation models**: Chronos (Apache-2.0) for
-   time series, TabPFN-2 (Prior Labs License, distillation expressly
-   permitted with attribution) for tabular.
+   time series; TabICL (Inria's BSD-3 model, which
+   [matches TabPFN-2](benchmarks/results/permissive-teachers.md) on our
+   suite), TabPFN-2 (Prior Labs License, distillation expressly permitted
+   with attribution), and Mitra (Amazon, Apache-2.0) for tabular.
 3. **Evaluation-only frontier models** (TabFM, TabPFN-3): benchmark them
    zero-shot to see what accuracy is on the table; distilling them for
    commercial use requires a license from their vendor.
