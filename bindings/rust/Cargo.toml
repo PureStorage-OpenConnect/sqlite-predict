@@ -13,4 +13,4 @@ include = ["src/**", "build.rs", "csrc/**", "README.md"]
 cc = "1"
 
 [dev-dependencies]
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
