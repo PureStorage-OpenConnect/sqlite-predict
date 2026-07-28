@@ -36,7 +36,8 @@ Rows are sorted by `ts` internally, so input order never matters. The
 aggregate is a **pure function**: nothing is written, so it works on read-only
 databases and inside views. Each group returns one JSON document; parse it in
 your app or expand it with `forecast_rows()` / `anomaly_rows()`. See
-[Using with ORMs](../orms/).
+the language [getting-started guides](../../getting-started/python/), which
+show the pattern through SQLAlchemy, Drizzle, and Diesel.
 
 The evaluation and training calls (`backtest`, `predict`, `distill_*`) stay
 query-shaped: they take a read-only `SELECT` string, because they need to
