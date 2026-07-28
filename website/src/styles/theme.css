@@ -7,6 +7,11 @@
  * [data-theme='light'] inverts it. */
 
 :root {
+  /* Content column. Starlight's 45rem default leaves the middle of a wide
+   * viewport empty while tables and SQL blocks wrap; 55rem keeps prose
+   * within a readable measure and gives the code the room it needs. */
+  --sl-content-width: 55rem;
+
   /* Pure Orange accent. Base is the brand #FE5000 (button/fill); -high is the
      readable link color on dark; -low is a deep tint for active backgrounds. */
   --sl-color-accent-low: hsl(19, 60%, 18%);
