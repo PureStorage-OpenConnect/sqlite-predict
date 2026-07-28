@@ -29,8 +29,9 @@ SELECT r.* FROM forecast_rows((SELECT forecast(ts, value, 24)
 ```
 
 None of this ships your data to a cloud model. It runs in-process, on CPU, in
-microseconds. And where a foundation model would be too heavy to call per
-query, you [**distill it once into a tiny native student**](#distill-a-foundation-model-into-your-database)
+microseconds. And when a stronger model (your own trained model, or a
+foundation model you are licensed to distill) is too heavy to call per query,
+you [**distill it once into a tiny native student**](#distill-a-model-into-your-database)
 that lives inside your database and runs anywhere.
 
 ## Is it accurate?
@@ -68,14 +69,27 @@ All of it runs on CPU, in-process, with no network and no GPU.
 > **Pre-alpha.** The API and the SQL surface are
 > unstable and may change without notice. Not yet recommended for production.
 
-## Distill a foundation model into your database
+## Distill a model into your database
 
-Foundation models are the accuracy ceiling and the deployment problem: too
-slow to call per query on CPU, too heavy to ship inside an app. Distillation
-is sqlite-predict's answer, and it is a SQL primitive like everything else:
-run the big model once as a teacher, compress what it learned into a native
-student a few kilobytes big, and serve that student in microseconds from the
-zero-dependency core.
+A strong model is usually a deployment problem: your production pipeline
+needs Python and a container, and a foundation model is too slow to call per
+query and too heavy to ship inside an app. Distillation is sqlite-predict's
+answer, and it is a SQL primitive like everything else: run the teacher once,
+compress what it learned into a native student a few kilobytes big, and serve
+that student in microseconds from the zero-dependency core.
+
+Any teacher works, and the common ones rank by what you may ship:
+
+1. **Your own labels or your own model's predictions**: the default path,
+   with no license question at all. Compress the XGBoost or sklearn pipeline
+   you already trust into a student that serves inside SQLite, no Python at
+   serve time.
+2. **Permissively licensed foundation models**: Chronos (Apache-2.0) for
+   time series, TabPFN-2 (Prior Labs License, distillation expressly
+   permitted with attribution) for tabular.
+3. **Evaluation-only frontier models** (TabFM, TabPFN-3): benchmark them
+   zero-shot to see what accuracy is on the table; distilling them for
+   commercial use requires a license from their vendor.
 
 The student is not a file on the side. **It is a row in your database**, so it
 snapshots, forks, branches, and syncs with the data it predicts, and it
@@ -83,7 +97,8 @@ travels wherever the database file goes. An agent that distills a model owns
 that model the same way it owns its tables.
 
 ```sql
--- once: distill (your labels, or a teacher's precomputed predictions)
+-- once: distill. The target column holds your labels, or your existing
+-- model's predictions (which compresses that model into the database).
 SELECT model_id, holdout_metric FROM distill_predict(
   'SELECT tenure, spend, churned FROM customers',
   '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
@@ -207,7 +222,7 @@ By default `distill_predict()` trains directly on the target column. That
 column can hold your labels, or a strong teacher's predictions computed
 offline: run the teacher once over your training rows on a GPU box, store
 what it predicts, and distill compresses it into a student that runs anywhere
-([example above](#distill-a-foundation-model-into-your-database)).
+([example above](#distill-a-model-into-your-database)).
 Pass a `teacher` to instead relabel the rows with a registered model first
 (for example, `'{"teacher":"knn5-incontext", ...}'` compresses the in-context
 k-NN into a standalone tree).

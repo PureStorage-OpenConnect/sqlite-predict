@@ -31,7 +31,7 @@ SELECT forecast(ts, value, 24) FROM readings;
 -- compose, so ORMs and query builders work unchanged.
 SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 
--- and when a foundation model is too heavy to call per query:
+-- and when a stronger model is too heavy to call per query:
 -- distill it once into a few-KB native student that lives in your
 -- database, then serve the student in microseconds
 SELECT model_id FROM distill_forecast('SELECT * FROM windows',
@@ -47,8 +47,9 @@ SELECT forecast(ts, value, 24, '{"model":"traffic-v1"}') FROM readings;
     Pure C99. No ONNX runtime, no GPU, no network at serve time.
   </Card>
   <Card title="Distill once, serve forever" icon="seti:shell">
-    Compress a foundation model into a few-KB student that lives in your
-    database and snapshots, forks, and syncs with it. See [Distillation](./guides/distillation/).
+    Compress your own model, or a foundation model you are licensed to
+    distill, into a few-KB student that lives in your database and
+    snapshots, forks, and syncs with it. See [Distillation](./guides/distillation/).
   </Card>
   <Card title="Measured, reproducible numbers" icon="bars">
     ~0.89 MASE distilled forecasting, SOTA-level anomaly detection, calibrated intervals. See [Benchmarks](./benchmarks/).

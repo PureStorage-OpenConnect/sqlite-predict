@@ -3,12 +3,16 @@ title: Distillation
 description: Compress a slow teacher into a tiny native student, then serve it like any other model.
 ---
 
-Foundation models are accurate but too heavy to call per query on CPU. The
-answer is distillation: run the teacher once to label your data, then fit a
-small **native student** that runs in the zero-dependency core with no
-runtime. Every distilled student registers under the `student_id` you give
-it, and you serve it by passing that id as the `model` option of the normal
-serving call. There is no separate "serve a student" API.
+A strong teacher is usually too heavy to call per query: your production
+model needs its Python stack, and a foundation model needs seconds of CPU or
+a GPU. The answer is distillation: run the teacher once to label your data,
+then fit a small **native student** that runs in the zero-dependency core
+with no runtime. The teacher can be your own model (put its predictions in
+the target column and you have compressed it into the database), a
+permissively licensed foundation model, or your plain labels. Every distilled
+student registers under the `student_id` you give it, and you serve it by
+passing that id as the `model` option of the normal serving call. There is no
+separate "serve a student" API.
 
 ## Tabular: distill with `distill_predict`, serve with `predict`
 

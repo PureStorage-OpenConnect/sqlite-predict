@@ -2,7 +2,12 @@
 
 This runs the whole [TabArena-v0.1 suite](https://tabarena.ai) (OpenML suite
 457, 51 datasets, 38 classification and 13 regression) through the extension's
-own `distill()` and `predict()`, with the real TabFM as a distillation teacher.
+own `distill_predict()` and `predict()`, with the real TabFM as a distillation
+teacher. This campaign is an evaluation of the distillation mechanism, run
+under TabFM's non-commercial license (which permits benchmarking); distilling
+TabFM for commercial use requires a license from Google. The same mechanism
+with a permissively licensed teacher is measured in
+[`tabpfn.md`](tabpfn.md).
 See [`datasets.md`](datasets.md) for what each dataset predicts.
 
 It is not TabArena's official protocol. That uses full data, nested
