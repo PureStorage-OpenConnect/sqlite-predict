@@ -241,8 +241,16 @@ TabPFN-prefixed model name) when you distribute the student, while the
 later TabPFN-2.5/2.6/3 weights are non-commercial. Your own labels or
 models carry no such limits. The
 extension's license gate (`accept_license`) makes a restrictively-licensed
-teacher an explicit opt-in rather than an accident, but checking that your
-use fits the teacher's license is on you.
+teacher an explicit opt-in rather than an accident.
+
+> [!IMPORTANT]
+> The license descriptions above are our lay summaries as of mid-2026,
+> not legal advice. Model licenses change between versions and over
+> time, and how they apply depends on your use. Before distilling any
+> third-party model or shipping a student derived from one, read the
+> license that came with the exact weights you are using, and consult
+> your own counsel where it matters. Compliance is your responsibility,
+> not something this tool or its documentation can determine for you.
 
 Three student kinds: `'tree'` is a single decision tree (a few kilobytes,
 interpretable); `'gbt'` is a gradient-boosted forest with second-order

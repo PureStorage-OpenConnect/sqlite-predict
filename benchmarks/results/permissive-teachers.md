@@ -1,9 +1,10 @@
 # Permissive tabular teachers: TabICL and Mitra
 
-Every teacher in this table may be distilled and the student
-shipped commercially: TabICL checkpoints are BSD-3-Clause, Mitra
-is Apache-2.0, TabPFN-2 is under the Prior Labs License
-(distillation permitted with attribution). Same datasets, splits,
+Every teacher in this table carried a permissive license when
+measured (mid-2026): TabICL checkpoints BSD-3-Clause, Mitra
+Apache-2.0, TabPFN-2 the Prior Labs License (distillation permitted
+with attribution). These are lay summaries, not legal advice;
+verify the license on the exact weights you use. Same datasets, splits,
 and caps as `tabarena-full.md`; xgboost/TabFM/TabPFN columns come
 from the other campaigns.
 

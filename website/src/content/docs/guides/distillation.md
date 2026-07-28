@@ -87,5 +87,13 @@ non-commercial license does both; TabPFN-2's Prior Labs License permits
 distillation, commercially too, with attribution when you distribute the
 student (the later TabPFN-2.5/2.6/3 weights are non-commercial); Chronos
 is Apache-2.0; your own labels and models carry no such limits. The `accept_license` option makes a
-restrictively-licensed teacher an explicit opt-in, but confirming that your
-use fits the teacher's terms is your responsibility.
+restrictively-licensed teacher an explicit opt-in.
+
+:::caution[Not legal advice]
+The license descriptions here are lay summaries as of mid-2026. Model
+licenses change between versions and over time, and how they apply
+depends on your use. Read the license that shipped with the exact
+weights you use, and consult your own counsel where it matters.
+Compliance is your responsibility; neither this extension nor its
+documentation can determine it for you.
+:::
