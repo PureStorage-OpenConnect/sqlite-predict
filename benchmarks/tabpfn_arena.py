@@ -102,6 +102,14 @@ def one_dataset(name, X, y, task):
         row[f"tabpfn_{v}"] = TA.score(yte, t["pred_te"], task)
         row[f"tabpfn_{v}_s"] = round(t["secs_te"], 2)
 
+        # Distill only TabPFN-2: its Prior Labs License expressly permits
+        # distillation (Section 10, attribution on distribution). The
+        # TabPFN-3 license Section 2(d) bars using Outputs to distill "a
+        # model that is competitive with" it, with no purpose qualifier,
+        # so v3 contributes zero-shot numbers only.
+        if v != "v2":
+            continue
+
         # hard-label distillation into our gbt student, served by the
         # extension. On heavily imbalanced sets the teacher's hard train
         # labels can collapse to one class and distill_predict refuses
@@ -171,17 +179,21 @@ def report():
 
     lines = ["# TabPFN on the TabArena subset (and distilling it)", ""]
     lines += [
-        "TabPFN-2's weights are under the Prior Labs License (distillation",
-        "permitted, commercial use included, with attribution when the",
-        "student is distributed). TabPFN-3, the current default, is",
-        "non-commercial: its numbers are the evaluation ceiling. Same",
-        "datasets, splits, and row/feature caps as `tabarena-full.md`;",
+        "TabPFN-2's weights are under the Prior Labs License: distillation",
+        "is expressly permitted (Section 10), commercial use included, with",
+        "attribution when the student is distributed. TabPFN-3, the current",
+        "default, is non-commercial and its license Section 2(d) bars using",
+        "Outputs to distill a model competitive with it, with no purpose",
+        "qualifier, so this campaign reports TabPFN-3 zero-shot only and",
+        "measures distillation exclusively on TabPFN-2. Same datasets,",
+        "splits, and row/feature caps as `tabarena-full.md`;",
         "TabFM/xgboost/knn5 columns are that campaign's numbers.",
         "",
-        f"Device: {DEVICE}. TabPFN package 8.2.0.", "",
+        f"Device: {DEVICE}. TabPFN package 8.2.0. First calls include",
+        "one-time weight download.", "",
         "| dataset | task | xgboost | TabFM | TabPFN-2 | TabPFN-3 |"
-        " gbt<-2 | soft<-2 | gbt<-3 | s/call (3) |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        " gbt<-2 | soft<-2 | s/call (3) |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     wins = {k: 0 for k in ("v2_vs_xgb", "v3_vs_xgb", "v3_vs_tabfm",
                            "soft2_vs_xgb")}
@@ -198,7 +210,7 @@ def report():
             f"| {r['dataset']} | {r['task']} | {fmt(xgb)} | {fmt(tabfm)} |"
             f" {fmt(r.get('tabpfn_v2'))} | {fmt(r.get('tabpfn_v3'))} |"
             f" {fmt(r.get('gbt<-tabpfn_v2'))} | {fmt(soft2)} |"
-            f" {fmt(r.get('gbt<-tabpfn_v3'))} | {r.get('tabpfn_v3_s', '-')} |")
+            f" {r.get('tabpfn_v3_s', '-')} |")
         t = r["task"]
         if xgb is not None:
             for key, val in (("v2_vs_xgb", r.get("tabpfn_v2")),
