@@ -4,7 +4,7 @@ trains and serves entirely inside the extension.
 This is the end-to-end proof that a *capable* student recovers most of a
 forecast FM's edge, where a tree student could not. Chronos labels sliding
 context windows (offline, cached); `distill_forecast` fits a multi-output
-regression MLP (PSFCST, RFC 0005 §4.1.6) that reproduces the teacher; then
+regression MLP (a PSFCST blob) that reproduces the teacher; then
 `forecast()` serves that native student with no teacher and no onnxruntime.
 
 On m4_hourly (80 series, context 256, horizon 48):

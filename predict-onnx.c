@@ -12,7 +12,7 @@
  * as context on every call). The in_context path is validated against
  * real weights on the gated GPU CI job.
  *
- * Performance shape (see the RFC): the expensive costs are session
+ * Performance shape: the expensive costs are session
  * creation and weight load, so sessions are cached process-global keyed by
  * (weights, device, precision) and reused across calls; query rows are run
  * in batches, not one at a time. Execution-provider selection is explicit
@@ -483,7 +483,7 @@ static int onnx_build_session(const predict0_model_row *model,
       BUILD_CHECK(ap, PREDICT_ERR_RUNTIME_UNAVAILABLE, "append TensorRT EP");
     }
 #else
-    /* Honest state: the GPU execution providers are validated on the gated
+    /* Current state: the GPU execution providers are validated on the gated
      * GPU CI job and compiled only into the GPU build. This CPU build does
      * not silently fall back to CPU for a cuda/tensorrt request. */
     rc = SQLITE_ERROR;
@@ -502,7 +502,7 @@ static int onnx_build_session(const predict0_model_row *model,
   }
 
   if (model->weights_uri) {
-    /* content-address check (RFC §6.2): the file must still hash to the
+    /* content-address check: the file must still hash to the
      * content_hash recorded at registration. Runs once per session-cache
      * miss, not per call. */
     char hex[PREDICT_HEX_BUFSIZE];

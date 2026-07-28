@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* distill_predict() -- RFC 0005 §4.2.6 -- and the native-student TRAINERS.
+/* distill_predict() and the native-student TRAINERS.
  *
  * The training half of distillation: the CART / gradient-boosted / MLP
  * trainers and the distill_predict() table-valued function. distill_predict() fits a student
@@ -1615,7 +1615,7 @@ static sqlite3_module distillModule = {
     /* xShadowName */ NULL,
     /* xIntegrity  */ NULL};
 
-/* ---- distill_forecast: train a native forecast student (PSFCST, §4.1.3) ----
+/* ---- distill_forecast: train a native forecast student (PSFCST) ----
  *
  * The train_query returns context + horizon columns per row: the first
  * `context` columns are a raw history window, the next `horizon` are the

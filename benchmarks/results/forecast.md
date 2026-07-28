@@ -200,7 +200,7 @@ one SQL call. On m4_hourly (40 series, context 512, 1500 epochs, 640 windows):
 | TimesFM-distilled student | 1.065 | zero-dependency serve |
 | seasonal-naive floor | 1.109 | — |
 
-Two honest reads. First, the reconstruction works: the TimesFM teacher (1.049) is
+Two takeaways. First, the reconstruction works: the TimesFM teacher (1.049) is
 the full model, and its student (1.065) tracks it within ~1.5%, closing 74% of
 the naive->teacher gap, a real jump from the single-decode stub's ~1.17. Second,
 the student is the bottleneck, not the teacher: chronos is far the better teacher

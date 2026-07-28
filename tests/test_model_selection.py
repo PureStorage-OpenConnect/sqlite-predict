@@ -1,5 +1,5 @@
 """Auto model selection and interval methods on the forecast aggregate
-(RFC §4.2.1): the auto pool, explicit candidates, conformal intervals, and
+: the auto pool, explicit candidates, conformal intervals, and
 option validation."""
 
 import json

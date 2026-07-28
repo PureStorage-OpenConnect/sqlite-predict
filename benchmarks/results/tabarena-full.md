@@ -171,7 +171,7 @@ judge*.
 | always gbt (soft) | — | 0.857 | +0.007 |
 | always mlp (soft) | — | 0.844 | +0.020 |
 
-Two findings, both honest and both useful:
+Two findings, both useful:
 
 **Label-free selection works.** Picking the student that best mimics TabFM on
 the unlabeled rows recovers the accuracy-best student 77% of the time and lands
@@ -198,7 +198,7 @@ label-free; *teacher* selection still needs truth or a prior.
 - Three datasets (`coil2000_insurance`, `hiva_agnostic`, `kddcup09_appetency`)
   are severely imbalanced: at 1500 rows both TabFM and knn5 predict a single
   class, so there is nothing to distill and those cells are blank. That is an
-  honest limit of distilling a collapsed teacher, isolated per model so the
+  real limit of distilling a collapsed teacher, isolated per model so the
   rest of the row still runs. (`xgb`/`knn5` accuracies are shown where they
   survive; note they are near the majority base rate.)
 - TabFM ran with an 8-member ensemble (default 32), a conservative floor.

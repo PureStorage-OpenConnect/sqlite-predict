@@ -1,0 +1,35 @@
+name: Bug report
+description: Something behaves incorrectly, crashes, or contradicts the docs.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `SELECT predict_version()`, or the package version.
+      placeholder: v0.0.1-alpha.6
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS/arch and how you installed (pip, npm, cargo, prebuilt binary, amalgamation).
+      placeholder: macOS arm64, pip install sqlite-predict
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest SQL that shows the problem. Include table DDL and a few rows of data if the shape matters.
+      render: sql
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What you expected, and what happened instead (paste the full error message, they are designed to be pasted).
+    validations:
+      required: true

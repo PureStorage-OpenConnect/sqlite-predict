@@ -2,6 +2,9 @@
 
 [![CI](https://github.com/PureStorage-OpenConnect/sqlite-predict/actions/workflows/ci.yml/badge.svg)](https://github.com/PureStorage-OpenConnect/sqlite-predict/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![crates.io](https://img.shields.io/crates/v/sqlite-predict.svg)](https://crates.io/crates/sqlite-predict)
+[![PyPI](https://img.shields.io/pypi/v/sqlite-predict.svg)](https://pypi.org/project/sqlite-predict/)
+[![npm](https://img.shields.io/npm/v/sqlite-predict.svg)](https://www.npmjs.com/package/sqlite-predict)
 ![C99](https://img.shields.io/badge/C99-zero%20dependencies-brightgreen.svg)
 
 **Prediction as a SQL primitive.** `forecast()`, `detect_anomalies()`, and
@@ -32,7 +35,7 @@ that lives inside your database and runs anywhere.
 
 ## Is it accurate?
 
-Yes, and the numbers are honest and reproducible (`benchmarks/`), not a demo on
+Yes, and the numbers are measured and reproducible (`benchmarks/`), not a demo on
 a toy series.
 
 - **Forecasting.** A Chronos foundation model distilled into a zero-dependency
@@ -166,7 +169,7 @@ SELECT avg(coverage) FROM backtest('SELECT ts, value FROM readings', 6,
 ## Models
 
 The default build is **pure C with no dependencies**. It ships small,
-honest statistical models:
+well-studied statistical models:
 
 - `theta-classic` (the Theta method) and `stub-seasonal-naive` for `forecast()`
   and `detect_anomalies()`; `tsb` (Teunter-Syntetos-Babai) for

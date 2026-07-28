@@ -173,7 +173,7 @@ def main():
     say("  are packed (one X with a train_size split) plus cat_mask and d, and")
     say("  real accuracy needs an external quantile-transform + feature-")
     say("  ensemble pipeline that cannot live in a SQL extension.")
-    say("- The measured cost keeps the RFC conclusion: run TabFM as a teacher")
+    say("- The measured cost keeps the design conclusion: run TabFM as a teacher")
     say("  offline (full pipeline), distill to a vector/in_context student that")
     say("  DOES fit the extension and serves in microseconds.")
 

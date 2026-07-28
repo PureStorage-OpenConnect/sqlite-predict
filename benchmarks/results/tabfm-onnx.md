@@ -97,7 +97,7 @@ packing), and the sklearn preprocessing + ensemble pushed into SQL or the
 graph. That is a large amount of work and machinery to serve a model that
 still costs tens of seconds per call.
 
-This is exactly the case the RFC's teacher/student split was built for. The
+This is exactly the case the teacher/student split was built for. The
 in-context ONNX path we shipped is proven on a synthetic 1-NN teacher and is
 the right shape for a *distilled* student; TabFM's role is the offline
 teacher, run with its full Python pipeline, whose skill we compress into a

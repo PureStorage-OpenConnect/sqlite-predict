@@ -1,15 +1,12 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* Model registry (_predict_models) and content hashing. RFC 0005 §4.1.1.
+/* Model registry (_predict_models) and content hashing.
  * Registered models are content-addressed: content_hash pins the exact
- * weights and is verified at load, before deserialization (§6.2):
+ * weights and is verified at load, before deserialization:
  * inline blobs in predict0_registry_lookup, URI weights in the onnx
  * session builder.
- *
- * One deliberate deviation from the 0005 draft, to feed its revision:
- * model kind 'ts-stat' (the draft's kind vocabulary lacks statistical
- * models). */
+ */
 #include "predict-internal.h"
 
 #ifndef SQLITE_CORE
@@ -177,7 +174,7 @@ int predict0_registry_lookup(sqlite3 *db, const char *model_id,
     predict0_model_row_free(out);
     return SQLITE_CORRUPT;
   }
-  /* content-address check (§6.2): inline weights must hash to the
+  /* content-address check: inline weights must hash to the
    * registered content_hash, or the row was tampered with/corrupted */
   if (out->weights && out->weights_len > 0) {
     predict0_hasher h;

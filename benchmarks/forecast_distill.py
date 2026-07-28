@@ -24,9 +24,9 @@ students are trained on identical rows:
 GENERICITY. Every hyperparameter is a fixed function of the seasonal period M
 (R=2M recent lags, min-origin 3M, stride M/2), and M comes from dataset
 metadata, not from tuning. The SAME pipeline runs on all three regimes. This is
-the honest test: on m4_hourly the FM beats the stat floor, so distillation
+the real test: on m4_hourly the FM beats the stat floor, so distillation
 should help; on tourism_monthly the FM does not beat our stat model (see
-forecast.md), so an honest method must NOT manufacture a win there. Nothing is
+forecast.md), so a sound method must NOT manufacture a win there. Nothing is
 selected on the test window.
 
 FM forecasts are cached per (dataset, series, origin) under

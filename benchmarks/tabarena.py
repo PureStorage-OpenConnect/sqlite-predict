@@ -1,7 +1,7 @@
 """Benchmark sqlite-predict's models against TabFM on a TabArena-spirit subset.
 
 TabFM was announced on TabArena (Erickson et al. 2025) — a curated OpenML
-benchmark. This runs a small, honest subset of comparable OpenML tasks and
+benchmark. This runs a small, representative subset of comparable OpenML tasks and
 lines up, on the same train/test splits:
 
   - xgboost                the strong tabular baseline

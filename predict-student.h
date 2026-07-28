@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* Native student model format and serving runtime (RFC 0005 §4.1.3).
+/* Native student model format and serving runtime.
  *
  * The serving/format half of the distillation feature: the blob layouts
  * (PSTREE01 / PSGBT01 / PSMLP01), their bounds-checked deserializers, the

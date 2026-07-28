@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* predict(train_query, apply_query, options) — RFC 0005 §4.2.5.
- * v0 backing: knn5-incontext (kind 'tabular-stat'), the measured honest
- * baseline from the benchmark campaign: z-scored 5-NN with per-column
+/* predict(train_query, apply_query, options).
+ * v0 backing: knn5-incontext (kind 'tabular-stat'), the strongest
+ * measured baseline from the benchmark campaign: z-scored 5-NN with per-column
  * categorical coding. Foundation-model teachers arrive via distill_predict()
  * and the opt-in ONNX build; the benchmarks showed raw in-context FMs
  * are teachers, not serving paths (30s+/call on CPU). */

@@ -1,5 +1,5 @@
-"""Aggregate forms of forecast/detect_anomalies (RFC 0005 §4.2.1-§4.2.2)
-and the expansion functions (§4.2.3).
+"""Aggregate forms of forecast/detect_anomalies and the
+forecast_rows()/anomaly_rows() expansion functions.
 
 forecast and detect_anomalies are aggregate-only: the enclosing statement
 supplies the rows, GROUP BY splits series, and each group returns one JSON
@@ -288,7 +288,7 @@ def test_expansion_rejects_garbage(db):
             db.execute(f"SELECT * FROM forecast_rows({bad})").fetchall()
 
 
-# ---- purity in expression contexts (§6.7) ----
+# ---- purity in expression contexts ----
 
 
 def test_aggregate_works_in_views(db):

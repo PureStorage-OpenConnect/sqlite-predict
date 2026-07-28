@@ -2,7 +2,7 @@
 
 Candidates: Google TabFM (local weights under models/tabfm, downloaded
 from google/tabfm-1.0.0-pytorch — license tabfm-non-commercial-v1.0,
-benchmark/evaluation use), plus honest floors (majority class / global
+benchmark/evaluation use), plus baseline floors (majority class / global
 mean) and a pure-python 5-NN so wins are attributable. The extension's
 predict() column joins when M4 lands. Unavailable candidates are
 reported SKIPPED, never silently dropped.

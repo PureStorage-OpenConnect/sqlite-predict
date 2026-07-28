@@ -47,8 +47,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   self-correcting error. The receipts/replay system explored during
   development (in-DB anchored receipts, then input-digest commitments,
   then document receipts) was removed before release: prediction is the
-  product, provenance was drag; the designs live in git history and the
-  RFC's deferred appendix. The model registry (`_predict_models`) remains:
+  product, provenance was drag; the designs live in git history. The
+  model registry (`_predict_models`) remains:
   content-addressed models and distilled students, hashes verified before
   deserialization.
 - **Auto model selection, conformal intervals, and `backtest()`.**
@@ -91,8 +91,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `distill_forecast()` trains a native **forecast student**: a regression net
   that maps an instance-normalized context window to future values, distilled
   from a teacher's forecasts (a foundation model run offline, or any per-window
-  teacher) over sliding windows. It registers a `PSFCST` inline BLOB (RFC 0005
-  §4.1.6) that `forecast()` serves natively, with no teacher and no onnxruntime,
+  teacher) over sliding windows. It registers a `PSFCST` inline BLOB
+  that `forecast()` serves natively, with no teacher and no onnxruntime,
   deterministically and in microseconds. The student is a **DLinear/TiDE-style
   net**: a direct linear map from the context to the fan (which carries the
   seasonal-naive + trend structure) plus a small, scaled nonlinear residual. A
@@ -131,7 +131,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rank; there is no forecast/interval. On a broad 200-series TSB-AD-U sample it
   scores 0.44 median VUS-PR (at the published SOTA level) versus the theta
   residual detector's 0.23 -- roughly 2x on the typical series, all in zero-
-  dependency C. Two honest caveats: the *mean* gap is
+  dependency C. Two caveats: the *mean* gap is
   much smaller (0.41 vs 0.38) because sub-pca fails badly on weakly-periodic or
   very long series where the fixed-window PCA does not fit, so the two are partly
   complementary; and on a subset filtered to moderate-length periodic series the

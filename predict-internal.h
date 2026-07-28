@@ -52,7 +52,8 @@ typedef size_t usize;
  * 1e11 s is year 5138; 1e11 ms is year 1973 — no realistic overlap. */
 #define PREDICT_EPOCH_MS_THRESHOLD 100000000000LL
 
-/* Closed call-error set, RFC 0005 §4.3. Raised as "PREDICT_ERR_<NAME>: detail". */
+/* Closed call-error set (see docs/reference/errors). Raised as
+ * "PREDICT_ERR_<NAME>: detail". */
 #define PREDICT_ERR_OPTIONS "PREDICT_ERR_OPTIONS"
 #define PREDICT_ERR_QUERY_NOT_READONLY "PREDICT_ERR_QUERY_NOT_READONLY"
 #define PREDICT_ERR_SCHEMA "PREDICT_ERR_SCHEMA"
@@ -85,7 +86,7 @@ int predict0_parse_timestamp(const char *s, i64 *out_ms);
 void predict0_format_timestamp(i64 ms, char *buf, usize bufsize);
 
 /* Prepare a caller-supplied inner query: must parse, be a single
- * statement, and be read-only (§6.1). what names the argument in error
+ * statement, and be read-only. what names the argument in error
  * messages. SQLITE_OK + *out, or SQLITE_ERROR + *errmsg. */
 int predict0_prepare_ro(sqlite3 *db, const char *sql, const char *what,
                         sqlite3_stmt **out, char **errmsg);
@@ -145,7 +146,7 @@ typedef struct {
 } predict0_model_row;
 
 /* Look up a model. Returns 0 and fills *out on hit, 1 if absent, 2 if
- * the row's inline weights fail content_hash verification (§6.2; the
+ * the row's inline weights fail content_hash verification (the
  * caller raises PREDICT_ERR_MODEL_HASH), or an SQLITE_ error. Free *out
  * with predict0_model_row_free on a hit only. */
 int predict0_registry_lookup(sqlite3 *db, const char *model_id,

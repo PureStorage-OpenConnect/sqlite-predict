@@ -3,7 +3,7 @@ zero-dependency MLP that emits a calibrated interval, and score it end-to-end
 through the extension.
 
 `distill_forecast` with a `quantiles` option fits a regression MLP whose outputs
-are the teacher's quantiles per horizon step (PSFCST, RFC 0005 §4.1.6);
+are the teacher's quantiles per horizon step (a PSFCST blob);
 `forecast()` reads the point and the interval straight off that fan. This is the
 CRPS-scoreable completion of the point student in `forecast_native.py`.
 

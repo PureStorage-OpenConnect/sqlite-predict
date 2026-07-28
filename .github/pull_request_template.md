@@ -1,4 +1,4 @@
-<!-- Thanks for contributing. Please keep this checklist honest. -->
+<!-- Thanks for contributing. Please keep this checklist accurate. -->
 
 ## What and why
 

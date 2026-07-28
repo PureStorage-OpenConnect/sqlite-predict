@@ -1,6 +1,6 @@
 # Spike results (M0-M5), 2026-07-22
 
-The numbers RFC 0005's open questions asked for, measured.
+The numbers the design's open questions asked for, measured.
 
 ## The artifact
 
@@ -36,7 +36,7 @@ The numbers RFC 0005's open questions asked for, measured.
 - **Distillation** (`distill-viability.md`): distilled students retain
   91-101% of TabFM across suites/budgets at 1 µs and 71 KB. Decisive at
   20-50 labels, where direct training falls below the majority floor.
-  Convergence at 300 labels marks the honest boundary.
+  Convergence at 300 labels marks the practical boundary.
 
 Model policy these numbers fix: cheap statistical/in-context models as
 the zero-dependency defaults; distill_predict() as the FM value path; raw FMs
@@ -53,7 +53,7 @@ as opt-in teachers (ONNX build), never default serving.
 - Schema drift bit immediately (ingested_at/intrigue_score vs the
   spec's example names): named column overrides are load-bearing.
 
-## Open-question answers for the RFC revision
+## Open-question answers
 
 - **OQ1 (runtime):** deferred correctly. The 33 s CPU TabFM calls and
   the distillation results mean the FM path is distill_predict()-first; a GGML
@@ -81,7 +81,7 @@ as opt-in teachers (ONNX build), never default serving.
   scoping (hash only the tables the inner query reads — resolvable via
   sqlite3_set_authorizer during prepare) or platform generation anchors.
 
-## Spec amendments queued for RFC 0005 rev 2
+## Design amendments (since folded into the implementation)
 
 1. `kind` vocabulary: add `ts-stat`, `tabular-stat`.
 2. `anchor_kind`: add `logical-digest`; define file-digest as
@@ -118,7 +118,7 @@ as opt-in teachers (ONNX build), never default serving.
 ## Code-quality pass (Fowler review, 2026-07-22)
 
 Reviewed for smells after the user flagged hardcoding. Done:
-- **Date handling rewritten** (was genuinely broken): strict digit parser
+- **Date handling rewritten** (was simply broken): strict digit parser
   (rejects embedded signs, :60, leading whitespace); Hinnant O(1)
   civil<->days replacing an O(years) loop that was a 294k-iteration DoS
   + buffer overflow past year 9999; format clamps to [0001,9999] so it's

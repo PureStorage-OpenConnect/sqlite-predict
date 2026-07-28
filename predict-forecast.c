@@ -6,9 +6,8 @@
  * backtest core, options parsing, series collection (backtest's front
  * end), the shared serving core (model resolution, auto candidate
  * discovery, per-series runs), the backtest() table-valued function
- * (RFC 0005 §4.2.4), the forecast()/detect_anomalies() aggregates
- * (§4.2.1, §4.2.2), and the forecast_rows()/anomaly_rows() expansion
- * functions (§4.2.3). */
+ * the forecast()/detect_anomalies() aggregates, and the
+ * forecast_rows()/anomaly_rows() expansion functions. */
 #include "predict-internal.h"
 #include "predict-student.h"
 
@@ -566,7 +565,7 @@ static int ts_conformal_q(predict0_ts_model model, const f64 *y, const i64 *ts,
   return nf;
 }
 
-/* ---- forecast student serving (PSFCST, §4.1.3) ---- */
+/* ---- forecast student serving (PSFCST blobs) ---- */
 
 /* Forecast H steps from the length-L window `src` (raw units): instance-
  * normalize by the window's own (mean, sd), apply the net, de-normalize. */
@@ -1826,7 +1825,7 @@ static int fc_run_series(sqlite3 *db, SeriesBuf *series, int n_series,
           rc = SQLITE_NOMEM;
           break;
         }
-        if (nf < CONFORMAL_MIN_FOLDS) { /* cannot calibrate honestly */
+        if (nf < CONFORMAL_MIN_FOLDS) { /* too few folds to calibrate */
           ForecastRow *r = &rows[n_rows++];
           memset(r, 0, sizeof(*r));
           r->series_key = sqlite3_mprintf("%s", s->key);
@@ -1885,7 +1884,7 @@ static int fc_run_series(sqlite3 *db, SeriesBuf *series, int n_series,
 
 #pragma region subpca
 
-/* Sub-PCA anomaly scorer (RFC §4.2.2, the `sub-pca` model). A subsequence
+/* Sub-PCA anomaly scorer (the `sub-pca` model). A subsequence
  * detector, not a forecaster: it embeds the series into sliding windows of one
  * period, standardizes each phase, fits PCA over the windows, and scores each
  * window by its reconstruction error in the top-variance subspace -- a window
@@ -2085,7 +2084,7 @@ static int subpca_rank_cmp(const void *a, const void *b) {
 
 #pragma region detect_anomalies
 
-/* detect_anomalies scoring core — RFC §4.2.2. Scoring is causal:
+/* detect_anomalies scoring core. Scoring is causal:
  * every point is scored against a one-step-ahead prediction built from
  * PRIOR points only (residual sigma via Welford, updated after each
  * point is scored), so the anomaly cannot hide inside its own fit. */
@@ -2812,7 +2811,7 @@ static sqlite3_module backtestModule = {
 #pragma region aggregate
 
 /* forecast(ts, value, horizon[, options]) and detect_anomalies(ts,
- * value[, options]) — the aggregates, RFC §4.2.1 and §4.2.2. The
+ * value[, options]) — the aggregates. The
  * enclosing statement pushes rows in (GROUP BY = series splitting),
  * the shared serving core runs the model per series, and the
  * result is one JSON document per group: {"model", "status", "rows"}.
@@ -2852,7 +2851,7 @@ static void agg_series_clear(AggSeries *a) {
 }
 
 /* TEXT first argument that reads as SQL: the caller invoked the query
- * form in expression position; redirect them (RFC §4.2.1 Errors). */
+ * form in expression position; redirect them with a pointed error. */
 static int agg_looks_like_query(sqlite3_value *v) {
   if (sqlite3_value_type(v) != SQLITE_TEXT)
     return 0;
@@ -2868,7 +2867,7 @@ static int agg_looks_like_query(sqlite3_value *v) {
 /* Shared xStep: coerce (ts, value) with the query form's rules
  * (collect_series), enforce constant options (and horizon, when
  * horizon_arg >= 0), and append. Timestamps normalize to whole seconds
- * deterministically at whole-second resolution (§4.2.1). */
+ * deterministically at whole-second resolution. */
 static void agg_step(sqlite3_context *ctx, int argc, sqlite3_value **argv,
                      const char *fname, int horizon_arg) {
   AggSeries *a = sqlite3_aggregate_context(ctx, sizeof(AggSeries));
@@ -3019,7 +3018,7 @@ static void agg_fc_misuse(sqlite3_context *ctx, int argc,
 
 /* JSON emission: %.17g round-trips doubles exactly (SQLite's own JSON
  * REAL formatting does not), so equal results are equal document
- * bytes (determinism, RFC §4.1.2). Non-finite values have no JSON
+ * bytes (same-input same-output determinism). Non-finite values have no JSON
  * form and emit null. */
 static void agg_json_num(sqlite3_str *s, f64 v) {
   if (!isfinite(v)) {
@@ -3057,7 +3056,7 @@ static void agg_error(sqlite3_context *ctx, char *msg) {
 static void agg_fc_final(sqlite3_context *ctx) {
   AggSeries *a = sqlite3_aggregate_context(ctx, 0);
   if (!a || !a->started) {
-    /* zero rows: NULL, the SQL aggregate convention (§4.2.1) */
+    /* zero rows: NULL, the SQL aggregate convention */
     agg_series_clear(a);
     sqlite3_result_null(ctx);
     return;
@@ -3122,7 +3121,7 @@ static void agg_fc_final(sqlite3_context *ctx) {
   /* one series: status is uniform across rows */
   const char *status = n_rows ? rows[0].status : "ok";
 
-  /* the result document (§4.2.1): row fields named as the query form's
+  /* the result document: row fields named as the rows-form
    * output columns. For auto, "model" reports the winning candidate,
    * which may be an mc-owned string, so mc is freed after the build. */
   sqlite3_str *doc = sqlite3_str_new(db);
@@ -3276,7 +3275,7 @@ static void agg_an_final(sqlite3_context *ctx) {
 #pragma region expansion
 
 /* forecast_rows(doc) / anomaly_rows(doc) — expand an aggregate-form
- * JSON document back into typed rows (RFC §4.2.3). Column names and
+ * JSON document back into typed rows. Column names and
  * types match the query form's output columns exactly; the numeric
  * columns are forced REAL so the inline-series replay hash sees the
  * same encoding the write path produced. */
@@ -3505,7 +3504,7 @@ static int xr_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (!done)
     return xr_error(cur, "document rows are not valid JSON");
 
-  /* empty rows: one status row, the query form's convention (§4.2.3) */
+  /* empty rows: one status row, the rows-form convention */
   if (cur->n_rows == 0) {
     cur->rows = sqlite3_malloc(sizeof(XRow));
     if (!cur->rows)

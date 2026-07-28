@@ -20,7 +20,7 @@ Source layout:
 | `predict-registry.c` | the model registry (`_predict_models`) and content hashing |
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
 | `predict-student.c` | the native student **serving** runtime: blob (de)serialization and tree / forest / MLP inference (`predict0_tree_run`). The serve side of the train/serve boundary |
-| `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on (RFC §4.1.3) |
+| `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on |
 | `predict-distill.c` | the **training** side: the CART / gradient-boosting / MLP trainers, the `distill_predict()` vtab, and the `distill_forecast()` vtab that fits the forecast student. Builds student blobs that `predict-student.c` serves |
 | `predict-internal.h` | shared types, contract constants, error codes, internal prototypes |
 | `vendor/sha256.c` | a self-contained FIPS 180-4 SHA-256 |
@@ -89,7 +89,7 @@ bytes run. Both run on CPU. A GPU build (`make loadable-onnx-gpu`,
 fp16/int8 precision; the provider-options symbols are in every onnxruntime
 C API, so it compiles and links against the CPU onnxruntime for a CI
 compile-check, while real GPU execution is validated on a dedicated GPU job.
-GPU results are honestly distinguishable from the deterministic CPU path
+GPU results stay distinguishable from the deterministic CPU path
 (provider and precision are explicit options, never silent fallbacks).
 Even so, the `benchmarks/` numbers (and the TabFM→ONNX eval in
 `benchmarks/results/tabfm-onnx.md`) are why the default answer for a
@@ -130,11 +130,11 @@ a `tree`-runtime model to the native runtime in the same file, which tells a
 single tree (`PSTREE` blob) from a forest (`PSGBT` blob) from a net (`PSMLP`
 blob) by magic and needs
 no onnxruntime. The blob formats are little-endian and normatively specified
-and versioned (RFC §4.1.3, `PSTREE01` / `PSGBT01` / `PSMLP01`), so a stored student stays
+and versioned (`PSTREE01` / `PSGBT01` / `PSMLP01`), so a stored student stays
 servable across upgrades, snapshots, and forks, and a serving-only module can
 execute a blob it never trained. They are rigorously bounds-checked on read,
 because the registry is
-writable by any SQL caller (RFC §6.2): a hand-crafted blob is rejected,
+writable by any SQL caller: a hand-crafted blob is rejected,
 never crashed on. The student is native and deterministic, like the stat
 models.
 
@@ -142,7 +142,7 @@ Forecasting has its own student. `distill_forecast()` (`predict-distill.c`)
 fits a regression MLP that maps an instance-normalized context window of `nfeat`
 recent values to `nquant` quantiles per horizon step, distilled from a teacher's
 forecasts over sliding windows. It is stored as a fourth student blob (`PSFCST`,
-RFC §4.1.3) and served not by `predict()` but by `forecast()`
+the same registry format) and served not by `predict()` but by `forecast()`
 (`predict-forecast.c`), which extracts the most recent window, normalizes it by
 its own mean and standard deviation (so one student serves series of any
 magnitude), applies the net, and de-normalizes. When the student carries a
@@ -163,14 +163,5 @@ the JSON documents). The ONNX CPU-fp32 path is deterministic too. GPU and
 fp16 inference is not bit-reproducible across machines (different hardware
 and kernels round differently). Cross-machine, cross-backend bit-equality
 is never claimed (see `benchmarks/notes.md`).
-
-## Spec alignment
-
-The design spec (RFC 0005) has been amended to match the implemented
-surface: the `ts-stat`/`tabular-stat` model kinds, the aggregate calling
-convention for `forecast` and `detect_anomalies`, null option values
-meaning "key omitted," and the removal of receipts (that design is
-preserved in the RFC's Appendix D). Section references in this document
-follow the amended numbering.
 
 [tvf]: https://www.sqlite.org/vtab.html#tabfunc2

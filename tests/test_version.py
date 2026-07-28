@@ -4,7 +4,6 @@ import json
 def test_version_is_json_with_spec(db):
     raw = db.execute("SELECT predict_version()").fetchone()[0]
     v = json.loads(raw)
-    assert v["spec"] == "0005-draft"
     assert v["extension"].startswith("v0.")
     assert isinstance(v["runtimes"], list) and "stat" in v["runtimes"]
     assert isinstance(v["models"], list)

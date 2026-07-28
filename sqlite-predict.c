@@ -14,16 +14,16 @@ static void predict_version_fn(sqlite3_context *context, int argc,
   UNUSED_PARAMETER(argc);
   UNUSED_PARAMETER(argv);
   char *json = sqlite3_mprintf(
-      "{\"extension\":\"%s\",\"spec\":\"%s\",\"runtimes\":[\"stat\",\"tree\""
+      "{\"extension\":\"%s\",\"runtimes\":[\"stat\",\"tree\""
 #ifdef SQLITE_PREDICT_ONNX
       ",\"onnx\""
 #endif
-      /* the bundled models every build serves (§4.2.8: registered
-       * aliases); user-registered models live in _predict_models and are
-       * per-database, so a pure version function cannot list them */
+      /* the bundled models every build serves; user-registered models
+       * live in _predict_models and are per-database, so a pure version
+       * function cannot list them */
       "],\"models\":[\"auto\",\"theta-classic\",\"stub-seasonal-naive\","
       "\"tsb\",\"sub-pca\",\"knn5-incontext\"]}",
-      SQLITE_PREDICT_VERSION, SQLITE_PREDICT_SPEC);
+      SQLITE_PREDICT_VERSION);
   if (!json) {
     sqlite3_result_error_nomem(context);
     return;
@@ -213,7 +213,7 @@ int predict0_json_str_array(sqlite3 *db, const char *json, const char *path,
 }
 
 /* Prepare a caller-supplied inner query with the safety contract every
- * operation shares (§6.1): it must parse, be a single statement, and be
+ * operation shares: it must parse, be a single statement, and be
  * read-only. what names the argument in error messages ("train_query").
  * Returns SQLITE_OK with *out set, or SQLITE_ERROR with *errmsg set. */
 int predict0_prepare_ro(sqlite3 *db, const char *sql, const char *what,

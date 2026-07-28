@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* Native student format + serving runtime (RFC 0005 §4.1.3). Reads and
+/* Native student format + serving runtime. Reads and
  * executes the inline student blobs distill_predict() produces: a single tree
  * (PSTREE01), a gradient-boosted forest (PSGBT01), or a one-hidden-layer MLP
  * (PSMLP01), told apart by the 8-byte magic. Every field is bounds-checked on
- * read, because the registry is writable by any SQL caller (RFC §6.2). This
+ * read, because the registry is writable by any SQL caller. This
  * file is compiled into the core build and links no training code. */
 #include "predict-internal.h"
 #include "predict-student.h"
@@ -611,7 +611,7 @@ oom:
 
 /* v01: plain MLP (nhid>0, no skip). v02: adds a linear skip Wskip[nout*nfeat]
  * and allows nhid=0 (pure linear). The writer emits v02; the reader accepts
- * both, so v01 blobs stay servable (RFC 0005 §4.1.3 back-compat). */
+ * both, so v01 blobs stay servable (format back-compat). */
 static const char FCST_MAGIC_V1[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '1'};
 static const char FCST_MAGIC[8] = {'P', 'S', 'F', 'C', 'S', 'T', '0', '2'};
 

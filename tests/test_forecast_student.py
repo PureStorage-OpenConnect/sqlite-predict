@@ -1,4 +1,4 @@
-"""distill_forecast() and the native forecast student (PSFCST, RFC 0005 §4.1.3).
+"""distill_forecast() and the native forecast student (PSFCST blobs).
 
 distill_forecast fits a multi-output regression MLP that maps an instance-
 normalized context window to a horizon of future values, reproducing a
@@ -227,7 +227,7 @@ def test_quantile_bad_levels_rejected(db):
 
 
 def test_forecast_rejects_a_malformed_student_blob(db):
-    # the registry is writable by any SQL caller (RFC §6.2): a truncated PSFCST
+    # the registry is writable by any SQL caller: a truncated PSFCST
     # blob (valid magic, nfeat present, nothing after) must be rejected cleanly,
     # never crash the serving path. The content_hash is correct so the blob
     # reaches the deserializer rather than tripping the hash check first.

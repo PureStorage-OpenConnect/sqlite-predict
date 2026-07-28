@@ -1,6 +1,6 @@
 ---
 title: Benchmarks
-description: Honest, reproducible accuracy numbers for the bundled models.
+description: Measured, reproducible accuracy numbers for the bundled models.
 ---
 
 These are the numbers we hold ourselves to. Every one is reproducible from the

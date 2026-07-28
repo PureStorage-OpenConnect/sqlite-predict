@@ -1,0 +1,21 @@
+name: Feature request
+description: A capability, model, or interface you need that does not exist yet.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task in your own terms, ideally with the SQL you wish you could write.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What do you do today instead?
+      description: Workarounds, external tools, or "nothing, it blocks me".
+  - type: textarea
+    id: shape
+    attributes:
+      label: Proposed shape (optional)
+      description: If you have an opinion on the SQL surface or options, sketch it.

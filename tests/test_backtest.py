@@ -1,4 +1,4 @@
-"""The backtest() TVF (RFC §4.2.4): rolling-origin fold metrics and their
+"""The backtest() TVF: rolling-origin fold metrics and their
 invariants, auto selection and conformal coverage as measured through
 backtest, and the distilled forecast student as a portable auto candidate.
 Adversarial by design: short series, huge gaps, bad options, and the
