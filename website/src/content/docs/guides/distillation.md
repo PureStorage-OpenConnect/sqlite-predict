@@ -27,13 +27,17 @@ SELECT row_ref, prediction, confidence FROM predict(NULL,
 
 The `NULL` first argument is the signature of serving a student: `predict`
 normally takes a training query for in-context models, but a student carries
-its training inside its blob, so passing one is an error.
+its training inside its blob, so pass `NULL`; a query in that position is
+not read when a student serves the call.
 
 `student_kind` is `tree` (a single CART), `gbt` (a gradient-boosted forest
 with second-order leaves, which matches or beats tuned XGBoost on most
 tasks), or `mlp` (a one-hidden-layer net for boundaries a tree renders
 poorly). With `proba` and `classes` the student learns the teacher's full
 probability distribution (soft-label distillation), not just its argmax.
+Feature columns must be numeric: encode categorical text before distilling
+(the in-context `knn5-incontext` handles text features itself; the distiller
+does not).
 
 ## Forecasting: distill with `distill_forecast`, serve with `forecast`
 
@@ -55,9 +59,12 @@ SELECT forecast(ts, value, 12, '{"model":"auto"}') FROM readings;
 
 The student is a DLinear/TiDE-style net (a linear skip plus a small
 residual). Without an onnx teacher, `distill_forecast` also trains directly
-from windowed rows: each training row is `context` window columns followed by
-`horizon` continuation columns (your own teacher's forecasts, computed
-anywhere and stored as columns).
+from windowed rows: each training row is, by position, `context` window
+columns followed by `horizon` continuation columns (your own teacher's
+forecasts, computed anywhere and stored as columns), and the column count
+must match exactly. Pass `quantiles` to distill a teacher's quantile fan
+instead of a point forecast: the continuation part then holds
+`horizon * nquant` columns, one block of quantile levels per step.
 
 ## Distribute the student
 

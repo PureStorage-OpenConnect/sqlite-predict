@@ -13,7 +13,8 @@ SELECT datetime('2024-01-01', '+' || i || ' hours') AS ts,
           + (CASE WHEN i = 300 THEN 60 ELSE 0 END) AS value
 FROM t;
 
-.print '\n== forecast the next 24 hours, with prediction intervals =='
+.print ''
+.print '== forecast the next 24 hours, with prediction intervals =='
 -- forecast() is an aggregate: your statement supplies the rows (WHERE,
 -- joins, and GROUP BY all compose), and each group returns one JSON
 -- document: {"model", "status", "rows"}. Expand it to typed rows with
@@ -26,7 +27,8 @@ SELECT r.step,
 FROM forecast_rows((SELECT forecast(ts, value, 24) FROM readings)) AS r
 LIMIT 5;
 
-.print '\n== find the anomaly (sub-pca, a SOTA-level subsequence detector) =='
+.print ''
+.print '== find the anomaly (sub-pca, a SOTA-level subsequence detector) =='
 SELECT r.ts,
        round(r.value, 1)               AS value,
        round(r.anomaly_probability, 3) AS score
@@ -34,12 +36,14 @@ FROM anomaly_rows((SELECT detect_anomalies(ts, value, '{"model":"sub-pca"}')
                    FROM readings)) AS r
 WHERE r.is_anomaly = 1;
 
-.print '\n== multi-series is just GROUP BY =='
+.print ''
+.print '== multi-series is just GROUP BY =='
 SELECT substr(ts, 12, 2) AS hour_of_day,
        json_extract(forecast(ts, value, 4), '$.status') AS status
 FROM readings GROUP BY hour_of_day LIMIT 4;
 
-.print '\n== how accurate is it here? backtest on your own data =='
+.print ''
+.print '== how accurate is it here? backtest on your own data =='
 SELECT fold, model, round(mase, 2) AS mase, round(coverage, 2) AS coverage
 FROM backtest('SELECT ts, value FROM readings', 24, '{"folds":5}')
 LIMIT 5;

@@ -16,7 +16,7 @@ seasonal-naive floor of 1.0.
 | Model | MASE | Notes |
 | --- | --- | --- |
 | seasonal-naive | 1.11 | the floor |
-| theta-classic | 1.03 | bundled default, zero dependencies |
+| theta-classic | 1.03 | bundled statistical model, zero dependencies |
 | distilled Chronos student | 0.89 | native blob, no runtime at serve time |
 | Chronos (teacher, ONNX) | ~0.80 | for reference; needs the ONNX build |
 

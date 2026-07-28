@@ -7,7 +7,9 @@ description: Load sqlite-predict in the SQLite CLI, or vendor the single C file.
 
 Download a prebuilt loadable for your platform from the
 [GitHub releases](https://github.com/PureStorage-OpenConnect/sqlite-predict/releases)
-and `.load` it:
+(`predict0-<os>-<arch>.{so,dylib,dll}`, checksums in `SHA256SUMS`) and
+`.load` it. One macOS note: the system `/usr/bin/sqlite3` is compiled without
+extension loading, so use a stock CLI (`brew install sqlite`):
 
 ```sh
 sqlite3 mydata.db

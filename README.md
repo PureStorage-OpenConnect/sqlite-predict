@@ -75,11 +75,11 @@ that model the same way it owns its tables.
 ```sql
 -- once: distill (your labels, or a teacher's precomputed predictions)
 SELECT model_id, holdout_metric FROM distill_predict(
-  'SELECT tenure, spend, plan, churned FROM customers',
+  'SELECT tenure, spend, churned FROM customers',
   '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
 
 -- forever: serve the student per row, in microseconds, no runtime attached
-SELECT * FROM predict(NULL, 'SELECT id, tenure, spend, plan FROM customers',
+SELECT * FROM predict(NULL, 'SELECT id, tenure, spend FROM customers',
                       '{"model":"churn-v1"}');
 
 -- the same move for time series: distill a Chronos-class teacher's forecasts
@@ -208,7 +208,9 @@ interpretable); `'gbt'` is a gradient-boosted forest with second-order
 matches or beats tuned XGBoost on most tasks; `'mlp'` is a one-hidden-layer
 neural net (classification only) for boundaries an axis-aligned tree ensemble
 renders poorly. All three run in the zero-dependency core and are
-deterministic.
+deterministic. Distillation feature columns must be numeric: encode
+categorical text before distilling (the in-context `knn5-incontext` handles
+text features itself; the distillers do not).
 
 When the teacher gives calibrated probabilities (as a foundation model does),
 distill its whole distribution instead of its hard label with `proba` and
@@ -220,7 +222,7 @@ hard label throws away.
 -- distill TabFM's predicted probabilities (columns p_stay, p_churn), while the
 -- true `churned` label scores the holdout
 SELECT model_id, holdout_metric FROM distill_predict(
-  'SELECT tenure, spend, plan, p_stay, p_churn, churned FROM scored',
+  'SELECT tenure, spend, p_stay, p_churn, churned FROM scored',
   '{"target":"churned","proba":["p_stay","p_churn"],
     "classes":["stay","churn"],"student_id":"churn-soft"}');
 ```
@@ -270,7 +272,7 @@ import sqlite3, sqlite_predict
 
 db = sqlite3.connect("app.db")
 sqlite_predict.load(db)
-db.execute("SELECT * FROM forecast('SELECT ts, value FROM readings', 24)")
+db.execute("SELECT forecast(ts, value, 24) FROM readings")
 ```
 
 Or drop the extension into any SQLite client directly. Three ways, in order of
