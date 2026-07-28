@@ -24,6 +24,14 @@
   --sl-color-black: hsl(30, 8%, 6%); /* #0F0E0D warm near-black */
 }
 
+/* Landing hero. Starlight pads the hero block by up to ~10rem top and bottom on
+ * wide viewports, which drops the title far below the header and leaves a big
+ * gap before the first section. Trim to a calmer rhythm. `div.hero` outranks
+ * Starlight's :where()-scoped `.hero` without !important. */
+div.hero {
+  padding-block: 2.5rem 3.5rem;
+}
+
 :root[data-theme="light"] {
   --sl-color-accent-high: hsl(20, 95%, 34%);
   --sl-color-accent: hsl(19, 100%, 50%);
