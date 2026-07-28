@@ -5,12 +5,12 @@
  * serving path (make loadable-onnx, -DSQLITE_PREDICT_ONNX). This file is
  * the only one that links onnxruntime; the core build never sees it.
  *
- * This pass implements the "vector" io_spec layout: a self-contained,
- * pre-trained model that maps a feature vector to a prediction (a
- * distilled student, or any exported tabular classifier/regressor). The
- * "in_context" layout (a teacher such as TabFM that ingests the training
- * rows as context) is the next pass; it is validated against real weights
- * on the gated GPU CI job.
+ * Two io_spec layouts are implemented: "vector" (a self-contained,
+ * pre-trained model mapping a feature vector to a prediction — a
+ * distilled student, or any exported tabular classifier/regressor) and
+ * "in_context" (a teacher such as TabFM that ingests the training rows
+ * as context on every call). The in_context path is validated against
+ * real weights on the gated GPU CI job.
  *
  * Performance shape (see the RFC): the expensive costs are session
  * creation and weight load, so sessions are cached process-global keyed by
@@ -328,34 +328,14 @@ static int json_flag(sqlite3 *db, const char *json, const char *path) {
   return on;
 }
 
-/* json array at path -> sqlite3_malloc'd char*[]; *n set. 0 on success. */
+/* json array at path -> sqlite3_malloc'd char*[]; *n set. 0 on success.
+ * Absent/invalid arrays yield an empty result: these fields are optional
+ * in an io_spec, so the callers treat empty as "not declared". */
 static int json_arr(sqlite3 *db, const char *json, const char *path,
                     char ***out, int *n) {
-  *out = NULL;
-  *n = 0;
-  sqlite3_stmt *s = NULL;
-  if (sqlite3_prepare_v2(
-          db, "SELECT value FROM json_each(?1, ?2)", -1, &s, NULL) != SQLITE_OK)
-    return 1;
-  sqlite3_bind_text(s, 1, json, -1, SQLITE_STATIC);
-  sqlite3_bind_text(s, 2, path, -1, SQLITE_STATIC);
-  int cap = 0;
-  int rc = 0;
-  while (sqlite3_step(s) == SQLITE_ROW) {
-    if (*n == cap) {
-      cap = cap ? cap * 2 : 8;
-      char **g = sqlite3_realloc(*out, sizeof(char *) * cap);
-      if (!g) {
-        rc = 1;
-        break;
-      }
-      *out = g;
-    }
-    (*out)[*n] =
-        sqlite3_mprintf("%s", (const char *)sqlite3_column_text(s, 0));
-    (*n)++;
-  }
-  sqlite3_finalize(s);
+  char *e = NULL;
+  int rc = predict0_json_str_array(db, json, path, out, n, &e);
+  sqlite3_free(e);
   return rc;
 }
 
@@ -522,6 +502,23 @@ static int onnx_build_session(const predict0_model_row *model,
   }
 
   if (model->weights_uri) {
+    /* content-address check (RFC §6.2): the file must still hash to the
+     * content_hash recorded at registration. Runs once per session-cache
+     * miss, not per call. */
+    char hex[PREDICT_HEX_BUFSIZE];
+    char *herr = NULL;
+    if (predict0_hash_file(model->weights_uri, hex, &herr) != SQLITE_OK) {
+      rc = SQLITE_ERROR;
+      *errmsg = herr;
+      goto fail;
+    }
+    if (model->content_hash && strcmp(hex, model->content_hash) != 0) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf(
+          "%s: weights file does not match the registered content_hash: %s",
+          PREDICT_ERR_MODEL_HASH, model->weights_uri);
+      goto fail;
+    }
     BUILD_CHECK(g_ort->CreateSession(g_env, model->weights_uri, so, out),
                 PREDICT_ERR_INFERENCE, "CreateSession from file");
   } else if (model->weights && model->weights_len > 0) {
@@ -1215,7 +1212,6 @@ int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
   return SQLITE_OK;
 }
 
-
 /* Map the apply query's feature columns (1..an-1) to model feature slots.
  * With names in io->features, match by name (an exact set). Without names,
  * map positionally (apply column order = model feature order). Sets *F, the
@@ -1262,6 +1258,8 @@ static int onnx_vector(sqlite3 *db, const char *model_id, const char *apply_sql,
                        const predict0_backend_opts *opts, const onnx_io *io,
                        OrtSession *session, predict0_result **out_rows,
                        int *out_n, char **errmsg) {
+  UNUSED_PARAMETER(model_id);
+  UNUSED_PARAMETER(opts);
   int classify = strcmp(io->output_kind, "value") != 0;
   int rc = SQLITE_OK;
 
@@ -1579,6 +1577,8 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
                           const predict0_backend_opts *opts, const onnx_io *io,
                           OrtSession *session, predict0_result **out_rows,
                           int *out_n, char **errmsg) {
+  UNUSED_PARAMETER(model_id);
+  UNUSED_PARAMETER(opts);
   int classify = strcmp(io->output_kind, "value") != 0;
   int rc = SQLITE_OK;
 
@@ -1637,10 +1637,10 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
         PREDICT_ERR_SCHEMA, F, train_F);
     goto done;
   }
-  if (F > 64) { /* the per-row stack buffer below is fixed at 64 */
+  if (F > PREDICT_MAX_FEAT) { /* per-row stack buffer is sized to the cap */
     rc = SQLITE_ERROR;
-    *errmsg = sqlite3_mprintf("%s: too many features (%d; max 64)",
-                              PREDICT_ERR_SCHEMA, F);
+    *errmsg = sqlite3_mprintf("%s: too many features (%d; max %d)",
+                              PREDICT_ERR_SCHEMA, F, PREDICT_MAX_FEAT);
     goto done;
   }
 
@@ -1668,7 +1668,7 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
       out->ref_t =
           sqlite3_mprintf("%s", (const char *)sqlite3_column_text(as, 0));
 
-    f32 feat[64];
+    f32 feat[PREDICT_MAX_FEAT];
     int bad = 0;
     for (int i = 1; i < an; i++) {
       int ct = sqlite3_column_type(as, i);
@@ -1846,10 +1846,10 @@ int predict0_onnx_predict(sqlite3 *db, const char *model_id,
   rc = onnx_io_parse(db, model->io_spec, &io, errmsg);
   if (rc != SQLITE_OK)
     return rc;
-  if (io.nfeat > 64) {
+  if (io.nfeat > PREDICT_MAX_FEAT) {
     onnx_io_free(&io);
-    *errmsg = sqlite3_mprintf("%s: model declares %d features (max 64)",
-                              PREDICT_ERR_IO_SPEC, io.nfeat);
+    *errmsg = sqlite3_mprintf("%s: model declares %d features (max %d)",
+                              PREDICT_ERR_IO_SPEC, io.nfeat, PREDICT_MAX_FEAT);
     return SQLITE_ERROR;
   }
 

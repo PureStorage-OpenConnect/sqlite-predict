@@ -1,4 +1,4 @@
-"""distill_forecast() and the native forecast student (PSFCST, RFC 0005 §4.1.6).
+"""distill_forecast() and the native forecast student (PSFCST, RFC 0005 §4.1.3).
 
 distill_forecast fits a multi-output regression MLP that maps an instance-
 normalized context window to a horizon of future values, reproducing a
@@ -9,18 +9,14 @@ The tests train small and fast via the `epochs`/`hidden` options and use a
 clean, learnable multi-seasonal wave so the student's forecast is checkable.
 """
 
+import hashlib
 import json
-import math
 import sqlite3
 
 import pytest
+from synthetic import wave as _wave
 
-L, H, PERIOD = 32, 8, 16
-
-
-def _wave(t):
-    return (10.0 + 5.0 * math.sin(2 * math.pi * t / PERIOD)
-            + 2.0 * math.sin(2 * math.pi * t / (PERIOD * 2)))
+L, H = 32, 8
 
 
 def _cols(ncol):
@@ -233,13 +229,15 @@ def test_quantile_bad_levels_rejected(db):
 def test_forecast_rejects_a_malformed_student_blob(db):
     # the registry is writable by any SQL caller (RFC §6.2): a truncated PSFCST
     # blob (valid magic, nfeat present, nothing after) must be rejected cleanly,
-    # never crash the serving path.
+    # never crash the serving path. The content_hash is correct so the blob
+    # reaches the deserializer rather than tripping the hash check first.
     _train(db)  # ensures _predict_models exists
     _load_series(db)
+    blob = b"PSFCST01\x05\x00\x00\x00"
     db.execute(
         "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
-        " content_hash, license) VALUES ('bad','student','tree',?,'x',"
-        "'unspecified')", (b"PSFCST01\x05\x00\x00\x00",))
+        " content_hash, license) VALUES ('bad','student','tree',?,?,"
+        "'unspecified')", (blob, hashlib.sha256(blob).hexdigest()))
     with pytest.raises(sqlite3.OperationalError):
         db.execute("SELECT forecast(ts, value, ?,"
                    " json_object('model','bad')) FROM s", (H,)).fetchall()
@@ -305,15 +303,32 @@ def test_auto_conformal_skips_students(db):
     assert doc["model"] in ("theta-classic", "stub-seasonal-naive", "tsb")
 
 
-def test_auto_errors_on_corrupt_registered_student(db):
-    # discovery must not paper over a corrupt registry row
+def test_auto_errors_on_tampered_registered_student(db):
+    # discovery must not paper over a tampered registry row: weights that do
+    # not match their content_hash are caught before the deserializer runs
     _train(db)
     _load_series(db)
     db.execute(
         "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
         " content_hash, license) VALUES ('bad','student','tree',?,'x',"
         "'unspecified')", (b"PSFCST01\x05\x00\x00\x00",))
-    with pytest.raises(sqlite3.OperationalError, match="invalid forecast"):
+    with pytest.raises(sqlite3.OperationalError,
+                       match="PREDICT_ERR_MODEL_HASH"):
+        db.execute("SELECT forecast(ts, value, ?, '{\"model\":\"auto\"}')"
+                   " FROM s", (H,)).fetchone()
+
+
+def test_auto_errors_on_corrupt_registered_student(db):
+    # hash intact but the blob itself is garbage: the hash check passes and
+    # the deserializer must still reject the row loudly
+    _train(db)
+    _load_series(db)
+    blob = b"PSFCST01\x05\x00\x00\x00"
+    db.execute(
+        "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+        " content_hash, license) VALUES ('bad','student','tree',?,?,"
+        "'unspecified')", (blob, hashlib.sha256(blob).hexdigest()))
+    with pytest.raises(sqlite3.OperationalError, match="PREDICT_ERR_SCHEMA"):
         db.execute("SELECT forecast(ts, value, ?, '{\"model\":\"auto\"}')"
                    " FROM s", (H,)).fetchone()
 

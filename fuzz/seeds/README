@@ -1,0 +1,1 @@
+aggopts1 and opts1 deliberately keep the removed "receipt":0 key: unknown option keys are fuzz fodder for the fail-loud options-rejection path.

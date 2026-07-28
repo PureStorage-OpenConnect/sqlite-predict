@@ -1,118 +1,74 @@
-# Releasing & claiming sqlite-predict
+# Releasing sqlite-predict
 
-Two separate jobs: **claim the names** (do this before any public mention, so
-nobody squats them) and **cut a release** (the functional launch). The generic
-`sqlite-predict` name is the one worth claiming everywhere; the everpure-scoped /
-prefixed packages are brand mirrors and lower urgency.
+Releases are tag-driven. Pushing a `v*` tag fires four workflows that
+build and publish everything; the manual part is syncing the version,
+committing, and tagging.
 
-Do everything under **org-owned accounts** (everpure / Pure Storage), never a
+## Cut a release
+
+1. Sync every manifest to the new version:
+
+   ```sh
+   make sync-version V=0.0.2
+   ```
+
+   This writes `VERSION` and syncs it into `bindings/rust/Cargo.toml`,
+   `bindings/python/pyproject.toml` (PEP 440 form, e.g. `0.0.1-alpha.5`
+   becomes `0.0.1a5`), `bindings/python/sqlite_predict/__init__.py`
+   (`__version__`), and `bindings/node/package.json` (including the
+   per-platform `optionalDependencies` pins). The C header derives its
+   version from `VERSION` at build time and needs no edit.
+
+2. Commit the version bump.
+
+3. Tag and push:
+
+   ```sh
+   git tag v0.0.2
+   git push && git push --tags
+   ```
+
+That is the whole procedure. Registry versions (PyPI, crates.io, npm)
+are immutable: if a publish job fails partway, fix the cause and cut a
+fresh version rather than re-tagging.
+
+## What the tag triggers
+
+All four workflows in `.github/workflows/` fire on every `v*` tag push:
+
+| Workflow | Publishes | Credentials |
+| --- | --- | --- |
+| `release.yml` | GitHub Release: prebuilt loadables for Linux, macOS, and Windows, the single-file amalgamation (`sqlite-predict.c`), and `SHA256SUMS`, with generated release notes | built-in `GITHUB_TOKEN` |
+| `wheels.yml` | Python wheels (manylinux and macOS, compiler-free `pip install sqlite-predict`) plus the sdist, to PyPI | trusted publishing (OIDC), no stored token |
+| `npm.yml` | the per-platform binary packages (`sqlite-predict-darwin-arm64`, `sqlite-predict-darwin-x64`, `sqlite-predict-linux-x64`, `sqlite-predict-linux-arm64`, `sqlite-predict-windows-x64`), then the main `sqlite-predict` package with `optionalDependencies` pinned to the same version | `NPM_TOKEN` repo secret |
+| `crate.yml` | the `sqlite-predict` crate to crates.io (the crate's `build.rs` compiles the bundled amalgamation on the user's machine) | `CARGO_REGISTRY_TOKEN` repo secret |
+
+`npm.yml` and `crate.yml` also support `workflow_dispatch` with an
+explicit version input, for re-running a single registry publish
+without a new tag.
+
+## One-time setup (already done, recorded for repo moves)
+
+- **PyPI trusted publisher** on the `sqlite-predict` project: owner
+  `PureStorage-OpenConnect`, repository `sqlite-predict`, workflow
+  `wheels.yml`, environment `pypi`. A matching `pypi` GitHub
+  environment must exist (Settings, then Environments). If the repo
+  moves, update the trusted publisher's owner.
+- **`NPM_TOKEN`**: an npm automation token for the org account, stored
+  as a repo secret.
+- **`CARGO_REGISTRY_TOKEN`**: a crates.io API token for the org
+  account, stored as a repo secret.
+
+All registry accounts are org-owned (everpure / Pure Storage), never a
 personal login, so publishing survives people leaving.
 
----
+## Names claimed as of alpha.5
 
-## Part 1 — Claim the names now
+The generic `sqlite-predict` name is claimed and functional on all
+three flat-namespace registries: PyPI, crates.io, and npm (the main
+package plus the five per-platform binary packages listed above).
+GitHub Releases need no claim; the repo owns them.
 
-Flat-namespace registries are first-come-first-served, so these three are the
-real squat risk. Each artifact below is already built and verified in this repo;
-you only need the account. Bump the version and re-run for later releases.
-
-### PyPI — `sqlite-predict`
-
-1. Create a PyPI account, then an API token (Account settings -> API tokens).
-2. Build (or reuse the built) sdist and upload:
-
-   ```sh
-   make python-src
-   python -m build --sdist --outdir bindings/python/dist bindings/python
-   python -m twine upload -u __token__ -p pypi-XXXX \
-     bindings/python/dist/sqlite_predict-*.tar.gz
-   ```
-
-   The sdist claims the name and is installable (it compiles on the user's
-   machine). Compiler-free **wheels** come from the tag pipeline in Part 2.
-
-### crates.io — `sqlite-predict`
-
-1. Log in to crates.io with the org GitHub account; create an API token.
-2. Publish (the crate compiles the amalgamation itself; fully functional on
-   install):
-
-   ```sh
-   cargo login <token>
-   make rust-src
-   cargo publish --manifest-path bindings/rust/Cargo.toml --allow-dirty
-   ```
-
-   `--allow-dirty` is needed because `csrc/` is generated (git-ignored); it is
-   still included in the published crate via `Cargo.toml`'s `include`.
-
-### npm — `sqlite-predict` (unscoped)
-
-1. `npm login` as the org account.
-2. Publish the main package to claim the name:
-
-   ```sh
-   cd bindings/node && npm publish --access public
-   ```
-
-   NOTE: this **claims the name but is not yet functional.** The package resolves
-   its binary from per-platform packages (`sqlite-predict-<platform>`) that must
-   be built and published by CI (not wired yet — see "Open follow-ups"). Claim
-   now; make it functional before you announce npm.
-
-### GitHub Releases — no account
-
-Nothing to claim; the repo owns it. See Part 2.
-
----
-
-## Part 2 — Cut a release
-
-Tagging drives everything else automatically (built-in `GITHUB_TOKEN`, no
-external secrets for the binaries):
-
-```sh
-git tag v0.0.1-alpha.1
-git push origin v0.0.1-alpha.1
-```
-
-- `release.yml` builds Linux/macOS/Windows loadables + the amalgamation
-  (`sqlite-predict.c`) + `SHA256SUMS` and publishes a GitHub Release.
-- `wheels.yml` builds the Python wheels + sdist and, once PyPI trusted
-  publishing is configured (below), uploads them so `pip install sqlite-predict`
-  is compiler-free.
-
-### PyPI trusted publishing (one-time, recommended over tokens)
-
-On PyPI -> the `sqlite-predict` project -> Publishing -> add a trusted publisher:
-
-| field | value |
-| --- | --- |
-| Owner | `PureStorage-OpenConnect` (or the everpure org, if the repo moves) |
-| Repository | `sqlite-predict` |
-| Workflow | `wheels.yml` |
-| Environment | `pypi` |
-
-Then create a `pypi` GitHub environment (Settings -> Environments). After that,
-a `v*` tag publishes wheels with no token stored in GitHub.
-
----
-
-## Part 3 — Brand mirrors (everpure)
-
-Lower urgency: `@everpure/*` on npm is already yours by scope, and the prefixed
-PyPI/crates names aren't the discoverable target. When ready, publish the same
-content under the branded names (`everpure-sqlite-predict` on PyPI/crates,
-`@everpure/sqlite-predict` on npm) as thin mirror packages. Ask and this can be
-wired into the release workflows.
-
----
-
-## Open follow-ups (not blocking the name claims)
-
-- **npm per-platform binary packages** + a workflow to build/publish them, so
-  `npm install sqlite-predict` ships a working binary (today only the name is
-  claimable). Same pattern as the wheels.
-- **Windows/musl/arm wheel coverage** in `wheels.yml` (currently CPython
-  manylinux + macOS).
-- The brand mirror packages in Part 3.
+The everpure-branded mirror names (`everpure-sqlite-predict` on PyPI
+and crates.io, `@everpure/sqlite-predict` on npm) are unclaimed and low
+urgency; the npm scope already belongs to the org.

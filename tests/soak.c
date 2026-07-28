@@ -21,7 +21,7 @@ static int run_discard(sqlite3 *db, const char *sql, int expect_ok) {
   if (expect_ok && rc != SQLITE_DONE)
     return fail(sql, db);
   if (!expect_ok && rc == SQLITE_DONE)
-    return fail("expected error but succeeded", db);
+    return fail(sql, db); /* expected error but succeeded */
   return 0;
 }
 
@@ -97,19 +97,22 @@ int main(void) {
       run_discard(db,
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_bad',"
-                  "'student','tree',x'505354524545303100000000','x',"
+                  "'student','tree',x'505354524545303100000000',"
+                  "'4a60558e205f4cacd258c09f4f35f423904372ca3b59c6e97dc956c40229795f',"
                   "'unspecified')",
                   1) ||
       run_discard(db,
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_gbt_bad',"
-                  "'student','tree',x'505347425430310000000000','x',"
+                  "'student','tree',x'505347425430310000000000',"
+                  "'e96201bfdfb18da27d3ee69d5016ead08ec45ca2117b67da67e68ee5632917af',"
                   "'unspecified')",
                   1) ||
       run_discard(db,
                   "INSERT INTO _predict_models (model_id, kind, runtime,"
                   " weights, content_hash, license) VALUES ('soak_mlp_bad',"
-                  "'student','tree',x'50534D4C5030310000000000','x',"
+                  "'student','tree',x'50534D4C5030310000000000',"
+                  "'146e6deb7739ca56ed568808f283ad9242bbf78edf1fe803648a905d2b13aecf',"
                   "'unspecified')",
                   1))
     goto done_fail;
@@ -126,6 +129,7 @@ int main(void) {
               "\"epochs\":50}')",
               1);
 
+  int fails = 0;
   for (int i = 0; i < 50; i++) {
     /* serving loop: the aggregate forms (the one calling convention for
      * forecast/detect_anomalies) + predict, across models and options */
@@ -152,107 +156,107 @@ int main(void) {
       goto done_fail;
 
     /* gbt-student (forest runtime) + tree/forest error paths */
-    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+    fails += run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_gbt\"}')",
                 1);
-    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+    fails += run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_knn\"}')",
                 1);
-    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+    fails += run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_soft\"}')",
                 1);
-    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+    fails += run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_mlp\"}')",
                 1);
-    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+    fails += run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_bad\"}')",
                 0);
-    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+    fails += run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_gbt_bad\"}')",
                 0);
-    run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
+    fails += run_discard(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM tab',"
                     " '{\"model\":\"soak_mlp_bad\"}')",
                 0);
-    run_discard(db,
+    fails += run_discard(db,
                 "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                 " '{\"target\":\"label\",\"student_id\":\"soak_student\"}')",
                 0);
-    run_discard(db, "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
+    fails += run_discard(db, "SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                     " '{\"student_id\":\"nope\"}')",
                 0);
 
     /* auto selection, conformal intervals, backtest() (grouped, gapped) --
      * exercises the rolling-origin backtest scratch allocations */
-    run_discard(db, "SELECT forecast(ts, value, 6,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"model\":\"auto\"}') FROM series",
                 1);
-    run_discard(db, "SELECT forecast(ts, value, 6,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"interval_method\":\"conformal\"}') FROM series",
                 1);
-    run_discard(db, "SELECT grp, forecast(ts, value, 4,"
+    fails += run_discard(db, "SELECT grp, forecast(ts, value, 4,"
                     " '{\"model\":\"auto\",\"interval_method\":"
                     "\"conformal\",\"folds\":8,\"gap\":2}')"
                     " FROM series GROUP BY grp",
                 1);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
                     " '{\"folds\":10}')",
                 1);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
                     " '{\"model\":\"auto\",\"interval_method\":\"conformal\","
                     "\"folds\":12}')",
                 1);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
                     " 5, '{\"group_cols\":[\"grp\"],\"gap\":3}')",
                 1);
     /* option error + edge paths */
-    run_discard(db, "SELECT forecast(ts, value, 6,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"interval_method\":\"bogus\"}') FROM series",
                 0);
-    run_discard(db, "SELECT forecast(ts, value, 6, '{\"folds\":0}')"
+    fails += run_discard(db, "SELECT forecast(ts, value, 6, '{\"folds\":0}')"
                     " FROM series",
                 0);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
                     " '{\"model\":\"nope\"}')",
                 0);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 6,"
                     " '{\"gap\":100000}')",
                 1);
 
     /* tsb + auto candidate sets (statistical models; the student-candidate
      * path is exercised by the onnx build) */
-    run_discard(db, "SELECT forecast(ts, value, 6,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"model\":\"tsb\"}') FROM series",
                 1);
-    run_discard(db, "SELECT forecast(ts, value, 6,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"model\":\"auto\",\"candidates\":[\"tsb\","
                     "\"theta-classic\"]}') FROM series",
                 1);
-    run_discard(db, "SELECT grp, forecast(ts, value, 4,"
+    fails += run_discard(db, "SELECT grp, forecast(ts, value, 4,"
                     " '{\"model\":\"auto\",\"candidates\":"
                     "[\"stub-seasonal-naive\",\"tsb\"],\"gap\":2}')"
                     " FROM series GROUP BY grp",
                 1);
-    run_discard(db, "SELECT forecast(ts, value, 6,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"candidates\":[\"tsb\"]}') FROM series",
-                0);
-    run_discard(db, "SELECT forecast(ts, value, 6,"
+                1);
+    fails += run_discard(db, "SELECT forecast(ts, value, 6,"
                     " '{\"model\":\"auto\",\"candidates\":[\"nope\"]}')"
                     " FROM series",
                 0);
-    run_discard(db, "SELECT detect_anomalies(ts, value,"
+    fails += run_discard(db, "SELECT detect_anomalies(ts, value,"
                     " '{\"model\":\"tsb\"}') FROM series",
                 0);
 
     /* forecast student: direct serve, and as an auto candidate (exercises
      * resolve_candidates student load/free + fcst_point + fcst_run) */
-    run_discard(db, "SELECT forecast(ts, value, 2,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 2,"
                     " '{\"model\":\"soak_fcst\"}') FROM series",
                 1);
-    run_discard(db, "SELECT forecast(ts, value, 2,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 2,"
                     " '{\"model\":\"auto\",\"candidates\":[\"theta-classic\","
                     "\"soak_fcst\"]}') FROM series",
                 1);
-    run_discard(db, "SELECT forecast(ts, value, 2,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 2,"
                     " '{\"model\":\"auto\",\"candidates\":[\"soak_fcst\"],"
                     "\"interval_method\":\"conformal\"}') FROM series",
                 0);
@@ -260,75 +264,80 @@ int main(void) {
     /* error paths every iteration too: aggregate misuse and option
      * rejection, plus backtest's collect_series failure branches, so
      * valgrind sees the partial-series cleanup under load */
-    run_discard(db, "SELECT forecast('SELECT ts FROM series', value, 3)"
+    fails += run_discard(db, "SELECT forecast('SELECT ts FROM series', value, 3)"
                     " FROM series",
                 0);
-    run_discard(db, "SELECT forecast('SELECT ts, value FROM series', 3)", 0);
-    run_discard(db, "SELECT forecast(ts, value, 3, '{\"bogus\":1}')"
+    fails += run_discard(db, "SELECT forecast('SELECT ts, value FROM series', 3)", 0);
+    fails += run_discard(db, "SELECT forecast(ts, value, 3, '{\"bogus\":1}')"
                     " FROM series",
                 0);
-    run_discard(db, "SELECT forecast(ts, value, 3,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 3,"
                     " '{\"time_col\":\"nope\"}') FROM series",
                 0);
-    run_discard(db, "SELECT forecast(ts, value, 3,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 3,"
                     " '{\"group_cols\":[\"grp\"]}') FROM series",
                 0);
-    run_discard(db, "SELECT forecast(ts, value, 3, '{\"receipt\":0}')"
+    fails += run_discard(db, "SELECT forecast(ts, value, 3, '{\"receipt\":0}')"
                     " FROM series",
                 0);
-    run_discard(db, "SELECT forecast(ts, value, rowid % 2 + 1) FROM series",
+    fails += run_discard(db, "SELECT forecast(ts, value, rowid % 2 + 1) FROM series",
                 0);
-    run_discard(db, "SELECT forecast(ts, value, 4, CASE WHEN rowid % 2"
+    fails += run_discard(db, "SELECT forecast(ts, value, 4, CASE WHEN rowid % 2"
                     " THEN '{}' ELSE NULL END) FROM series",
                 0);
-    run_discard(db, "SELECT forecast(ts, value, 0) FROM series", 0);
-    run_discard(db, "SELECT forecast(ts, value, 4) FROM series WHERE 0", 1);
-    run_discard(db, "SELECT * FROM backtest('DELETE FROM series', 3)", 0);
-    run_discard(db, "SELECT * FROM backtest('NOT SQL', 3)", 0);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts FROM series', 3)", 0);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 3,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 0) FROM series", 0);
+    fails += run_discard(db, "SELECT forecast(ts, value, 4) FROM series WHERE 0", 1);
+    fails += run_discard(db, "SELECT * FROM backtest('DELETE FROM series', 3)", 0);
+    fails += run_discard(db, "SELECT * FROM backtest('NOT SQL', 3)", 0);
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts FROM series', 3)", 0);
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts, value FROM series', 3,"
                     " '{\"time_col\":\"nope\"}')",
                 0);
-    run_discard(db, "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
+    fails += run_discard(db, "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
                     " 3, '{\"group_cols\":[\"nope\"]}')",
                 0);
     /* duplicate option keys (the CI fuzzer's leak): last-wins, no leak */
-    run_discard(db, "SELECT forecast(ts, value, 3,"
+    fails += run_discard(db, "SELECT forecast(ts, value, 3,"
                     " '{\"model\":\"theta-classic\",\"model\":"
                     "\"stub-seasonal-naive\"}') FROM series",
                 1);
-    run_discard(db,
+    fails += run_discard(db,
                 "SELECT * FROM backtest('SELECT ts, value, grp FROM series',"
                 " 3, '{\"model\":\"theta-classic\",\"model\":"
                 "\"stub-seasonal-naive\",\"time_col\":\"ts\",\"time_col\":"
                 "\"ts\",\"group_cols\":[\"grp\"],\"group_cols\":[\"grp\"]}')",
                 1);
-    run_discard(db,
+    fails += run_discard(db,
                 "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
                 " 'SELECT id, f1, f2 FROM tab',"
                 " '{\"target\":\"label\",\"task\":\"classify\",\"task\":"
                 "\"classify\",\"model\":\"knn5-incontext\",\"model\":"
                 "\"knn5-incontext\"}')",
                 1);
-    run_discard(db,
+    fails += run_discard(db,
                 "SELECT * FROM predict('SELECT f1, f2, label FROM tab',"
                 " 'SELECT id, f1 FROM tab', '{\"target\":\"label\"}')",
                 0);
-    run_discard(db, "SELECT predict_ulid('not a time')", 0);
+    fails += run_discard(db, "SELECT predict_ulid('not a time')", 0);
 
     /* expansion functions: round trips + garbage documents */
-    run_discard(db, "SELECT * FROM forecast_rows((SELECT forecast(ts, value,"
+    fails += run_discard(db, "SELECT * FROM forecast_rows((SELECT forecast(ts, value,"
                     " 4) FROM series))",
                 1);
-    run_discard(db, "SELECT * FROM anomaly_rows((SELECT detect_anomalies(ts,"
+    fails += run_discard(db, "SELECT * FROM anomaly_rows((SELECT detect_anomalies(ts,"
                     " value) FROM series))",
                 1);
-    run_discard(db, "SELECT * FROM forecast_rows('not json')", 0);
-    run_discard(db, "SELECT * FROM anomaly_rows('[1,2]')", 0);
-    run_discard(db, "SELECT * FROM forecast_rows(NULL)", 1);
+    fails += run_discard(db, "SELECT * FROM forecast_rows('not json')", 0);
+    fails += run_discard(db, "SELECT * FROM anomaly_rows('[1,2]')", 0);
+    fails += run_discard(db, "SELECT * FROM forecast_rows(NULL)", 1);
   }
 
   sqlite3_close(db);
+  if (fails) {
+    fprintf(stderr, "soak: %d statement(s) misbehaved\n", fails);
+    sqlite3_close(db);
+    return 1;
+  }
   fprintf(stderr, "soak ok\n");
   return 0;
 

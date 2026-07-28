@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* Native student model format and serving runtime (RFC 0005 §4.1.6).
+/* Native student model format and serving runtime (RFC 0005 §4.1.3).
  *
  * The serving/format half of the distillation feature: the blob layouts
  * (PSTREE01 / PSGBT01 / PSMLP01), their bounds-checked deserializers, the
@@ -15,12 +15,12 @@
 
 #include "predict-internal.h"
 
-#define TREE_MAX_FEAT 64 /* apply-time feature cap; bounds a student's nfeat */
+#define TREE_MAX_FEAT PREDICT_MAX_FEAT /* alias; see predict-internal.h */
 #define FCST_MAX_CONTEXT 4096 /* forecast student: max context length (nfeat) */
 #define FCST_MAX_QUANT 64 /* forecast student: max quantile levels */
 /* Forecast student with a linear skip: the hidden path is a small correction on
  * the dominant linear map, so its output is scaled by this. Shared by the
- * trainer (train_mlp) and the serving forward (mlp_forward). */
+ * trainer (train_mlp) and the serving forward (predict0_mlp_forward). */
 #define FCST_RES_SCALE 0.1
 
 /* A decision-tree node (also the weak learner of a gbt forest). */
@@ -79,9 +79,9 @@ typedef struct {
 /* Serialize a trained student to its inline blob (caller frees *blob_out with
  * sqlite3_free). Used by distill_predict(); the matching deserializers are internal to
  * the runtime and picked by blob magic. */
-int tree_serialize(const Tree *t, void **blob_out, int *len_out);
-int forest_serialize(const Forest *f, void **blob_out, int *len_out);
-int mlp_serialize(const MLP *m, void **blob_out, int *len_out);
+int predict0_tree_serialize(const Tree *t, void **blob_out, int *len_out);
+int predict0_forest_serialize(const Forest *f, void **blob_out, int *len_out);
+int predict0_mlp_serialize(const MLP *m, void **blob_out, int *len_out);
 
 /* Forecast student (PSFCST01): a multi-output regression MLP whose outputs are
  * `nquant` quantiles per horizon step (nout = horizon * nquant), distilled from
@@ -95,25 +95,25 @@ typedef struct {
   f32 *levels; /* [nquant] ascending; {0.5} for a point student */
 } ForecastStudent;
 
-int fcst_serialize(const ForecastStudent *fs, void **blob_out, int *len_out);
-int fcst_deserialize(const void *blob, int len, ForecastStudent *fs,
+int predict0_fcst_serialize(const ForecastStudent *fs, void **blob_out, int *len_out);
+int predict0_fcst_deserialize(const void *blob, int len, ForecastStudent *fs,
                      char **errmsg);
-void fcst_student_free(ForecastStudent *fs);
+void predict0_fcst_student_free(ForecastStudent *fs);
 
 /* Free a student's owned memory. */
-void tree_free(Tree *t);
-void forest_free(Forest *f);
-void mlp_free(MLP *m);
+void predict0_tree_free(Tree *t);
+void predict0_forest_free(Forest *f);
+void predict0_mlp_free(MLP *m);
 
 /* Inference, shared by predict0_tree_run and distill_predict()'s holdout evaluation. */
-int tree_walk(const Tree *t, const f32 *x);
-f32 reg_tree_value(const TreeNode *nd, int guard, const f32 *x);
-int forest_predict_row(const Forest *f, const f32 *x, f64 *scbuf, char **pred,
+int predict0_tree_walk(const Tree *t, const f32 *x);
+f32 predict0_reg_tree_value(const TreeNode *nd, int guard, const f32 *x);
+int predict0_forest_predict_row(const Forest *f, const f32 *x, f64 *scbuf, char **pred,
                        f64 *conf, int *has_conf);
-int mlp_predict_row(const MLP *m, const f32 *x, f32 *hid, f32 *out, char **pred,
+int predict0_mlp_predict_row(const MLP *m, const f32 *x, f32 *hid, f32 *out, char **pred,
                     f64 *conf, int *has_conf);
 /* Raw forward pass: writes hid[nhid] and out[nout]. Used by forecast()
  * serving, which supplies an instance-normalized window as x. */
-void mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out);
+void predict0_mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out);
 
 #endif /* PREDICT_STUDENT_H */

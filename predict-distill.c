@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* distill_predict() -- RFC 0005 §4.2.4 -- and the native-student TRAINERS.
+/* distill_predict() -- RFC 0005 §4.2.6 -- and the native-student TRAINERS.
  *
  * The training half of distillation: the CART / gradient-boosted / MLP
  * trainers and the distill_predict() table-valued function. distill_predict() fits a student
@@ -256,7 +256,7 @@ done:
   sqlite3_free(xs);
   sqlite3_free(dout);
   if (rc != SQLITE_OK)
-    mlp_free(m);
+    predict0_mlp_free(m);
   return rc;
 }
 
@@ -605,7 +605,7 @@ static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
       }
       for (int i = 0; i < n; i++)
         F[(size_t)i * nscore + s] +=
-            fo->lr * reg_tree_value(b.nodes, b.n, &X[(size_t)i * nfeat]);
+            fo->lr * predict0_reg_tree_value(b.nodes, b.n, &X[(size_t)i * nfeat]);
 
       int need = fo->tree_off[nt] + b.n;
       if (need > pool_cap) {
@@ -634,7 +634,7 @@ done:
   sqlite3_free(grad);
   sqlite3_free(hess);
   if (rc != SQLITE_OK)
-    forest_free(fo);
+    predict0_forest_free(fo);
   return rc;
 }
 
@@ -709,46 +709,6 @@ static const char *const DIST_OPTION_KEYS[] = {
     "target", "task",  "student_id", "teacher", "student_kind",
     "proba",  "classes", NULL};
 
-/* Parse a JSON array of strings into a heap array of sqlite3_mprintf'd
- * strings. Returns SQLITE_OK and sets out and n (caller frees each element and
- * the array). On a non-array or parse error, returns SQLITE_ERROR with errmsg
- * set. */
-static int parse_str_array(sqlite3 *db, const char *json, char ***out, int *n,
-                           char **errmsg) {
-  *out = NULL;
-  *n = 0;
-  int cap = 0;
-  sqlite3_stmt *st = NULL;
-  if (sqlite3_prepare_v2(db, "SELECT value FROM json_each(?) WHERE"
-                             " json_type(?) = 'array'",
-                         -1, &st, NULL) != SQLITE_OK) {
-    *errmsg = sqlite3_mprintf("%s: cannot parse option array", PREDICT_ERR_OPTIONS);
-    return SQLITE_ERROR;
-  }
-  sqlite3_bind_text(st, 1, json, -1, SQLITE_STATIC);
-  sqlite3_bind_text(st, 2, json, -1, SQLITE_STATIC);
-  int rc = SQLITE_OK;
-  while (sqlite3_step(st) == SQLITE_ROW) {
-    if (*n == cap) {
-      cap = cap ? cap * 2 : 8;
-      char **g = sqlite3_realloc(*out, sizeof(char *) * cap);
-      if (!g) {
-        rc = SQLITE_NOMEM;
-        break;
-      }
-      *out = g;
-    }
-    (*out)[*n] = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(st, 0));
-    if (!(*out)[*n]) {
-      rc = SQLITE_NOMEM;
-      break;
-    }
-    (*n)++;
-  }
-  sqlite3_finalize(st);
-  return rc;
-}
-
 static int name_index(char *const *arr, int n, const char *s) {
   for (int i = 0; i < n; i++)
     if (strcmp(arr[i], s) == 0)
@@ -773,6 +733,49 @@ static void append_ident(sqlite3_str *s, const char *nm) {
   sqlite3_str_appendchar(s, 1, '"');
 }
 
+/* Hash a serialized student blob and register it under student_id
+ * (kind='student'; runtime='tree' also covers MLP/forest blobs, "native
+ * in-core runtime" as opposed to onnx). hash_out receives the
+ * content_hash hex. Returns SQLITE_OK, or SQLITE_ERROR with *errmsg set
+ * (STUDENT_EXISTS on an id collision). */
+static int register_student(sqlite3 *db, const char *student_id,
+                            const void *blob, int blob_len,
+                            char hash_out[PREDICT_HEX_BUFSIZE],
+                            char **errmsg) {
+  predict0_hasher h;
+  predict0_hash_init(&h);
+  sha256_update(&h.sha, (const u8 *)blob, (usize)blob_len);
+  predict0_hash_hex(&h, hash_out);
+
+  sqlite3_stmt *ins = NULL;
+  if (sqlite3_prepare_v2(
+          db,
+          "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+          " io_spec, content_hash, license) VALUES (?1,'student','tree',?2,"
+          " NULL,?3,'unspecified')",
+          -1, &ins, NULL) != SQLITE_OK) {
+    *errmsg = sqlite3_mprintf("%s: cannot prepare student insert",
+                              PREDICT_ERR_RESOURCE);
+    return SQLITE_ERROR;
+  }
+  sqlite3_bind_text(ins, 1, student_id, -1, SQLITE_STATIC);
+  sqlite3_bind_blob(ins, 2, blob, blob_len, SQLITE_STATIC);
+  sqlite3_bind_text(ins, 3, hash_out, -1, SQLITE_STATIC);
+  int irc = sqlite3_step(ins);
+  sqlite3_finalize(ins);
+  if (irc == SQLITE_CONSTRAINT) {
+    *errmsg = sqlite3_mprintf("%s: student '%s' already exists",
+                              PREDICT_ERR_STUDENT_EXISTS, student_id);
+    return SQLITE_ERROR;
+  }
+  if (irc != SQLITE_DONE) {
+    *errmsg = sqlite3_mprintf("%s: student insert failed: %s",
+                              PREDICT_ERR_RESOURCE, sqlite3_errmsg(db));
+    return SQLITE_ERROR;
+  }
+  return SQLITE_OK;
+}
+
 /* The training pipeline. Fills *res on success. */
 static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
                          DistResult *res, char **errmsg) {
@@ -782,11 +785,8 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
 
   /* ---- 1. introspect train_query columns ---- */
   sqlite3_stmt *iq = NULL;
-  if (sqlite3_prepare_v2(db, tq, -1, &iq, NULL) != SQLITE_OK || !iq) {
-    *errmsg = sqlite3_mprintf("%s: train_query does not parse: %s",
-                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
+  if (predict0_prepare_ro(db, tq, "train_query", &iq, errmsg) != SQLITE_OK)
     return SQLITE_ERROR;
-  }
   int ncol = sqlite3_column_count(iq);
   int target_col = -1;
   char *feat_names[TREE_MAX_FEAT];
@@ -848,7 +848,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
   void *blob = NULL;
   int blob_len = 0;
   int *idx = NULL;
-  char *read_sql = NULL, *apply_sql = NULL, *teacher_sql = NULL, *params = NULL;
+  char *read_sql = NULL, *apply_sql = NULL, *teacher_sql = NULL;
   sqlite3_stmt *rq = NULL, *tqs = NULL;
   char **proba_names = NULL, **soft_labels = NULL; /* soft distillation */
   int nproba = 0, nsoft = 0, *proba_col = NULL;
@@ -885,9 +885,11 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
                                 PREDICT_ERR_OPTIONS);
       goto done;
     }
-    if (parse_str_array(db, o->proba, &proba_names, &nproba, errmsg) !=
+    if (predict0_json_str_array(db, o->proba, NULL, &proba_names,
+                                &nproba, errmsg) !=
             SQLITE_OK ||
-        parse_str_array(db, o->classes, &soft_labels, &nsoft, errmsg) !=
+        predict0_json_str_array(db, o->classes, NULL, &soft_labels,
+                                &nsoft, errmsg) !=
             SQLITE_OK) {
       rc = SQLITE_ERROR;
       goto done;
@@ -1099,8 +1101,9 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     }
     if (sqlite3_prepare_v2(db, teacher_sql, -1, &tqs, NULL) != SQLITE_OK) {
       rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: teacher '%s' failed: %s",
-                                PREDICT_ERR_MODEL_NOT_FOUND, teacher,
+      *errmsg = sqlite3_mprintf("%s: teacher query for '%s' does not"
+                                " prepare: %s",
+                                PREDICT_ERR_SCHEMA, teacher,
                                 sqlite3_errmsg(db));
       goto done;
     }
@@ -1189,7 +1192,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       char *pred = NULL;
       f64 conf = 0;
       int hc = 0;
-      if (mlp_predict_row(&mlp, &X[(size_t)i * mlp.nfeat], hb, ob, &pred, &conf,
+      if (predict0_mlp_predict_row(&mlp, &X[(size_t)i * mlp.nfeat], hb, ob, &pred, &conf,
                           &hc) != SQLITE_OK) {
         sqlite3_free(hb);
         sqlite3_free(ob);
@@ -1204,7 +1207,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     sqlite3_free(hb);
     sqlite3_free(ob);
     res->metric = (f64)correct / n_hold;
-    rc = mlp_serialize(&mlp, &blob, &blob_len);
+    rc = predict0_mlp_serialize(&mlp, &blob, &blob_len);
     if (rc != SQLITE_OK) {
       *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
       goto done;
@@ -1236,7 +1239,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       char *pred = NULL;
       f64 conf = 0;
       int hc = 0;
-      if (forest_predict_row(&forest, &X[(size_t)i * forest.nfeat], scbuf,
+      if (predict0_forest_predict_row(&forest, &X[(size_t)i * forest.nfeat], scbuf,
                              &pred, &conf, &hc) != SQLITE_OK) {
         sqlite3_free(scbuf);
         rc = SQLITE_NOMEM;
@@ -1254,7 +1257,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     }
     sqlite3_free(scbuf);
     res->metric = classify ? (f64)correct / n_hold : sqrt(sse / n_hold);
-    rc = forest_serialize(&forest, &blob, &blob_len);
+    rc = predict0_forest_serialize(&forest, &blob, &blob_len);
     if (rc != SQLITE_OK) {
       *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
       goto done;
@@ -1304,7 +1307,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     labels = NULL;
 
     for (int i = n_fit; i < n; i++) {
-      int leaf = tree_walk(&tree, &X[(size_t)i * tree.nfeat]);
+      int leaf = predict0_tree_walk(&tree, &X[(size_t)i * tree.nfeat]);
       if (leaf < 0)
         continue;
       const TreeNode *ln = &tree.nodes[leaf];
@@ -1317,49 +1320,16 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       }
     }
     res->metric = classify ? (f64)correct / n_hold : sqrt(sse / n_hold);
-    rc = tree_serialize(&tree, &blob, &blob_len);
+    rc = predict0_tree_serialize(&tree, &blob, &blob_len);
     if (rc != SQLITE_OK) {
       *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
       goto done;
     }
   }
-  {
-    predict0_hasher h;
-    predict0_hash_init(&h);
-    sha256_update(&h.sha, (const u8 *)blob, (usize)blob_len);
-    predict0_hash_hex(&h, res->content_hash);
-  }
-  {
-    sqlite3_stmt *ins = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
-            " io_spec, content_hash, license) VALUES (?1,'student','tree',?2,"
-            " NULL,?3,'unspecified')",
-            -1, &ins, NULL) != SQLITE_OK) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: cannot prepare student insert",
-                                PREDICT_ERR_RESOURCE);
-      goto done;
-    }
-    sqlite3_bind_text(ins, 1, o->student_id, -1, SQLITE_STATIC);
-    sqlite3_bind_blob(ins, 2, blob, blob_len, SQLITE_STATIC);
-    sqlite3_bind_text(ins, 3, res->content_hash, -1, SQLITE_STATIC);
-    int irc = sqlite3_step(ins);
-    sqlite3_finalize(ins);
-    if (irc == SQLITE_CONSTRAINT) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: student '%s' already exists",
-                                PREDICT_ERR_STUDENT_EXISTS, o->student_id);
-      goto done;
-    }
-    if (irc != SQLITE_DONE) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: student insert failed: %s",
-                                PREDICT_ERR_RESOURCE, sqlite3_errmsg(db));
-      goto done;
-    }
-  }
+  rc = register_student(db, o->student_id, blob, blob_len, res->content_hash,
+                        errmsg);
+  if (rc != SQLITE_OK)
+    goto done;
 
   res->model_id = sqlite3_mprintf("%s", o->student_id);
   res->train_rows = n;
@@ -1371,7 +1341,6 @@ done:
   sqlite3_free(read_sql);
   sqlite3_free(apply_sql);
   sqlite3_free(teacher_sql);
-  sqlite3_free(params);
   if (rq)
     sqlite3_finalize(rq);
   if (tqs)
@@ -1404,9 +1373,9 @@ done:
     sqlite3_finalize(sps);
   sqlite3_free(idx);
   sqlite3_free(blob);
-  tree_free(&tree);
-  forest_free(&forest);
-  mlp_free(&mlp);
+  predict0_tree_free(&tree);
+  predict0_forest_free(&forest);
+  predict0_mlp_free(&mlp);
   return rc;
 }
 
@@ -1646,7 +1615,7 @@ static sqlite3_module distillModule = {
     /* xShadowName */ NULL,
     /* xIntegrity  */ NULL};
 
-/* ---- distill_forecast: train a native forecast student (PSFCST, §4.1.6) ----
+/* ---- distill_forecast: train a native forecast student (PSFCST, §4.1.3) ----
  *
  * The train_query returns context + horizon columns per row: the first
  * `context` columns are a raw history window, the next `horizon` are the
@@ -1704,7 +1673,7 @@ static int fdistill_fit(sqlite3 *db, const f32 *X, const f32 *Y, int n, int L,
     f64 se = 0;
     int m = 0;
     for (int r = n_fit; r < n; r++) {
-      mlp_forward(&mlp, &X[(size_t)r * L], hid, out);
+      predict0_mlp_forward(&mlp, &X[(size_t)r * L], hid, out);
       for (int k = 0; k < nout; k++) {
         f64 e = (f64)out[k] - Y[(size_t)r * nout + k];
         se += e * e;
@@ -1717,55 +1686,22 @@ static int fdistill_fit(sqlite3 *db, const f32 *X, const f32 *Y, int n, int L,
   }
   ForecastStudent fs = {
       .mlp = mlp, .horizon = H, .nquant = Q, .levels = (f32 *)levels};
-  rc = fcst_serialize(&fs, &blob, &blob_len);
+  rc = predict0_fcst_serialize(&fs, &blob, &blob_len);
   if (rc != SQLITE_OK) {
     *errmsg =
         sqlite3_mprintf("%s: student serialize failed", PREDICT_ERR_RESOURCE);
     goto done;
   }
-  {
-    predict0_hasher h;
-    predict0_hash_init(&h);
-    sha256_update(&h.sha, (const u8 *)blob, (usize)blob_len);
-    predict0_hash_hex(&h, res->content_hash);
-  }
-  {
-    sqlite3_stmt *ins = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
-            " io_spec, content_hash, license) VALUES (?1,'student','tree',?2,"
-            " NULL,?3,'unspecified')",
-            -1, &ins, NULL) != SQLITE_OK) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: cannot prepare student insert",
-                                PREDICT_ERR_RESOURCE);
-      goto done;
-    }
-    sqlite3_bind_text(ins, 1, student_id, -1, SQLITE_STATIC);
-    sqlite3_bind_blob(ins, 2, blob, blob_len, SQLITE_STATIC);
-    sqlite3_bind_text(ins, 3, res->content_hash, -1, SQLITE_STATIC);
-    int irc = sqlite3_step(ins);
-    sqlite3_finalize(ins);
-    if (irc == SQLITE_CONSTRAINT) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: student '%s' already exists",
-                                PREDICT_ERR_STUDENT_EXISTS, student_id);
-      goto done;
-    }
-    if (irc != SQLITE_DONE) {
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: student insert failed: %s",
-                                PREDICT_ERR_RESOURCE, sqlite3_errmsg(db));
-      goto done;
-    }
-  }
+  rc = register_student(db, student_id, blob, blob_len, res->content_hash,
+                        errmsg);
+  if (rc != SQLITE_OK)
+    goto done;
   res->model_id = sqlite3_mprintf("%s", student_id);
   res->train_rows = n;
   rc = SQLITE_OK;
 done:
   sqlite3_free(blob);
-  mlp_free(&mlp);
+  predict0_mlp_free(&mlp);
   return rc;
 }
 
@@ -1779,11 +1715,8 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H, int Q,
   f32 *X = NULL, *Y = NULL;
   f64 *wrow = NULL;
   sqlite3_stmt *q = NULL;
-  if (sqlite3_prepare_v2(db, tq, -1, &q, NULL) != SQLITE_OK) {
-    *errmsg = sqlite3_mprintf("%s: cannot prepare train_query: %s",
-                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
+  if (predict0_prepare_ro(db, tq, "train_query", &q, errmsg) != SQLITE_OK)
     return SQLITE_ERROR;
-  }
   if (sqlite3_column_count(q) != ncol) {
     *errmsg = sqlite3_mprintf(
         "%s: train_query must return context + horizon*nquant = %d columns,"
@@ -1845,6 +1778,68 @@ done:
 }
 
 #ifdef SQLITE_PREDICT_ONNX
+/* Label one series' sliding windows into X/Y with the onnx teacher's
+ * quantile fan, so the trainer holds at most one series in memory.
+ * Grows *X and *Y (realloc'd, *n windows of *cap capacity); the first
+ * flush sets *Q and *levels from the teacher. Returns SQLITE_OK or an
+ * error with *errmsg set. */
+static int fcst_teacher_flush(sqlite3 *db, const predict0_model_row *trow,
+                              const predict0_backend_opts *bopts,
+                              const f64 *series, int sn, int L, int H,
+                              f32 **X, f32 **Y, int *n, int *cap, int *Q,
+                              f32 **levels, char **errmsg) {
+  int stride = H >= 8 ? H / 4 : 1; /* dense enough for window diversity */
+  for (int t = L; t <= sn && *n < FCST_TEACHER_MAX_WIN; t += stride) {
+    const f64 *win = series + (t - L);
+    f64 wm = 0;
+    for (int i = 0; i < L; i++)
+      wm += win[i];
+    wm /= L;
+    f64 wv = 0;
+    for (int i = 0; i < L; i++) {
+      f64 d = win[i] - wm;
+      wv += d * d;
+    }
+    f64 ws = sqrt(wv / L);
+    if (ws < 1e-6 * (fabs(wm) + 1))
+      continue; /* degenerate window: instance-norm blows up */
+    f64 *fan = NULL;
+    f32 *lv = NULL;
+    int fq = 0;
+    int rc = predict0_onnx_forecast_fan(db, trow, bopts, win, L, H, &fan, &lv,
+                                        &fq, errmsg);
+    if (rc != SQLITE_OK)
+      return rc;
+    if (*Q == 0) {
+      *Q = fq;
+      *levels = lv;
+    } else
+      sqlite3_free(lv);
+    int nout = H * *Q;
+    if (*n == *cap) {
+      int nc = *cap ? *cap * 2 : 256;
+      f32 *nX = sqlite3_realloc(*X, (int)(sizeof(f32) * (size_t)nc * L));
+      f32 *nY = sqlite3_realloc(*Y, (int)(sizeof(f32) * (size_t)nc * nout));
+      if (nX)
+        *X = nX;
+      if (nY)
+        *Y = nY;
+      if (!nX || !nY) {
+        sqlite3_free(fan);
+        return SQLITE_NOMEM;
+      }
+      *cap = nc;
+    }
+    for (int i = 0; i < L; i++)
+      (*X)[(size_t)*n * L + i] = (f32)((win[i] - wm) / ws);
+    for (int k = 0; k < nout; k++)
+      (*Y)[(size_t)*n * nout + k] = (f32)((fan[k] - wm) / ws);
+    sqlite3_free(fan);
+    (*n)++;
+  }
+  return SQLITE_OK;
+}
+
 /* teacher= mode: the train_query returns (value) rows for one series, or
  * (series_key, value) rows for several (in series-then-time order). The onnx
  * teacher labels sliding context windows in-DB; instance-normalize and fit.
@@ -1856,14 +1851,14 @@ static int fdistill_train_teacher(sqlite3 *db, const char *tq,
                                   char **errmsg) {
   int rc = SQLITE_OK, Q = 0, cap = 0, n = 0;
   f32 *X = NULL, *Y = NULL, *levels = NULL;
-  f64 *series = NULL, *fan = NULL;
+  f64 *series = NULL;
   int sn = 0, scap = 0;
   char *curkey = NULL;
   sqlite3_stmt *q = NULL;
   predict0_model_row trow;
   memset(&trow, 0, sizeof(trow));
   int have_trow = 0;
-  predict0_backend_opts bopts = {NULL, NULL, NULL, 0};
+  predict0_backend_opts bopts = {NULL, NULL, NULL};
 
   if (predict0_registry_lookup(db, teacher, &trow) != 0 || !trow.runtime ||
       strcmp(trow.runtime, "onnx") != 0) {
@@ -1875,78 +1870,25 @@ static int fdistill_train_teacher(sqlite3 *db, const char *tq,
     return SQLITE_ERROR;
   }
   have_trow = 1;
-  if (sqlite3_prepare_v2(db, tq, -1, &q, NULL) != SQLITE_OK) {
-    *errmsg = sqlite3_mprintf("%s: cannot prepare train_query: %s",
-                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
+  if (predict0_prepare_ro(db, tq, "train_query", &q, errmsg) != SQLITE_OK) {
     rc = SQLITE_ERROR;
     goto done;
   }
   int qcol = sqlite3_column_count(q), has_key = qcol >= 2;
 
-/* label one series' sliding windows into X/Y before moving on, so we hold at
- * most one series in memory */
-#define FLUSH_SERIES()                                                          \
-  do {                                                                          \
-    int stride = H >= 8 ? H / 4 : 1; /* dense enough for window diversity */    \
-    for (int t = L; t <= sn && n < FCST_TEACHER_MAX_WIN; t += stride) {          \
-      const f64 *win = series + (t - L);                                        \
-      f64 wm = 0;                                                               \
-      for (int i = 0; i < L; i++)                                               \
-        wm += win[i];                                                           \
-      wm /= L;                                                                  \
-      f64 wv = 0;                                                               \
-      for (int i = 0; i < L; i++) {                                             \
-        f64 d = win[i] - wm;                                                    \
-        wv += d * d;                                                            \
-      }                                                                         \
-      f64 ws = sqrt(wv / L);                                                    \
-      if (ws < 1e-6 * (fabs(wm) + 1))                                           \
-        continue; /* degenerate window: instance-norm blows up */              \
-      f32 *lv = NULL;                                                           \
-      int fq = 0;                                                               \
-      rc = predict0_onnx_forecast_fan(db, &trow, &bopts, win, L, H, &fan, &lv,  \
-                                      &fq, errmsg);                             \
-      if (rc != SQLITE_OK)                                                      \
-        goto done;                                                             \
-      if (Q == 0) {                                                             \
-        Q = fq;                                                                 \
-        levels = lv;                                                            \
-        lv = NULL;                                                              \
-      } else                                                                    \
-        sqlite3_free(lv);                                                       \
-      int nout = H * Q;                                                         \
-      if (n == cap) {                                                          \
-        int nc = cap ? cap * 2 : 256;                                          \
-        f32 *nX = sqlite3_realloc(X, (int)(sizeof(f32) * (size_t)nc * L));      \
-        f32 *nY = sqlite3_realloc(Y, (int)(sizeof(f32) * (size_t)nc * nout));   \
-        if (nX)                                                                 \
-          X = nX;                                                               \
-        if (nY)                                                                 \
-          Y = nY;                                                               \
-        if (!nX || !nY) {                                                       \
-          rc = SQLITE_NOMEM;                                                    \
-          goto done;                                                          \
-        }                                                                       \
-        cap = nc;                                                               \
-      }                                                                         \
-      for (int i = 0; i < L; i++)                                               \
-        X[(size_t)n * L + i] = (f32)((win[i] - wm) / ws);                       \
-      for (int k = 0; k < nout; k++)                                            \
-        Y[(size_t)n * nout + k] = (f32)((fan[k] - wm) / ws);                    \
-      sqlite3_free(fan);                                                        \
-      fan = NULL;                                                               \
-      n++;                                                                      \
-    }                                                                           \
-    sn = 0;                                                                     \
-  } while (0)
 
   while (sqlite3_step(q) == SQLITE_ROW && n < FCST_TEACHER_MAX_WIN) {
     const char *key = has_key ? (const char *)sqlite3_column_text(q, 0) : "";
     if (!key)
       key = "";
     if (has_key && (!curkey || strcmp(key, curkey) != 0)) {
-      if (curkey)
-        FLUSH_SERIES();
+      if (curkey) {
+        rc = fcst_teacher_flush(db, &trow, &bopts, series, sn, L, H, &X, &Y,
+                                &n, &cap, &Q, &levels, errmsg);
+        if (rc != SQLITE_OK)
+          goto done;
+        sn = 0;
+      }
       sqlite3_free(curkey);
       curkey = sqlite3_mprintf("%s", key);
     } else if (!curkey) {
@@ -1964,9 +1906,12 @@ static int fdistill_train_teacher(sqlite3 *db, const char *tq,
     }
     series[sn++] = sqlite3_column_double(q, qcol - 1);
   }
-  if (rc == SQLITE_OK && sn >= L)
-    FLUSH_SERIES();
-#undef FLUSH_SERIES
+  if (rc == SQLITE_OK && sn >= L) {
+    rc = fcst_teacher_flush(db, &trow, &bopts, series, sn, L, H, &X, &Y, &n,
+                            &cap, &Q, &levels, errmsg);
+    if (rc != SQLITE_OK)
+      goto done;
+  }
 
   if (rc == SQLITE_OK)
     rc = fdistill_fit(db, X, Y, n, L, H, Q, levels, student_id, nhid, epochs,
@@ -1978,7 +1923,6 @@ done:
     predict0_model_row_free(&trow);
   sqlite3_free(curkey);
   sqlite3_free(series);
-  sqlite3_free(fan);
   sqlite3_free(levels);
   sqlite3_free(X);
   sqlite3_free(Y);
@@ -2251,7 +2195,7 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
                                 lr, &cur->res, &emsg);
 #else
     rc = SQLITE_ERROR;
-    emsg = sqlite3_mprintf("%s: distill_forecast teacher= needs the onnx build",
+    emsg = sqlite3_mprintf("%s: onnx runtime is not in this build: teacher",
                            PREDICT_ERR_RUNTIME_UNAVAILABLE);
 #endif
   } else {

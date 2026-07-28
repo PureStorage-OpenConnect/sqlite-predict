@@ -1,4 +1,4 @@
-"""distill_predict() and the native tree student (RFC 0005 §4.2.4).
+"""distill_predict() and the native tree student (RFC 0005 §4.2.6).
 
 distill runs a teacher over the training rows, fits a CART tree on the
 teacher's predictions, evaluates on a holdout, and registers the tree as an

@@ -1,8 +1,9 @@
-"""Error-path coverage for the shared collect_series() helper.
+"""Error paths of the backtest() TVF's series collection.
 
 With forecast() and detect_anomalies() now aggregates over the caller's
-own rows, collect_series() has one time-series consumer left: the
-backtest() TVF. Every failure branch is exercised through it. The point
+own rows, the shared collect_series() helper has one time-series
+consumer left: the backtest() TVF. Every failure branch is exercised
+through it. The point
 is not just that the right error code comes back, but that the error
 paths (which free partially-built series arrays and resolved-name
 strings) are clean under ASan/valgrind — run via `make test-asan` /

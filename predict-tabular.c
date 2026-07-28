@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* predict(train_query, apply_query, options) — RFC 0005 §4.2.3.
+/* predict(train_query, apply_query, options) — RFC 0005 §4.2.5.
  * v0 backing: knn5-incontext (kind 'tabular-stat'), the measured honest
  * baseline from the benchmark campaign: z-scored 5-NN with per-column
  * categorical coding. Foundation-model teachers arrive via distill_predict()
@@ -14,7 +14,7 @@ SQLITE_EXTENSION_INIT3
 #endif
 
 #define TAB_MAX_TRAIN 100000 /* knn5-incontext declared context capacity */
-#define TAB_MAX_FEAT 64
+#define TAB_MAX_FEAT PREDICT_MAX_FEAT
 #define TAB_K 5
 
 #define PR_COL_REF 0
@@ -233,32 +233,12 @@ static int pr_error(pred_cursor *cur, const char *code, const char *msg,
 static sqlite3_stmt *pr_prepare(pred_cursor *cur, sqlite3 *db,
                                 const char *sql, int *err) {
   sqlite3_stmt *stmt = NULL;
-  const char *tail = NULL;
+  char *emsg = NULL;
   *err = 0;
-  if (!sql) {
-    *err = pr_error(cur, PREDICT_ERR_SCHEMA, "query must be text", NULL);
-    return NULL;
-  }
-  if (sqlite3_prepare_v2(db, sql, -1, &stmt, &tail) != SQLITE_OK || !stmt) {
-    if (stmt)
-      sqlite3_finalize(stmt);
-    *err = pr_error(cur, PREDICT_ERR_SCHEMA, "query does not parse: ",
-                    sqlite3_errmsg(db));
-    return NULL;
-  }
-  while (tail && (*tail == ' ' || *tail == '\n' || *tail == ';' ||
-                  *tail == '\t'))
-    tail++;
-  if (tail && *tail != '\0') {
-    sqlite3_finalize(stmt);
-    *err = pr_error(cur, PREDICT_ERR_SCHEMA,
-                    "query must be a single statement", NULL);
-    return NULL;
-  }
-  if (!sqlite3_stmt_readonly(stmt)) {
-    sqlite3_finalize(stmt);
-    *err = pr_error(cur, PREDICT_ERR_QUERY_NOT_READONLY,
-                    "query must be a read-only SELECT", NULL);
+  if (predict0_prepare_ro(db, sql, "query", &stmt, &emsg) != SQLITE_OK) {
+    sqlite3_free(cur->base.pVtab->zErrMsg);
+    cur->base.pVtab->zErrMsg = emsg; /* already "CODE: detail" formed */
+    *err = SQLITE_ERROR;
     return NULL;
   }
   return stmt;
@@ -384,7 +364,14 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     predict0_model_row m;
     int look = predict0_registry_lookup(db, model_id, &m);
     if (look == 1) {
-      rc = pr_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, model_id, NULL);
+      rc = pr_error(cur, PREDICT_ERR_MODEL_NOT_FOUND, "no such model: ",
+                    model_id);
+      pred_opts_free(&opts);
+      return rc;
+    }
+    if (look == 2) {
+      rc = pr_error(cur, PREDICT_ERR_MODEL_HASH,
+                    "weights do not match content_hash: ", model_id);
       pred_opts_free(&opts);
       return rc;
     }
@@ -414,9 +401,9 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                     "onnx runtime is not in this build: ", model_id);
 #endif
     } else {
-      rc = pr_error(cur, PREDICT_ERR_MODEL_NOT_FOUND,
-                    "unsupported model runtime for predict(): ",
-                    m.runtime ? m.runtime : model_id);
+      rc = pr_error(cur, PREDICT_ERR_RUNTIME_UNAVAILABLE,
+                    "predict() cannot serve models with runtime: ",
+                    m.runtime ? m.runtime : "unknown");
     }
     predict0_model_row_free(&m);
     pred_opts_free(&opts);
@@ -746,7 +733,6 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     rc = pr_error(cur, PREDICT_ERR_RESOURCE, "apply query failed", NULL);
     goto fail_train;
   }
-
 
   rc = SQLITE_OK;
   cur->i = 0;

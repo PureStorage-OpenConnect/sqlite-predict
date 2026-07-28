@@ -50,7 +50,7 @@ def test_confidence_out_of_range(seeded):
                  (3, '{"confidence_level": 1.5}'))
 
 
-def test_query_shape_keys_are_unknown(seeded):
+def test_removed_option_keys_rejected(seeded):
     """time_col/value_col/group_cols/receipt belonged to the deleted
     query form; on the aggregate they are unknown option keys."""
     for opts in ('{"time_col": "ts"}', '{"value_col": "value"}',

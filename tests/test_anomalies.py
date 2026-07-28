@@ -1,28 +1,14 @@
-import json
 import sqlite3
 import pytest
 import synthetic as syn
-
-
-def detect(db, opts=None):
-    """Run the detect_anomalies aggregate over the series table and parse
-    the JSON document it returns."""
-    if opts is None:
-        doc, = db.execute(
-            "SELECT detect_anomalies(ts, value) FROM series"
-        ).fetchone()
-    else:
-        doc, = db.execute(
-            "SELECT detect_anomalies(ts, value, ?) FROM series", (opts,)
-        ).fetchone()
-    return json.loads(doc)
+from conftest import anomaly_doc
 
 
 def test_injected_anomalies_are_found(db):
     rows, _ = syn.trend_season(n=200, noise=0.5, amplitude=5.0, seed=41)
     noisy, indices = syn.with_anomalies(rows, k=4, magnitude=10.0, seed=42)
     syn.load_into(db, noisy)
-    out = detect(db)["rows"]
+    out = anomaly_doc(db)["rows"]
     flagged = {r["ts"] for r in out if r["is_anomaly"] == 1}
     truth = {noisy[i][0] for i in indices}
     hits = flagged & truth
@@ -35,7 +21,7 @@ def test_injected_anomalies_are_found(db):
 def test_clean_series_stays_clean(db):
     rows, _ = syn.trend_season(n=200, noise=0.5, seed=43)
     syn.load_into(db, rows)
-    out = detect(db)["rows"]
+    out = anomaly_doc(db)["rows"]
     flags = sum(r["is_anomaly"] or 0 for r in out)
     assert flags <= 2, f"clean series produced {flags} anomaly flags"
 
@@ -48,7 +34,7 @@ def test_long_series_scores_every_point(db):
     rows, _ = syn.trend_season(n=6000, noise=0.5, seed=71)
     noisy, indices = syn.with_anomalies(rows, k=3, magnitude=12.0, seed=72)
     syn.load_into(db, noisy)
-    doc = detect(db)
+    doc = anomaly_doc(db)
     assert doc["status"] != "truncated"
     out = doc["rows"]
     assert len(out) == 6000  # every point returned, not just the last 4096
@@ -65,7 +51,7 @@ def test_sub_pca_flags_injected_anomalies(db):
     rows, _ = syn.trend_season(n=600, noise=0.4, amplitude=5.0, seed=61)
     noisy, indices = syn.with_anomalies(rows, k=3, magnitude=12.0, seed=62)
     syn.load_into(db, noisy)
-    out = detect(db, '{"model":"sub-pca"}')["rows"]
+    out = anomaly_doc(db, model="sub-pca")["rows"]
     assert len(out) == 600
     assert all(r["forecast"] is None for r in out)  # no forecast
     # every point scored
@@ -80,7 +66,7 @@ def test_sub_pca_flags_injected_anomalies(db):
 def test_warmup_rows_have_no_prediction(db):
     rows, _ = syn.random_walk(n=50, seed=44)
     syn.load_into(db, rows)
-    out = detect(db)["rows"]
+    out = anomaly_doc(db)["rows"]
     assert len(out) == 50
     assert out[0]["forecast"] is None  # no forecast on the first row
     assert any(r["forecast"] is not None for r in out[10:])
@@ -91,9 +77,9 @@ def test_threshold_option_monotone(db):
     noisy, _ = syn.with_anomalies(rows, k=3, magnitude=6.0, seed=46)
     syn.load_into(db, noisy)
     strict = sum(r["is_anomaly"] or 0 for r in
-                 detect(db, '{"anomaly_prob_threshold": 0.999}')["rows"])
+                 anomaly_doc(db, anomaly_prob_threshold=0.999)["rows"])
     loose = sum(r["is_anomaly"] or 0 for r in
-                detect(db, '{"anomaly_prob_threshold": 0.9}')["rows"])
+                anomaly_doc(db, anomaly_prob_threshold=0.9)["rows"])
     assert loose >= strict
 
 
@@ -101,14 +87,14 @@ def test_threshold_out_of_range(db):
     rows, _ = syn.random_walk(n=50, seed=47)
     syn.load_into(db, rows)
     with pytest.raises(sqlite3.OperationalError) as e:
-        detect(db, '{"anomaly_prob_threshold": 2.0}')
+        anomaly_doc(db, anomaly_prob_threshold=2.0)
     assert "PREDICT_ERR_THRESHOLD" in str(e.value)
 
 
 def test_insufficient_history_status(db):
     rows, _ = syn.random_walk(n=4, seed=50)
     syn.load_into(db, rows)
-    doc = detect(db)
+    doc = anomaly_doc(db)
     assert doc["status"] == "insufficient_history"
     assert doc["rows"] == []
 
@@ -116,6 +102,6 @@ def test_insufficient_history_status(db):
 def test_naive_model_selectable(db):
     rows, _ = syn.trend_season(n=150, seed=51)
     syn.load_into(db, rows)
-    doc = detect(db, '{"model": "stub-seasonal-naive"}')
+    doc = anomaly_doc(db, model="stub-seasonal-naive")
     assert len(doc["rows"]) == 150
     assert doc["model"] == "stub-seasonal-naive"

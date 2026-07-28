@@ -17,25 +17,37 @@ Source layout:
 | `sqlite-predict.c` | entry point, function registration, shared helpers (timestamp parse/format, ULID, options parsing, normal-quantile) |
 | `predict-forecast.c` | the `forecast()` and `detect_anomalies()` aggregates, `backtest()`, the expansion TVFs, the statistical models, the native forecast-student serving path, and the shared `collect_series()` helper |
 | `predict-tabular.c` | `predict()` vtab, the in-context k-NN model, and dispatch to a runtime backend for registered models |
-| `predict-receipts.c` | the model registry (`_predict_models`) and content hashing |
+| `predict-registry.c` | the model registry (`_predict_models`) and content hashing |
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
 | `predict-student.c` | the native student **serving** runtime: blob (de)serialization and tree / forest / MLP inference (`predict0_tree_run`). The serve side of the train/serve boundary |
-| `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on (RFC §4.1.6) |
+| `predict-student.h` | the shared student-model **format**: the tree/forest/MLP structs and the runtime entry points both sides agree on (RFC §4.1.3) |
 | `predict-distill.c` | the **training** side: the CART / gradient-boosting / MLP trainers, the `distill_predict()` vtab, and the `distill_forecast()` vtab that fits the forecast student. Builds student blobs that `predict-student.c` serves |
 | `predict-internal.h` | shared types, contract constants, error codes, internal prototypes |
 | `vendor/sha256.c` | a self-contained FIPS 180-4 SHA-256 |
 
-## Operations are table-valued functions
+## Two calling conventions: aggregates and TVFs
 
-Each operation is an [eponymous virtual table module][tvf]. Arguments
-arrive as hidden columns (`query`, `horizon`, `options`), resolved in
-`xBestIndex` and consumed in `xFilter`, which does all the work and
-materializes result rows the cursor then walks. This is the same mechanism
-SQLite's own `generate_series` uses.
+The series operations are plain SQL aggregate functions.
+`forecast(ts, value, horizon[, options])` and
+`detect_anomalies(ts, value[, options])` aggregate over the caller's own
+rows: each input row contributes one (ts, value) observation, each
+aggregate evaluation (one `GROUP BY` group, or the whole statement) is
+one series, and the result is a single JSON document. The
+`forecast_rows(doc)` and `anomaly_rows(doc)` table-valued functions
+expand that document back into typed rows.
 
-`forecast()` and `detect_anomalies()` share `collect_series()`: prepare and
-validate the inner query (read-only, single statement), resolve or infer
-the time/value/group columns, and collect rows into per-series buffers.
+The query-shaped operations (`backtest()`, `predict()`,
+`distill_predict()`, `distill_forecast()`) are [eponymous virtual table
+modules][tvf] instead. Arguments arrive as hidden columns (a `query`
+string plus operation-specific columns such as `horizon` and `options`),
+resolved in `xBestIndex` and consumed in `xFilter`, which does all the
+work and materializes result rows the cursor then walks. This is the
+same mechanism SQLite's own `generate_series` uses.
+
+`collect_series()` (prepare and validate an inner query as read-only and
+single-statement, resolve or infer the time/value/group columns, collect
+rows into per-series buffers) now serves only `backtest()`, the one
+series operation that still takes a query string.
 
 ## Models
 
@@ -66,7 +78,7 @@ a complete registration for the vector case (in-context adds only `target`,
 which is a SQL column introspection can't see). An explicit `io_spec`
 overrides the derivation. Feature columns map positionally by default (apply
 column order); a `features` list switches to name-based mapping. All the JSON
-handling — reading the `io_spec`, building the derived one — goes through
+handling (reading the `io_spec`, building the derived one) goes through
 SQLite's JSON1 (`json_extract`/`json_each`/`json_object`), never a hand-rolled
 parser. Both cache one onnxruntime session per (weights, device,
 precision), run query rows in batches, and select the execution provider
@@ -87,11 +99,11 @@ teacher's accuracy is usually distillation to a small student.
 zero-dependency core. It fits a native student on a training signal,
 evaluates it on a held-out fraction, and writes the student into
 `_predict_models` as an inline BLOB (`runtime='tree'`, `kind='student'`). By
-default the signal is the `target` column of the training query — your
+default the signal is the `target` column of the training query: your
 labels, or a strong teacher's predictions computed offline and stored in that
 column, which is how a 30-second TabFM run becomes a microsecond student. A
 `teacher` argument names a registered `predict()` model, which `distill`
-re-runs over the rows (aligned by row number) to relabel them first — the way
+re-runs over the rows (aligned by row number) to relabel them first, the way
 to compress the in-context knn5 into a standalone tree.
 
 Three `student_kind`s exist. `'tree'` and `'gbt'` share the CART trainer;
@@ -99,8 +111,8 @@ Three `student_kind`s exist. `'tree'` and `'gbt'` share the CART trainer;
 shallow trees, and it is the go-to when accuracy matters: it fits each tree to
 the loss
 gradient but sets each leaf to the **second-order (Newton) step**
-`Σg / (Σh + λ)` using the softmax Hessian — the same thing that lifts
-XGBoost above a vanilla gradient booster — with shrinkage (a small learning
+`Σg / (Σh + λ)` using the softmax Hessian (the same thing that lifts
+XGBoost above a vanilla gradient booster), with shrinkage (a small learning
 rate over many rounds) doing the regularizing. It is deterministic by
 construction: no bootstrap, no feature-sampling, no early-stopping split, so
 the student stays reproducible and exactly replayable. Given `proba` and
@@ -118,11 +130,11 @@ a `tree`-runtime model to the native runtime in the same file, which tells a
 single tree (`PSTREE` blob) from a forest (`PSGBT` blob) from a net (`PSMLP`
 blob) by magic and needs
 no onnxruntime. The blob formats are little-endian and normatively specified
-and versioned (RFC §4.1.6, `PSTREE01` / `PSGBT01` / `PSMLP01`), so a stored student stays
+and versioned (RFC §4.1.3, `PSTREE01` / `PSGBT01` / `PSMLP01`), so a stored student stays
 servable across upgrades, snapshots, and forks, and a serving-only module can
 execute a blob it never trained. They are rigorously bounds-checked on read,
 because the registry is
-writable by any SQL caller (RFC §6.2) — a hand-crafted blob is rejected,
+writable by any SQL caller (RFC §6.2): a hand-crafted blob is rejected,
 never crashed on. The student is native and deterministic, like the stat
 models.
 
@@ -130,7 +142,7 @@ Forecasting has its own student. `distill_forecast()` (`predict-distill.c`)
 fits a regression MLP that maps an instance-normalized context window of `nfeat`
 recent values to `nquant` quantiles per horizon step, distilled from a teacher's
 forecasts over sliding windows. It is stored as a fourth student blob (`PSFCST`,
-RFC §4.1.6) and served not by `predict()` but by `forecast()`
+RFC §4.1.3) and served not by `predict()` but by `forecast()`
 (`predict-forecast.c`), which extracts the most recent window, normalizes it by
 its own mean and standard deviation (so one student serves series of any
 magnitude), applies the net, and de-normalizes. When the student carries a
@@ -152,12 +164,13 @@ fp16 inference is not bit-reproducible across machines (different hardware
 and kernels round differently). Cross-machine, cross-backend bit-equality
 is never claimed (see `benchmarks/notes.md`).
 
-## Deviations from the spec
+## Spec alignment
 
-The implementation surfaced amendments queued for the design spec: the
-`ts-stat`/`tabular-stat` model kinds, aggregate-form `forecast`/
-`detect_anomalies` as the one calling convention for series operations,
-the removal of receipts, and null option values meaning "key omitted."
-These are noted at the top of the files that introduce them.
+The design spec (RFC 0005) has been amended to match the implemented
+surface: the `ts-stat`/`tabular-stat` model kinds, the aggregate calling
+convention for `forecast` and `detect_anomalies`, null option values
+meaning "key omitted," and the removal of receipts (that design is
+preserved in the RFC's Appendix D). Section references in this document
+follow the amended numbering.
 
 [tvf]: https://www.sqlite.org/vtab.html#tabfunc2

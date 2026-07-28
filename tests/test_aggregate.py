@@ -1,5 +1,5 @@
-"""Aggregate forms of forecast/detect_anomalies (RFC 0005 §4.2.8) and the
-expansion functions (§4.2.9).
+"""Aggregate forms of forecast/detect_anomalies (RFC 0005 §4.2.1-§4.2.2)
+and the expansion functions (§4.2.3).
 
 forecast and detect_anomalies are aggregate-only: the enclosing statement
 supplies the rows, GROUP BY splits series, and each group returns one JSON
@@ -14,11 +14,7 @@ import sqlite3
 
 import pytest
 import synthetic as syn
-
-
-def doc(db, sql, *params):
-    row = db.execute(sql, params).fetchone()
-    return json.loads(row[0]) if row and row[0] is not None else None
+from conftest import anomaly_doc, forecast_doc
 
 
 # ---- shape and semantics ----
@@ -27,7 +23,7 @@ def doc(db, sql, *params):
 def test_forecast_doc_shape(db):
     rows, _ = syn.trend_season(n=96, seed=21)
     syn.load_into(db, rows)
-    d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
+    d = forecast_doc(db, 6)
     assert set(d) == {"model", "status", "rows"}
     assert d["status"] == "ok"
     assert d["model"] == "theta-classic"
@@ -54,8 +50,9 @@ def test_group_by_matches_per_group_calls(db):
     }
     assert set(agg) == {"a", "b"}
     for grp in ("a", "b"):
-        single = doc(db, "SELECT forecast(ts, value, 4) FROM series"
-                         " WHERE grp = ?", grp)
+        single = json.loads(db.execute(
+            "SELECT forecast(ts, value, 4) FROM series WHERE grp = ?",
+            (grp,)).fetchone()[0])
         assert agg[grp] == single
 
 
@@ -65,8 +62,8 @@ def test_input_order_does_not_matter(db):
     random.Random(7).shuffle(shuffled)
     syn.load_into(db, rows, table="ordered")
     syn.load_into(db, shuffled, table="shuffled")
-    d1 = doc(db, "SELECT forecast(ts, value, 6) FROM ordered")
-    d2 = doc(db, "SELECT forecast(ts, value, 6) FROM shuffled")
+    d1 = forecast_doc(db, 6, table="ordered")
+    d2 = forecast_doc(db, 6, table="shuffled")
     assert d1["rows"] == d2["rows"]
 
 
@@ -81,7 +78,7 @@ def test_zero_rows_returns_null(db):
 def test_degraded_series_status(db):
     # too little history: status doc with empty rows, not a query failure
     syn.load_into(db, [(f"2024-01-01T0{i}:00:00Z", float(i)) for i in range(4)])
-    d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
+    d = forecast_doc(db, 6)
     assert set(d) == {"model", "status", "rows"}
     assert d["status"] == "insufficient_history"
     assert d["rows"] == []
@@ -91,7 +88,7 @@ def test_non_numeric_degrades_not_fails(db):
     rows, _ = syn.trend_season(n=96, seed=25)
     syn.load_into(db, rows)
     db.execute("INSERT INTO series VALUES ('2024-06-01T00:00:00Z', 'not-a-number')")
-    d = doc(db, "SELECT forecast(ts, value, 6) FROM series")
+    d = forecast_doc(db, 6)
     assert d["status"] == "non_numeric"
     assert d["rows"] == []
 
@@ -153,18 +150,6 @@ def test_horizon_must_be_constant_within_group(db):
             " FROM series").fetchone()
 
 
-def test_query_shape_and_receipt_options_rejected(db):
-    # query-shape keys are replaced by GROUP BY and argument positions;
-    # "receipt" is gone with the receipts machinery — all unknown now
-    rows, _ = syn.trend_season(n=96, seed=39)
-    syn.load_into(db, rows)
-    for key in ("time_col", "value_col", "group_cols", "receipt"):
-        with pytest.raises(sqlite3.OperationalError, match="OPTIONS"):
-            db.execute(
-                f"SELECT forecast(ts, value, 4, '{{\"{key}\": \"x\"}}')"
-                " FROM series").fetchone()
-
-
 def test_horizon_validation(db):
     rows, _ = syn.trend_season(n=96, seed=40)
     syn.load_into(db, rows)
@@ -211,7 +196,7 @@ def test_null_and_mixed_ts_degrade(db):
     rows, _ = syn.trend_season(n=96, seed=43)
     syn.load_into(db, rows)
     db.execute("INSERT INTO series VALUES (NULL, 1.0)")
-    d = doc(db, "SELECT forecast(ts, value, 4) FROM series")
+    d = forecast_doc(db, 4)
     assert d["status"] == "non_numeric"
 
 
@@ -220,14 +205,14 @@ def test_epoch_integer_timestamps(db):
     db.execute("CREATE TABLE e(ts INTEGER, value REAL)")
     db.executemany("INSERT INTO e VALUES (?, ?)",
                    [(base + i * 3600, 50.0 + (i % 24)) for i in range(96)])
-    d = doc(db, "SELECT forecast(ts, value, 4) FROM e")
+    d = forecast_doc(db, 4, table="e")
     assert d["status"] == "ok"
     assert d["rows"][0]["forecast_timestamp"].startswith("2024-01-05T")
 
 
 def test_single_point_series(db):
     syn.load_into(db, [("2024-01-01T00:00:00Z", 1.0)])
-    d = doc(db, "SELECT forecast(ts, value, 4) FROM series")
+    d = forecast_doc(db, 4)
     assert d["status"] == "insufficient_history"
 
 
@@ -238,7 +223,7 @@ def test_anomaly_doc_shape_and_detection(db):
     rows, _ = syn.trend_season(n=120, noise=0.3, seed=44)
     rows, _ = syn.with_anomalies(rows, k=3, magnitude=12.0, seed=45)
     syn.load_into(db, rows)
-    d = doc(db, "SELECT detect_anomalies(ts, value) FROM series")
+    d = anomaly_doc(db)
     assert set(d) == {"model", "status", "rows"}
     assert d["status"] == "ok"
     assert len(d["rows"]) == 120
@@ -251,8 +236,7 @@ def test_anomaly_doc_shape_and_detection(db):
 def test_anomaly_subpca_rows_have_null_intervals(db):
     rows, _ = syn.trend_season(n=250, seed=46)
     syn.load_into(db, rows)
-    d = doc(db, "SELECT detect_anomalies(ts, value,"
-                " '{\"model\": \"sub-pca\"}') FROM series")
+    d = anomaly_doc(db, model="sub-pca")
     assert d["status"] == "ok"
     assert all(r["forecast"] is None and r["lower_bound"] is None
                for r in d["rows"])

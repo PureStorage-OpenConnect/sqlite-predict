@@ -1,4 +1,4 @@
-# Security Policy
+# Security policy
 
 ## Reporting a vulnerability
 
@@ -39,7 +39,6 @@ particular attention:
   forecast horizons, and per-call work are bounded, and interrupts are
   honored between batches.
 
-Error messages do not echo input row values. Receipts are as sensitive as
-the queries they record.
+Error messages do not echo input row values.
 
 [ghsa]: https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability

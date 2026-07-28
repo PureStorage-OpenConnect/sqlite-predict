@@ -26,11 +26,14 @@ typedef size_t usize;
 #define UNUSED_PARAMETER(X) (void)(X)
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
-/* Wire-format contracts. These are duplicated across the key builder,
- * the result hasher, and the RFC §4.1.3 spec; they MUST agree, so they
- * live in exactly one place. */
-#define PREDICT_FS 0x1f /* field separator: series keys + result hash */
-#define PREDICT_RS 0x1e /* row separator: result hash */
+/* Series-key field separator (collect_series/agg group keys): a byte
+ * that cannot appear in JSON-escaped column values. */
+#define PREDICT_FS 0x1f
+
+/* Feature-vector cap shared by every tabular path (knn, tree students,
+ * onnx): apply-row buffers are sized to it, and a student's nfeat is
+ * bounded by it at both distill and serve time. */
+#define PREDICT_MAX_FEAT 64
 
 /* Buffer sizes encoding fixed-width invariants. */
 #define PREDICT_TS_BUFSIZE 24   /* "YYYY-MM-DDTHH:MM:SSZ" (20) + slack */
@@ -81,6 +84,18 @@ int predict0_parse_timestamp(const char *s, i64 *out_ms);
 /* Format epoch ms back to "YYYY-MM-DDTHH:MM:SSZ" into buf[21+]. */
 void predict0_format_timestamp(i64 ms, char *buf, usize bufsize);
 
+/* Prepare a caller-supplied inner query: must parse, be a single
+ * statement, and be read-only (§6.1). what names the argument in error
+ * messages. SQLITE_OK + *out, or SQLITE_ERROR + *errmsg. */
+int predict0_prepare_ro(sqlite3 *db, const char *sql, const char *what,
+                        sqlite3_stmt **out, char **errmsg);
+
+/* Parse a JSON array of strings; path selects an array inside a larger
+ * document, NULL means json itself is the array. out/n: sqlite3_malloc'd
+ * (caller frees elements + array). SQLITE_OK, or SQLITE_ code + *errmsg. */
+int predict0_json_str_array(sqlite3 *db, const char *json, const char *path,
+                            char ***out, int *n, char **errmsg);
+
 /* Inverse standard-normal CDF (Acklam's rational approximation).
  * p in (0,1). Used for prediction-interval z values. */
 f64 predict0_norm_quantile(f64 p);
@@ -96,29 +111,17 @@ int predict0_options_parse(sqlite3 *db, const char *json,
                            const char *const *keys, predict0_option_cb cb,
                            void *ctx, char **errmsg);
 
-/* Smallest ULID for the given epoch ms (random component zeroed),
- * Crockford base32, 26 chars + NUL into buf[27]. */
-void predict0_ulid_min(i64 ms, char *buf);
-
-/* Fresh ULID for the given epoch ms with sqlite3_randomness entropy. */
-void predict0_ulid_new(i64 ms, char *buf);
-
-/* ---- model registry (predict-receipts.c) ---- */
+/* ---- model registry (predict-registry.c) ---- */
 
 #include "sha256.h"
 
-/* Content hashing for model integrity (content_hash pinning):
- * type-tagged fields, 0x1F between fields, 0x1E after each row. */
+/* Content hashing for model integrity (content_hash pinning): plain
+ * SHA-256 over the raw weight bytes, hex-encoded. */
 typedef struct {
   sha256_ctx sha;
 } predict0_hasher;
 
 void predict0_hash_init(predict0_hasher *h);
-void predict0_hash_null(predict0_hasher *h);
-void predict0_hash_int(predict0_hasher *h, i64 v);
-void predict0_hash_real(predict0_hasher *h, f64 v);
-void predict0_hash_text(predict0_hasher *h, const char *s);
-void predict0_hash_row_end(predict0_hasher *h);
 void predict0_hash_hex(predict0_hasher *h, char hex[PREDICT_HEX_BUFSIZE]);
 
 /* Idempotent DDL for _predict_models + bundled rows. */
@@ -141,8 +144,10 @@ typedef struct {
   int weights_len;
 } predict0_model_row;
 
-/* Look up a model. Returns 0 and fills *out on hit, 1 if absent, or an
- * SQLITE_ error. Free *out with predict0_model_row_free on a hit. */
+/* Look up a model. Returns 0 and fills *out on hit, 1 if absent, 2 if
+ * the row's inline weights fail content_hash verification (§6.2; the
+ * caller raises PREDICT_ERR_MODEL_HASH), or an SQLITE_ error. Free *out
+ * with predict0_model_row_free on a hit only. */
 int predict0_registry_lookup(sqlite3 *db, const char *model_id,
                              predict0_model_row *out);
 void predict0_model_row_free(predict0_model_row *m);
@@ -152,7 +157,10 @@ void predict0_model_row_free(predict0_model_row *m);
 int predict0_hash_file(const char *path, char out[PREDICT_HEX_BUFSIZE],
                        char **errmsg);
 
-/* ---- runtime backends (predict-onnx.c, opt-in build) ---- */
+/* ---- backend result type + runtime entry points ----
+ * The neutral result/option types and the tree runtime
+ * (predict-student.c) are zero-dependency core; the predict0_onnx_*
+ * entry points (predict-onnx.c) exist only in the opt-in ONNX build. */
 
 /* Backend-relevant options, parsed from the predict() JSON. Borrowed
  * pointers into the caller's parsed options; valid for the call only. */

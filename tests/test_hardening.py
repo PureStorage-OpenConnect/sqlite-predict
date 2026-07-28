@@ -7,11 +7,7 @@ import sqlite3
 import pytest
 import synthetic as syn
 import synthetic_tabular as syt
-
-
-def forecast_doc(db, sql, *params):
-    (raw,) = db.execute(sql, params).fetchone()
-    return json.loads(raw)
+from conftest import anomaly_doc, forecast_doc
 
 
 def test_too_many_features_errors_loudly(db):
@@ -55,7 +51,7 @@ def test_epoch_milliseconds_not_mangled(db):
         "INSERT INTO es VALUES (?, ?)",
         [(base_ms + i * 3_600_000, 10.0 + i) for i in range(50)],
     )
-    doc = forecast_doc(db, "SELECT forecast(t, v, 2) FROM es")
+    doc = forecast_doc(db, 2, table="es", ts_col="t", value_col="v")
     assert doc["status"] == "ok"
     assert doc["rows"][0]["forecast_timestamp"] == "2026-01-03T02:00:00Z"
 
@@ -70,7 +66,7 @@ def test_pre_epoch_dates_handled_correctly(db):
         [(f"1969-12-{1 + i // 24:02d}T{i % 24:02d}:00:00Z", float(i))
          for i in range(40)],
     )
-    doc = forecast_doc(db, "SELECT forecast(ts, v, 2) FROM old")
+    doc = forecast_doc(db, 2, table="old", value_col="v")
     assert doc["status"] == "ok"
     assert doc["rows"][0]["forecast_timestamp"].startswith("1969-12-")
 
@@ -106,7 +102,7 @@ def test_huge_integer_epoch_is_bounded(db):
     db.execute("CREATE TABLE big(t INTEGER, v REAL)")
     db.executemany("INSERT INTO big VALUES (?, ?)",
                    [(9_000_000_000_000_000 + i, float(i)) for i in range(20)])
-    doc = forecast_doc(db, "SELECT forecast(t, v, 2) FROM big")
+    doc = forecast_doc(db, 2, table="big", ts_col="t", value_col="v")
     assert doc["status"] == "non_numeric"
     assert doc["rows"] == []
 
@@ -118,9 +114,9 @@ def test_serving_path_writes_nothing(db):
     rows, _ = syn.trend_season(n=60, seed=63)
     syn.load_into(db, rows)
     db.execute("PRAGMA query_only=ON")
-    doc = forecast_doc(db, "SELECT forecast(ts, value, 3) FROM series")
+    doc = forecast_doc(db, 3)
     assert doc["status"] == "ok" and len(doc["rows"]) == 3
-    doc = forecast_doc(db, "SELECT detect_anomalies(ts, value) FROM series")
+    doc = anomaly_doc(db)
     assert doc["status"] == "ok"
     db.execute("PRAGMA query_only=OFF")
     n, = db.execute(

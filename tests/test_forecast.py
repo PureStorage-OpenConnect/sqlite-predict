@@ -1,20 +1,7 @@
 import json
 import math
 import synthetic as syn
-
-
-def run_forecast(db, horizon, table="series", ts_col="ts", value_col="value",
-                 **options):
-    """Run the forecast aggregate over a whole table and parse the JSON
-    document it returns."""
-    if options:
-        sql = f"SELECT forecast({ts_col}, {value_col}, ?, ?) FROM {table}"
-        params = (horizon, json.dumps(options))
-    else:
-        sql = f"SELECT forecast({ts_col}, {value_col}, ?) FROM {table}"
-        params = (horizon,)
-    doc, = db.execute(sql, params).fetchone()
-    return json.loads(doc)
+from conftest import forecast_doc
 
 
 def mae(pairs):
@@ -33,7 +20,7 @@ def test_models_beat_flat_forecast_on_structured_series(db):
     flat = mae([(train[-1][1], t) for t in truth])
 
     for model in ("theta-classic", "stub-seasonal-naive"):
-        doc = run_forecast(db, 24, model=model)
+        doc = forecast_doc(db, 24, model=model)
         assert doc["status"] == "ok"
         assert len(doc["rows"]) == 24
         fcs = [r["forecast"] for r in doc["rows"]]
@@ -49,7 +36,7 @@ def test_seasonal_phase_is_tracked(db):
     train, future = split_series(rows, 24)
     syn.load_into(db, train)
     truth = [v for _, v in future]
-    doc = run_forecast(db, 24)
+    doc = forecast_doc(db, 24)
     fcs = [r["forecast"] for r in doc["rows"]]
 
     # de-mean both and correlate: seasonal phase must align
@@ -65,7 +52,7 @@ def test_interval_coverage_reasonable(db):
     rows, _ = syn.trend_season(n=200, noise=1.0, seed=13)
     train, future = split_series(rows, 24)
     syn.load_into(db, train)
-    doc = run_forecast(db, 24, confidence_level=0.95)
+    doc = forecast_doc(db, 24, confidence_level=0.95)
     out = doc["rows"]
     covered = sum(
         1 for r, (_, t) in zip(out, future)
@@ -96,7 +83,7 @@ def test_group_by_splits_series(db):
 def test_insufficient_history_is_status_not_error(db):
     rows, _ = syn.random_walk(n=5, seed=16)
     syn.load_into(db, rows)
-    doc = run_forecast(db, 6)
+    doc = forecast_doc(db, 6)
     assert doc["status"] == "insufficient_history"
     assert doc["rows"] == []  # no forecast rows on a degraded series
 
@@ -104,7 +91,7 @@ def test_insufficient_history_is_status_not_error(db):
 def test_context_limit_truncates_with_status(db):
     rows, _ = syn.trend_season(n=150, seed=17)
     syn.load_into(db, rows)
-    doc = run_forecast(db, 3, context_limit=50)
+    doc = forecast_doc(db, 3, context_limit=50)
     assert doc["status"] == "truncated"
     assert len(doc["rows"]) == 3
 
@@ -116,7 +103,7 @@ def test_integer_epoch_seconds_timestamps(db):
         "INSERT INTO es VALUES (?, ?)",
         [(base + i * 3600, 10.0 + i) for i in range(50)],
     )
-    doc = run_forecast(db, 2, table="es", ts_col="t", value_col="v")
+    doc = forecast_doc(db, 2, table="es", ts_col="t", value_col="v")
     assert doc["status"] == "ok"
     # hour 50 on the grid
     assert doc["rows"][0]["forecast_timestamp"] == "2026-01-03T02:00:00Z"
@@ -125,6 +112,6 @@ def test_integer_epoch_seconds_timestamps(db):
 def test_forecast_is_deterministic(db):
     rows, _ = syn.trend_season(n=120, seed=19)
     syn.load_into(db, rows)
-    one = run_forecast(db, 6)
-    two = run_forecast(db, 6)
+    one = forecast_doc(db, 6)
+    two = forecast_doc(db, 6)
     assert one == two

@@ -72,6 +72,23 @@ def level_shift(n=200, shift_at=120, magnitude=15.0, noise=0.5, level=20.0,
                   "magnitude": magnitude}
 
 
+def intermittent_trailing_zeros(n=200, active=25):
+    """Early varying demand, then a long tail of zeros: seasonal-naive+drift
+    extrapolates a spurious trend, tsb stays at a small non-negative rate."""
+    rows = [(f"2024-01-01T{i // 24:02d}:{i % 24:02d}:00",
+             float((i * 7 + 3) % 9 + 3) if i < active else 0.0)
+            for i in range(n)]
+    return rows, {"kind": "intermittent_trailing_zeros", "active": active}
+
+
+def wave(t, period=16):
+    """Point sample (not a generator) of the clean multi-seasonal wave the
+    distillation tests train and serve on: two sine components over a base
+    level, deterministic and learnable."""
+    return (10.0 + 5.0 * math.sin(2 * math.pi * t / period)
+            + 2.0 * math.sin(2 * math.pi * t / (period * 2)))
+
+
 def with_anomalies(rows, k=5, magnitude=8.0, seed=5):
     """Inject k point anomalies into an existing series. Returns
     (rows, anomaly_indices). Never places anomalies in the first 20% of

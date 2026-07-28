@@ -1,14 +1,15 @@
-"""Auto model selection, conformal intervals, and the backtest() TVF.
-
-These share one rolling-origin backtest core, so the tests probe the three
-surfaces and their edges together. Adversarial by design: short series, huge
-gaps, bad options, and the invariants that must hold on every fold.
+"""The backtest() TVF (RFC §4.2.4): rolling-origin fold metrics and their
+invariants, auto selection and conformal coverage as measured through
+backtest, and the distilled forecast student as a portable auto candidate.
+Adversarial by design: short series, huge gaps, bad options, and the
+invariants that must hold on every fold.
 """
 import json
 import sqlite3
 
 import pytest
 import synthetic as syn
+from conftest import forecast_doc
 
 FC = "SELECT ts, value FROM series"
 
@@ -26,19 +27,6 @@ def bt(db, horizon, **options):
 def avg_mase(db, model, horizon=12, folds=10):
     return rows(db, "SELECT avg(mase) FROM backtest(?, ?, ?)", FC, horizon,
                 json.dumps({"model": model, "folds": folds}))[0][0]
-
-
-def fc(db, horizon, table="series", **options):
-    """Aggregate-form forecast: one JSON document {model, status, rows}."""
-    if options:
-        doc, = db.execute(
-            "SELECT forecast(ts, value, ?, ?) FROM %s" % table,
-            (horizon, json.dumps(options))).fetchone()
-    else:
-        doc, = db.execute(
-            "SELECT forecast(ts, value, ?) FROM %s" % table,
-            (horizon,)).fetchone()
-    return json.loads(doc)
 
 
 # ---------------------------------------------------------------- auto select
@@ -62,14 +50,6 @@ def test_auto_reports_a_real_model_name(db):
     assert names and names <= {"theta-classic", "stub-seasonal-naive"}
 
 
-def test_forecast_auto_produces_a_full_horizon(db):
-    series, _ = syn.trend_season(n=200, noise=1.0, seed=9)
-    syn.load_into(db, series)
-    d = fc(db, 6, model="auto")
-    assert d["status"] == "ok"
-    assert len(d["rows"]) == 6
-
-
 # ---------------------------------------------------------------- conformal
 
 def test_conformal_beats_residual_coverage_on_smooth_data(db):
@@ -90,35 +70,6 @@ def test_conformal_beats_residual_coverage_on_smooth_data(db):
     resid = coverage(False)
     assert 0.82 <= conf <= 1.0, conf
     assert conf > resid, (conf, resid)
-
-
-def test_conformal_band_differs_from_residual(db):
-    series, _ = syn.trend_season(n=200, noise=1.0, seed=4)
-    syn.load_into(db, series)
-    r = fc(db, 6)["rows"]
-    c = fc(db, 6, interval_method="conformal")["rows"]
-    rw = sum(x["upper_bound"] - x["lower_bound"] for x in r)
-    cw = sum(x["upper_bound"] - x["lower_bound"] for x in c)
-    assert abs(rw - cw) > 1e-6
-
-
-def test_conformal_and_auto_compose(db):
-    series, _ = syn.trend_season(n=220, noise=1.5, seed=6)
-    syn.load_into(db, series)
-    d = fc(db, 6, model="auto", interval_method="conformal")
-    assert d["status"] == "ok"
-    assert len(d["rows"]) == 6
-    assert all(x["lower_bound"] <= x["upper_bound"] for x in d["rows"])
-
-
-def test_conformal_rejects_series_too_short_to_calibrate(db):
-    """Fail loud, not silent: too few out-of-sample folds to calibrate a
-    conformal band -> insufficient_history, no bogus interval."""
-    series, _ = syn.trend_season(n=14, noise=0.5, seed=2)
-    syn.load_into(db, series)
-    d = fc(db, 6, interval_method="conformal")
-    assert d["status"] == "insufficient_history"
-    assert d["rows"] == []
 
 
 # ---------------------------------------------------------------- backtest()
@@ -184,23 +135,6 @@ def test_backtest_grouped_series(db):
     assert {r[0] for r in out} == {"a", "b"}
 
 
-# ---------------------------------------------------------------- bad options
-
-@pytest.mark.parametrize("opts", [
-    {"folds": 0},                       # below 1
-    {"folds": 100000},                  # above cap
-    {"gap": -1},                        # negative
-    {"interval_method": "bogus"},       # not residual/conformal
-    {"folds": "x"},                     # wrong type
-])
-def test_forecast_rejects_bad_options(db, opts):
-    series, _ = syn.trend_season(n=100, noise=1.0, seed=1)
-    syn.load_into(db, series)
-    with pytest.raises(sqlite3.OperationalError):
-        db.execute("SELECT forecast(ts, value, 6, ?) FROM series",
-                   (json.dumps(opts),)).fetchone()
-
-
 def test_backtest_rejects_unknown_model(db):
     series, _ = syn.trend_season(n=100, noise=1.0, seed=1)
     syn.load_into(db, series)
@@ -209,35 +143,11 @@ def test_backtest_rejects_unknown_model(db):
              json.dumps({"model": "no-such-model"}))
 
 
-# ---------------------------------------------------------------- tsb (intermittent)
-
-def _intermittent_trailing_zeros(n=200, active=25):
-    """Early varying demand, then a long tail of zeros: seasonal-naive+drift
-    extrapolates a spurious trend, tsb stays at a small non-negative rate."""
-    return [(f"2024-01-01T{i // 24:02d}:{i % 24:02d}:00",
-             float((i * 7 + 3) % 9 + 3) if i < active else 0.0)
-            for i in range(n)]
-
-
-def test_tsb_forecast_is_flat_and_nonnegative(db):
-    syn.load_into(db, _intermittent_trailing_zeros())
-    d = fc(db, 5, model="tsb")
-    fcs = [x["forecast"] for x in d["rows"]]
-    assert len(fcs) == 5
-    assert all(abs(f - fcs[0]) < 1e-12 for f in fcs)   # intermittent = flat rate
-    assert fcs[0] >= 0
-
-
-def test_tsb_rejected_in_detect_anomalies(db):
-    syn.load_into(db, _intermittent_trailing_zeros())
-    with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT detect_anomalies(ts, value, ?) FROM series",
-                   (json.dumps({"model": "tsb"}),)).fetchone()
-    assert "PREDICT_ERR_OPTIONS" in str(e.value)
-
+# ------------------------------------------- tsb (intermittent) via backtest
 
 def test_tsb_wins_intermittent_and_auto_picks_it(db):
-    syn.load_into(db, _intermittent_trailing_zeros())
+    series, _ = syn.intermittent_trailing_zeros()
+    syn.load_into(db, series)
     tsb = avg_mase(db, "tsb", horizon=6, folds=15)
     theta = avg_mase(db, "theta-classic", horizon=6, folds=15)
     snaive = avg_mase(db, "stub-seasonal-naive", horizon=6, folds=15)
@@ -254,62 +164,6 @@ def test_auto_pool_includes_tsb(db):
     assert abs(avg_mase(db, "auto") - best) < 1e-9
 
 
-# ------------------------------------------------------------- auto candidates
-
-def _fc_auto(db, cands, horizon=4):
-    d = fc(db, horizon, model="auto", candidates=cands)
-    return [x["forecast"] for x in d["rows"]]
-
-
-def test_candidates_restrict_and_select_pool(db):
-    """The candidate set is the auto pool: restricting it changes the winner,
-    and auto picks the better of a mixed set."""
-    syn.load_into(db, _intermittent_trailing_zeros())
-    tsb_only = _fc_auto(db, ["tsb"])
-    theta_only = _fc_auto(db, ["theta-classic"])
-    both = _fc_auto(db, ["tsb", "theta-classic"])
-    assert all(abs(v) < 0.05 for v in tsb_only)      # tsb rate ~ 0 on the tail
-    assert any(abs(v) > 0.05 for v in theta_only)     # theta is not flat-zero
-    assert both == tsb_only                           # auto picks tsb (the better)
-
-
-def test_candidates_narrows_the_default_and_rejects_named_models(db):
-    series, _ = syn.trend_season(n=100, seed=1)
-    syn.load_into(db, series)
-    # auto is the default, so bare candidates narrows the default pool
-    doc = json.loads(db.execute(
-        "SELECT forecast(ts, value, 6, ?) FROM series",
-        (json.dumps({"candidates": ["theta-classic"]}),)).fetchone()[0])
-    assert doc["status"] == "ok"
-    assert doc["model"] == "theta-classic"
-    # but candidates alongside a pinned non-auto model is a contradiction
-    with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT forecast(ts, value, 6, ?) FROM series",
-                   (json.dumps({"model": "tsb",
-                                "candidates": ["theta-classic"]}),)).fetchone()
-    assert "PREDICT_ERR_OPTIONS" in str(e.value)
-
-
-def test_candidates_reject_unknown(db):
-    series, _ = syn.trend_season(n=100, seed=1)
-    syn.load_into(db, series)
-    with pytest.raises(sqlite3.OperationalError):
-        db.execute("SELECT forecast(ts, value, 6, ?) FROM series",
-                   (json.dumps({"model": "auto",
-                                "candidates": ["theta-classic", "nope"]}),
-                    )).fetchone()
-
-
-def test_candidates_conformal_with_stat_models_ok(db):
-    series, _ = syn.trend_season(n=200, noise=1.0, seed=3)
-    syn.load_into(db, series)
-    d = fc(db, 6, model="auto",
-           candidates=["theta-classic", "stub-seasonal-naive"],
-           interval_method="conformal")
-    assert len(d["rows"]) == 6
-    assert all(x["lower_bound"] <= x["upper_bound"] for x in d["rows"])
-
-
 # ------------------------- distilled student: distributable + auto candidate
 
 # A distilled forecast student is created and served entirely in the
@@ -317,13 +171,7 @@ def test_candidates_conformal_with_stat_models_ok(db):
 # Here the training query supplies the future columns directly (a perfect
 # teacher baked into the data), so no onnx is involved.
 
-_LS, _HS, _PS = 32, 8, 16
-
-
-def _wave(t):
-    import math
-    return (10.0 + 5.0 * math.sin(2 * math.pi * t / _PS)
-            + 2.0 * math.sin(2 * math.pi * t / (_PS * 2)))
+_LS, _HS = 32, 8
 
 
 def _distill_student(db, student_id="stud", horizon=_HS):
@@ -331,8 +179,8 @@ def _distill_student(db, student_id="stud", horizon=_HS):
     db.execute("CREATE TABLE w(%s)" % ",".join("c%d REAL" % i for i in range(ncol)))
     db.executemany(
         "INSERT INTO w VALUES (%s)" % ",".join("?" * ncol),
-        [[_wave(k + i) for i in range(_LS)]
-         + [_wave(k + _LS + j) for j in range(horizon)] for k in range(300)])
+        [[syn.wave(k + i) for i in range(_LS)]
+         + [syn.wave(k + _LS + j) for j in range(horizon)] for k in range(300)])
     cols = ",".join("c%d" % i for i in range(ncol))
     db.execute("SELECT model_id FROM distill_forecast(?, json(?))",
                ("SELECT %s FROM w" % cols,
@@ -345,7 +193,7 @@ def _wave_series(db, n=64, base=1000):
     db.execute("CREATE TABLE s(ts TEXT, value REAL)")
     db.executemany(
         "INSERT INTO s VALUES (?,?)",
-        [(f"2020-01-01T{i // 60:02d}:{i % 60:02d}:00", _wave(base + i))
+        [(f"2020-01-01T{i // 60:02d}:{i % 60:02d}:00", syn.wave(base + i))
          for i in range(n)])
 
 
@@ -354,12 +202,12 @@ def test_distilled_student_competes_as_auto_candidate(db):
     auto pool alongside the baselines, deterministically."""
     _distill_student(db, "stud")
     _wave_series(db)
-    d = fc(db, 6, table="s", model="auto",
-           candidates=["theta-classic", "stud"])
+    d = forecast_doc(db, 6, table="s", model="auto",
+                     candidates=["theta-classic", "stud"])
     assert d["status"] == "ok"
     assert len(d["rows"]) == 6
-    assert fc(db, 6, table="s", model="auto",
-              candidates=["theta-classic", "stud"]) == d  # deterministic
+    assert forecast_doc(db, 6, table="s", model="auto",
+                        candidates=["theta-classic", "stud"]) == d  # deterministic
 
 
 def test_distilled_student_is_distributable(db):

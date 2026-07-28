@@ -1,8 +1,8 @@
 /* ASan/valgrind soak for the onnx backend. Exercises the vector path and
  * its error branches repeatedly so a sanitizer sees every alloc/free pair
  * in predict-onnx.c. Needs a fixture model path as argv[1] (tests/fixtures/
- * logreg.onnx). Built by `make soak-onnx`; onnxruntime's own still-reachable
- * allocations are filtered by tests/onnx.supp. */
+ * logreg.onnx). Built by `make test-asan-onnx`; onnxruntime's own
+ * still-reachable allocations are filtered by tests/onnx.supp. */
 #include "predict-internal.h"
 
 static int run(sqlite3 *db, const char *sql, int expect_ok) {
@@ -14,10 +14,14 @@ static int run(sqlite3 *db, const char *sql, int expect_ok) {
     for (int i = 0; i < sqlite3_column_count(st); i++)
       (void)sqlite3_column_text(st, i);
   sqlite3_finalize(st);
-  if (expect_ok && rc != SQLITE_DONE)
+  if (expect_ok && rc != SQLITE_DONE) {
+    fprintf(stderr, "FAIL (expected ok): %s: %s\n", sql, sqlite3_errmsg(db));
     return 1;
-  if (!expect_ok && rc == SQLITE_DONE)
+  }
+  if (!expect_ok && rc == SQLITE_DONE) {
+    fprintf(stderr, "FAIL (expected error): %s\n", sql);
     return 1;
+  }
   return 0;
 }
 
@@ -94,90 +98,99 @@ int main(int argc, char **argv) {
       sqlite3_close(db);
       return 1;
     }
-    run(db, "CREATE TABLE ser(ts TEXT, value REAL)", 1);
-    run(db, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
-            " i < 40) INSERT INTO ser SELECT printf('2020-01-01T%02d:00:00', i),"
-            " 10.0 + (i%9) FROM n",
+  }
+
+  int fails = 0;
+  if (two_head) {
+    fails += run(db, "CREATE TABLE ser(ts TEXT, value REAL)", 1);
+    fails += run(db,
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
+        " i < 40) INSERT INTO ser SELECT datetime('2020-01-01', '+' || i ||"
+        " ' hours'), 10.0 + (i%9) FROM n",
         1);
-    run(db, "CREATE TABLE sk(series_key INTEGER, t INTEGER, value REAL)", 1);
-    run(db, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
-            " i < 60) INSERT INTO sk SELECT 0, i, 10.0 + (i%9) FROM n",
+    fails += run(db, "CREATE TABLE sk(series_key INTEGER, t INTEGER,"
+                     " value REAL)", 1);
+    fails += run(db,
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
+        " i < 60) INSERT INTO sk SELECT 0, i, 10.0 + (i%9) FROM n",
         1);
     /* distill the two-head teacher into forecast students -- exercises the
      * skip/nhid=0 training allocations: a TiDE student (hidden default) and a
      * pure-linear student (hidden=0), point and quantile. */
-    run(db, "SELECT * FROM distill_forecast('SELECT series_key, value FROM sk"
-            " ORDER BY series_key, t', json_object('teacher','th','context',8,"
-            "'horizon',3,'student_id','fs_tide','epochs',60,'receipt',0))",
+    fails += run(db,
+        "SELECT * FROM distill_forecast('SELECT series_key, value FROM sk"
+        " ORDER BY series_key, t', json_object('teacher','th','context',8,"
+        "'horizon',3,'student_id','fs_tide','epochs',60))",
         1);
-    run(db, "SELECT * FROM distill_forecast('SELECT series_key, value FROM sk"
-            " ORDER BY series_key, t', json_object('teacher','th','context',8,"
-            "'horizon',3,'hidden',0,'student_id','fs_lin','epochs',60,"
-            "'receipt',0))",
+    fails += run(db,
+        "SELECT * FROM distill_forecast('SELECT series_key, value FROM sk"
+        " ORDER BY series_key, t', json_object('teacher','th','context',8,"
+        "'horizon',3,'hidden',0,'student_id','fs_lin','epochs',60))",
         1);
   }
 
-  run(db, "CREATE TABLE apply(id INTEGER, f1 REAL, f2 REAL)", 1);
-  run(db,
+  fails += run(db, "CREATE TABLE apply(id INTEGER, f1 REAL, f2 REAL)", 1);
+  fails += run(db,
       "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
       " i < 1500) INSERT INTO apply SELECT i, (i%7)-3.0, (i%5)-2.0 FROM n",
       1);
-  run(db, "CREATE TABLE tr(id INTEGER, f1 REAL, f2 REAL, label TEXT)", 1);
-  run(db,
+  fails += run(db, "CREATE TABLE tr(id INTEGER, f1 REAL, f2 REAL,"
+                   " label TEXT)", 1);
+  fails += run(db,
       "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE"
       " i < 40) INSERT INTO tr SELECT i, (i%5)-2.0, (i%3)-1.0,"
       " CAST(i%2 AS TEXT) FROM n",
       1);
 
   for (int i = 0; i < 20; i++) {
-    /* vector: success (multi-batch: 1501 rows), with and without receipt */
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','clf'))", 1);
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','clf','receipt',0))", 1);
+    /* vector: success (multi-batch: 1501 rows) */
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM"
+            " apply',json_object('model','clf'))", 1);
     /* introspected model + positional features */
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','bare','receipt',0))", 1);
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM"
+            " apply',json_object('model','bare'))", 1);
     /* in_context: success (train context + 1501-row query, multi-batch) */
-    run(db, "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+    fails += run(db, "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
             "'SELECT id, f1, f2 FROM apply',json_object('model','knn1'))", 1);
-    run(db, "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
-            "'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','knn1','receipt',0))", 1);
     /* every error branch, both layouts */
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','clf','device','banana'))", 0);
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','clf','device','cuda'))", 0);
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','clf','precision','fp16'))", 0);
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1 FROM apply',"
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM"
+            " apply',json_object('model','clf','device','banana'))", 0);
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM"
+            " apply',json_object('model','clf','device','cuda'))", 0);
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM"
+            " apply',json_object('model','clf','precision','fp16'))", 0);
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1 FROM apply',"
             "json_object('model','clf'))", 0);
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','ghost'))", 0);
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM"
+            " apply',json_object('model','ghost'))", 0);
     /* in_context error branches: no train, missing target, bad label */
-    run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
-            "json_object('model','knn1'))", 0);
-    run(db, "SELECT * FROM predict('SELECT f1, f2 FROM tr',"
+    fails += run(db, "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM"
+            " apply',json_object('model','knn1'))", 0);
+    fails += run(db, "SELECT * FROM predict('SELECT f1, f2 FROM tr',"
             "'SELECT id, f1, f2 FROM apply',json_object('model','knn1'))", 0);
-    /* two-head forecast: reconstruction success + point/interval, then the
-     * fail-loud single-output flip declaration */
+    /* two-head forecast (aggregate form): reconstruction success +
+     * point/interval, then the fail-loud single-output flip declaration */
     if (two_head) {
-      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
-              "json_object('model','th','confidence_level',0.8))", 1);
-      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
-              "json_object('model','th','receipt',0))", 1);
-      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
-              "json_object('model','badf','receipt',0))", 0);
+      fails += run(db, "SELECT forecast(ts, value, 3,"
+              "json_object('model','th','confidence_level',0.8)) FROM ser", 1);
+      fails += run(db, "SELECT forecast(ts, value, 3,"
+              "json_object('model','th')) FROM ser", 1);
+      fails += run(db, "SELECT forecast(ts, value, 3,"
+              "json_object('model','badf')) FROM ser", 0);
       /* serve the distilled skip students (TiDE + pure linear) */
-      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
-              "json_object('model','fs_tide','receipt',0))", 1);
-      run(db, "SELECT * FROM forecast('SELECT ts, value FROM ser', 3,"
-              "json_object('model','fs_lin','confidence_level',0.8))", 1);
+      fails += run(db, "SELECT forecast(ts, value, 3,"
+              "json_object('model','fs_tide')) FROM ser", 1);
+      fails += run(db, "SELECT forecast(ts, value, 3,"
+              "json_object('model','fs_lin','confidence_level',0.8))"
+              " FROM ser", 1);
     }
   }
 
   sqlite3_close(db);
+  if (fails) {
+    fprintf(stderr, "onnx soak: %d unexpected statement results\n", fails);
+    return 1;
+  }
   fprintf(stderr, "onnx soak ok\n");
   return 0;
 }

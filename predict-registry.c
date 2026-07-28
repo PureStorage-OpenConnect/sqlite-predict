@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* Model registry (_predict_models) and content hashing. RFC 0005 §4.1.
+/* Model registry (_predict_models) and content hashing. RFC 0005 §4.1.1.
  * Registered models are content-addressed: content_hash pins the exact
- * weights and is verified before deserialization (§6.2).
+ * weights and is verified at load, before deserialization (§6.2):
+ * inline blobs in predict0_registry_lookup, URI weights in the onnx
+ * session builder.
  *
  * One deliberate deviation from the 0005 draft, to feed its revision:
  * model kind 'ts-stat' (the draft's kind vocabulary lacks statistical
@@ -17,46 +19,6 @@ SQLITE_EXTENSION_INIT3
 #pragma region hashing
 
 void predict0_hash_init(predict0_hasher *h) { sha256_init(&h->sha); }
-
-static void hash_sep(predict0_hasher *h) {
-  static const u8 fs = PREDICT_FS;
-  sha256_update(&h->sha, &fs, 1);
-}
-
-void predict0_hash_null(predict0_hasher *h) {
-  sha256_update(&h->sha, (const u8 *)"n", 1);
-  hash_sep(h);
-}
-
-void predict0_hash_int(predict0_hasher *h, i64 v) {
-  char buf[24];
-  int n = snprintf(buf, sizeof(buf), "i%lld", (long long)v);
-  sha256_update(&h->sha, (const u8 *)buf, (usize)n);
-  hash_sep(h);
-}
-
-void predict0_hash_real(predict0_hasher *h, f64 v) {
-  u64 bits;
-  memcpy(&bits, &v, 8);
-  u8 buf[9];
-  buf[0] = 'r';
-  for (int i = 0; i < 8; i++)
-    buf[1 + i] = (u8)(bits >> (8 * (7 - i))); /* big-endian bit pattern */
-  sha256_update(&h->sha, buf, 9);
-  hash_sep(h);
-}
-
-void predict0_hash_text(predict0_hasher *h, const char *s) {
-  sha256_update(&h->sha, (const u8 *)"t", 1);
-  if (s)
-    sha256_update(&h->sha, (const u8 *)s, strlen(s));
-  hash_sep(h);
-}
-
-void predict0_hash_row_end(predict0_hasher *h) {
-  static const u8 rs = PREDICT_RS;
-  sha256_update(&h->sha, &rs, 1);
-}
 
 void predict0_hash_hex(predict0_hasher *h, char hex[PREDICT_HEX_BUFSIZE]) {
   u8 digest[32];
@@ -87,9 +49,9 @@ static const char *DDL =
     "  license      TEXT NOT NULL,\n"
     "  created_at   TEXT NOT NULL\n"
     "    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n"
-    /* remote/bundled models carry no local weights. Local runtimes carry\n"
-     * exactly one source: an inline BLOB (small students, travel with the\n"
-     * DB through snapshot/fork) XOR an external URI (large teachers that\n"
+    /* remote/bundled models carry no local weights. Local runtimes carry
+     * exactly one source: an inline BLOB (small students, travel with the
+     * DB through snapshot/fork) XOR an external URI (large teachers that
      * cannot live in a BLOB). */
     "  CHECK (CASE runtime\n"
     "    WHEN 'remote'  THEN weights IS NULL AND weights_uri IS NULL\n"
@@ -126,7 +88,7 @@ int predict0_registry_ensure(sqlite3 *db, char **errmsg) {
   int rc = sqlite3_exec(db, DDL, NULL, NULL, &emsg);
   if (rc != SQLITE_OK) {
     *errmsg = sqlite3_mprintf(
-        "%s: cannot create the model registry (%s)", PREDICT_ERR_RESOURCE,
+        "%s: cannot create the model registry: %s", PREDICT_ERR_RESOURCE,
         emsg ? emsg : "unknown");
     sqlite3_free(emsg);
     return rc;
@@ -215,6 +177,19 @@ int predict0_registry_lookup(sqlite3 *db, const char *model_id,
     predict0_model_row_free(out);
     return SQLITE_CORRUPT;
   }
+  /* content-address check (§6.2): inline weights must hash to the
+   * registered content_hash, or the row was tampered with/corrupted */
+  if (out->weights && out->weights_len > 0) {
+    predict0_hasher h;
+    predict0_hash_init(&h);
+    sha256_update(&h.sha, (const u8 *)out->weights, (usize)out->weights_len);
+    char hex[PREDICT_HEX_BUFSIZE];
+    predict0_hash_hex(&h, hex);
+    if (strcmp(hex, out->content_hash) != 0) {
+      predict0_model_row_free(out);
+      return 2; /* hash mismatch */
+    }
+  }
   return 0;
 }
 
@@ -229,16 +204,6 @@ void predict0_model_row_free(predict0_model_row *m) {
   sqlite3_free(m->content_hash);
   sqlite3_free(m->weights);
   memset(m, 0, sizeof(*m));
-}
-
-void predict0_results_free(predict0_result *rows, int n) {
-  if (!rows)
-    return;
-  for (int i = 0; i < n; i++) {
-    sqlite3_free(rows[i].ref_t);
-    sqlite3_free(rows[i].prediction);
-  }
-  sqlite3_free(rows);
 }
 
 int predict0_hash_file(const char *path, char out[PREDICT_HEX_BUFSIZE],

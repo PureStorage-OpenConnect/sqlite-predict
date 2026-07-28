@@ -37,7 +37,7 @@ prefix?=dist
 
 TARGET_LOADABLE=$(prefix)/predict0.$(LOADABLE_EXTENSION)
 
-OBJS=sqlite-predict.c predict-forecast.c predict-receipts.c predict-tabular.c predict-student.c predict-distill.c vendor/sha256.c
+OBJS=sqlite-predict.c predict-forecast.c predict-registry.c predict-tabular.c predict-student.c predict-distill.c vendor/sha256.c
 ONNX_OBJS=$(OBJS) predict-onnx.c
 
 # onnxruntime is a build+runtime dependency of the loadable-onnx variant
@@ -117,7 +117,7 @@ test-onnx: loadable-onnx
 
 # ASan+UBSan on the C soak driver (standalone executable: no DYLD
 # injection needed, macOS SIP strips it for system binaries anyway).
-# Covers every operation, receipts, replay, and the error paths.
+# Covers every operation and the error paths.
 test-asan: vendor/sqlite3ext.h sqlite-predict.h
 	mkdir -p $(prefix)
 	clang -std=c99 -g -O1 -fsanitize=address,undefined \
@@ -150,7 +150,7 @@ fuzz-build: vendor/sqlite3ext.h sqlite-predict.h
 	  -DSQLITE_CORE -DSQLITE_PREDICT_STATIC -DSQLITE_STRICT_SUBTYPE=1 \
 	  -Ivendor/ -I./ \
 	  fuzz/fuzz_predict.c $(OBJS) vendor/sqlite3.c \
-	  -o $(prefix)/fuzz_predict
+	  -o $(prefix)/fuzz_predict -lm -lpthread -ldl
 
 fuzz: fuzz-build
 	mkdir -p fuzz/corpus
@@ -194,6 +194,12 @@ soak-wasm: $(prefix) vendor/sqlite3ext.h sqlite-predict.h
 	  -sALLOW_MEMORY_GROWTH -sEXIT_RUNTIME=1 -sSTACK_SIZE=1048576 \
 	  tests/soak.c $(OBJS) vendor/sqlite3.c -o $(prefix)/soak.js
 
+# refresh the gitignored dev copies of the loadable inside the language
+# bindings, so their local test suites exercise the current build
+bindings-dev: loadable
+	cp $(prefix)/predict0.$(LOADABLE_EXTENSION) bindings/node/
+	cp $(prefix)/predict0.$(LOADABLE_EXTENSION) bindings/python/sqlite_predict/
+
 clean:
 	rm -rf $(prefix) sqlite-predict.h
 
@@ -201,7 +207,8 @@ format:
 	clang-format -i sqlite-predict.c predict-*.c
 
 .PHONY: loadable loadable-onnx loadable-onnx-gpu amalgamation amalgamation-check python-src rust-src \
-  sync-version debug test test-loadable test-onnx test-asan-onnx clean format
+  sync-version debug test test-loadable test-onnx test-asan test-asan-onnx test-valgrind \
+  fuzz fuzz-build fuzz-docker soak soak-wasm bindings-dev clean format
 
 # stage the amalgamation + SQLite ext headers into the python package so it can
 # build a self-contained wheel (used by dev installs and the wheels workflow)

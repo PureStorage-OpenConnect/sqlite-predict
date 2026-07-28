@@ -18,7 +18,11 @@ static void predict_version_fn(sqlite3_context *context, int argc,
 #ifdef SQLITE_PREDICT_ONNX
       ",\"onnx\""
 #endif
-      "],\"models\":[]}",
+      /* the bundled models every build serves (§4.2.8: registered
+       * aliases); user-registered models live in _predict_models and are
+       * per-database, so a pure version function cannot list them */
+      "],\"models\":[\"auto\",\"theta-classic\",\"stub-seasonal-naive\","
+      "\"tsb\",\"sub-pca\",\"knn5-incontext\"]}",
       SQLITE_PREDICT_VERSION, SQLITE_PREDICT_SPEC);
   if (!json) {
     sqlite3_result_error_nomem(context);
@@ -79,10 +83,9 @@ static void civil_from_days(i64 z, int *y, int *m, int *d) {
   *y = (int)(yy + (*m <= 2));
 }
 
-/* Read exactly `want` ASCII digits (no sign, no whitespace) at *pos,
- * advancing *pos. Returns the value, or -1 if fewer than `want` digits
- * are present. `want` is the minimum; single-digit fields are tolerated
- * only when `flex` and the field is unambiguously terminated. */
+/* Read min_d..max_d ASCII digits (no sign, no whitespace) at *pos,
+ * advancing *pos. Returns the value, or -1 if fewer than min_d digits
+ * are present. */
 static int read_digits(const char *s, int *pos, int min_d, int max_d) {
   int v = 0, got = 0;
   while (got < max_d && s[*pos] >= '0' && s[*pos] <= '9') {
@@ -162,6 +165,104 @@ void predict0_format_timestamp(i64 ms, char *buf, usize bufsize) {
            rem / 3600, (rem / 60) % 60, rem % 60);
 }
 
+/* Parse a JSON array of strings into a heap array of sqlite3_mprintf'd
+ * strings (caller frees each element and the array). path selects an
+ * array inside a larger document ("$.features"); NULL means json itself
+ * is the array (validated as one). Returns SQLITE_OK and sets out/n; on
+ * failure returns an SQLITE_ code with *errmsg set. */
+int predict0_json_str_array(sqlite3 *db, const char *json, const char *path,
+                            char ***out, int *n, char **errmsg) {
+  *out = NULL;
+  *n = 0;
+  int cap = 0;
+  sqlite3_stmt *st = NULL;
+  const char *sql = path ? "SELECT value FROM json_each(?1, ?2)"
+                         : "SELECT value FROM json_each(?1) WHERE"
+                           " json_type(?1) = 'array'";
+  if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+    *errmsg =
+        sqlite3_mprintf("%s: cannot parse option array", PREDICT_ERR_OPTIONS);
+    return SQLITE_ERROR;
+  }
+  sqlite3_bind_text(st, 1, json, -1, SQLITE_STATIC);
+  if (path)
+    sqlite3_bind_text(st, 2, path, -1, SQLITE_STATIC);
+  int rc = SQLITE_OK;
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    if (*n == cap) {
+      cap = cap ? cap * 2 : 8;
+      char **g = sqlite3_realloc(*out, sizeof(char *) * cap);
+      if (!g) {
+        rc = SQLITE_NOMEM;
+        break;
+      }
+      *out = g;
+    }
+    (*out)[*n] =
+        sqlite3_mprintf("%s", (const char *)sqlite3_column_text(st, 0));
+    if (!(*out)[*n]) {
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    (*n)++;
+  }
+  sqlite3_finalize(st);
+  if (rc == SQLITE_NOMEM)
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+  return rc;
+}
+
+/* Prepare a caller-supplied inner query with the safety contract every
+ * operation shares (§6.1): it must parse, be a single statement, and be
+ * read-only. what names the argument in error messages ("train_query").
+ * Returns SQLITE_OK with *out set, or SQLITE_ERROR with *errmsg set. */
+int predict0_prepare_ro(sqlite3 *db, const char *sql, const char *what,
+                        sqlite3_stmt **out, char **errmsg) {
+  *out = NULL;
+  if (!sql) {
+    *errmsg =
+        sqlite3_mprintf("%s: %s must be text", PREDICT_ERR_SCHEMA, what);
+    return SQLITE_ERROR;
+  }
+  sqlite3_stmt *stmt = NULL;
+  const char *tail = NULL;
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, &tail) != SQLITE_OK || !stmt) {
+    if (stmt)
+      sqlite3_finalize(stmt);
+    *errmsg = sqlite3_mprintf("%s: %s does not parse: %s", PREDICT_ERR_SCHEMA,
+                              what, sqlite3_errmsg(db));
+    return SQLITE_ERROR;
+  }
+  while (tail &&
+         (*tail == ' ' || *tail == '\n' || *tail == ';' || *tail == '\t'))
+    tail++;
+  if (tail && *tail != '\0') {
+    sqlite3_finalize(stmt);
+    *errmsg = sqlite3_mprintf("%s: %s must be a single statement",
+                              PREDICT_ERR_SCHEMA, what);
+    return SQLITE_ERROR;
+  }
+  if (!sqlite3_stmt_readonly(stmt)) {
+    sqlite3_finalize(stmt);
+    *errmsg = sqlite3_mprintf("%s: %s must be a read-only SELECT",
+                              PREDICT_ERR_QUERY_NOT_READONLY, what);
+    return SQLITE_ERROR;
+  }
+  *out = stmt;
+  return SQLITE_OK;
+}
+
+/* Free a runtime backend's neutral result array. */
+void predict0_results_free(predict0_result *rows, int n) {
+  if (!rows)
+    return;
+  for (int i = 0; i < n; i++) {
+    sqlite3_free(rows[i].ref_t);
+    sqlite3_free(rows[i].prediction);
+  }
+  sqlite3_free(rows);
+}
+
 f64 predict0_norm_quantile(f64 p) {
   /* Acklam's inverse normal CDF approximation, |relative error| < 1.15e-9 */
   static const f64 a[] = {-3.969683028665376e+01, 2.209460984245205e+02,
@@ -208,7 +309,7 @@ int predict0_options_parse(sqlite3 *db, const char *json,
       db, "SELECT key, value FROM json_each(?) WHERE json_type(?) = 'object'",
       -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
-    *errmsg = sqlite3_mprintf("%s: options parsing unavailable (%s)",
+    *errmsg = sqlite3_mprintf("%s: options parsing unavailable: %s",
                               PREDICT_ERR_OPTIONS, sqlite3_errmsg(db));
     return 1;
   }
@@ -297,15 +398,9 @@ static void ulid_encode(i64 ms, const u8 rand16[10], char *buf) {
   buf[26] = '\0';
 }
 
-void predict0_ulid_min(i64 ms, char *buf) {
+static void predict0_ulid_min(i64 ms, char *buf) {
   u8 zeros[10] = {0};
   ulid_encode(ms, zeros, buf);
-}
-
-void predict0_ulid_new(i64 ms, char *buf) {
-  u8 rnd[10];
-  sqlite3_randomness(sizeof(rnd), rnd);
-  ulid_encode(ms, rnd, buf);
 }
 
 static void predict_ulid_fn(sqlite3_context *context, int argc,
@@ -331,8 +426,9 @@ static void predict_ulid_fn(sqlite3_context *context, int argc,
  *     "license":"<SPDX>", "weights_uri":"/path/model.onnx",
  *     "io_spec": { ...tensor mapping... } }
  * The content_hash is computed from the weights file and pins the exact
- * bytes (verified before deserialization). Returns the content_hash. Registration is metadata only: executing the model still
- * requires the matching runtime to be compiled in. */
+ * bytes (verified again when the weights load). Returns the content_hash.
+ * Registration is metadata only: executing the model still requires the
+ * matching runtime to be compiled in. */
 static void predict_register_fn(sqlite3_context *context, int argc,
                                 sqlite3_value **argv) {
   UNUSED_PARAMETER(argc);
@@ -409,9 +505,15 @@ static void predict_register_fn(sqlite3_context *context, int argc,
   if (!license)
     license = sqlite3_mprintf("unspecified");
 
-  if (strcmp(runtime, "onnx") != 0 && strcmp(runtime, "ggml") != 0 &&
-      strcmp(runtime, "tree") != 0)
-    REG_FAIL("%s: predict_register handles onnx|ggml|tree runtimes, got '%s'",
+  if (strcmp(runtime, "tree") == 0)
+    /* tree students carry inline-BLOB weights that only distill_predict/
+     * distill_forecast write; a URI-registered 'tree' row could never be
+     * served, so reject it here rather than at first use */
+    REG_FAIL("%s: 'tree' students are created by distill_predict/"
+             "distill_forecast, not predict_register",
+             PREDICT_ERR_OPTIONS);
+  if (strcmp(runtime, "onnx") != 0 && strcmp(runtime, "ggml") != 0)
+    REG_FAIL("%s: predict_register handles onnx|ggml runtimes, got '%s'",
              PREDICT_ERR_OPTIONS, runtime);
   if (!uri)
     REG_FAIL("%s: %s models need a weights_uri", PREDICT_ERR_OPTIONS, runtime);
@@ -539,9 +641,6 @@ __declspec(dllexport)
    * DETERMINISTIC (its content_hash depends on a file read). */
   rc = sqlite3_create_function_v2(db, "predict_register", 2, SQLITE_UTF8,
                                   NULL, predict_register_fn, NULL, NULL, NULL);
-  if (rc != SQLITE_OK)
-    return rc;
-
   if (rc != SQLITE_OK)
     return rc;
   rc = predict0_forecast_init(db);
