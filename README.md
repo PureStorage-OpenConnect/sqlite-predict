@@ -129,8 +129,9 @@ parameters, and `GROUP BY` all compose naturally, from the CLI or from an ORM
 (Drizzle, SQLAlchemy, Diesel). They are **pure functions**: nothing is ever
 written, so they run on read-only databases and inside views. Each group
 returns one JSON document; expand it with `forecast_rows()` /
-`anomaly_rows()`, or `JSON.parse` it in your app. See [Using with
-ORMs](https://purestorage-openconnect.github.io/sqlite-predict/guides/orms/).
+`anomaly_rows()`, or `JSON.parse` it in your app. Each language's
+[getting-started guide](https://purestorage-openconnect.github.io/sqlite-predict/getting-started/python/)
+shows the pattern through its native ORM (SQLAlchemy, Drizzle, Diesel).
 
 `backtest`, `predict`, and the `distill_*` operations take read-only SELECT
 queries (training needs labeled or windowed row sets); their results are

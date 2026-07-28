@@ -39,12 +39,58 @@ console.log(JSON.parse(doc).rows[0]);
 ```
 
 Because it is an aggregate, `WHERE`, joins, and bound parameters compose, and
-`GROUP BY city` returns one document per city. This is the form Drizzle and
-other query builders build naturally.
+`GROUP BY city` returns one document per city.
+
+## Drizzle
+
+The same call through the query builder, with a bound parameter and no SQL
+strings (this is the code the CI smoke test runs):
+
+```ts
+import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import { sql, eq } from "drizzle-orm";
+import { sqliteTable, text, real } from "drizzle-orm/sqlite-core";
+import * as sp from "sqlite-predict";
+
+const sqlite = new Database("app.db");
+sqlite.loadExtension(sp.getLoadablePath());
+const db = drizzle(sqlite);
+
+const readings = sqliteTable("readings", {
+  city: text("city"), ts: text("ts"), value: real("value"),
+});
+
+const out = db
+  .select({
+    city: readings.city,
+    doc: sql`forecast(${readings.ts}, ${readings.value}, 24)`,
+  })
+  .from(readings)
+  .where(eq(readings.city, "SF"))   // bound parameter, no string SQL
+  .groupBy(readings.city)
+  .all();
+
+const { rows } = JSON.parse(out[0].doc);
+```
+
+If you use drizzle-kit, exclude sqlite-predict's model registry from schema
+diffs (it lives in your database, and diff tools will otherwise try to drop
+it):
+
+```ts
+// drizzle.config.ts
+export default { /* … */ tablesFilter: ["!_predict_*"] };
+```
+
+**Prisma**: the default engine never exposes the raw connection, so extensions
+can't load. Use a [driver adapter](https://www.prisma.io/docs/orm/overview/databases/database-drivers)
+(better-sqlite3 or libSQL) and load on the underlying connection as above; and
+since `_predict_*` tables are not in your Prisma schema, prefer `migrate diff`
+reviews over auto-apply so drift detection doesn't drop them.
 
 With `node:sqlite` you need `--experimental-sqlite` on Node 22, or a recent Node
 where it is stable. `sqlitePredict.getLoadablePath()` returns the binary path if
 you load it yourself.
 
-Next: [Operations](../../guides/operations/), or
-[Using with ORMs](../../guides/orms/) for the Drizzle pattern.
+Next: [Operations](../../guides/operations/).

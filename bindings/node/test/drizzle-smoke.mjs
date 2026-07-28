@@ -1,6 +1,7 @@
 // Drizzle ORM smoke test: compose the aggregate form of forecast()
 // through the query builder (the RFC 0005 §4.2.8 ORM path). Run by CI's
-// bindings job; the same pattern is documented in the ORM guide.
+// bindings job; the same pattern is documented in the JavaScript
+// getting-started guide.
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { sql, eq } from "drizzle-orm";

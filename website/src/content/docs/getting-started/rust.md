@@ -42,5 +42,20 @@ fn main() -> rusqlite::Result<()> {
 }
 ```
 
-Next: [Operations](../../guides/operations/), or
-[Using with ORMs](../../guides/orms/) for the Diesel pattern.
+Because `register()` uses `sqlite3_auto_extension`, every connection any
+rusqlite-based stack opens afterward has the functions, Diesel and sqlx
+included, with no per-connection hook:
+
+```rust
+unsafe { sqlite_predict::register()?; }   // once, before connecting
+
+// then through any rusqlite-based stack:
+let doc: String = conn.query_row(
+    "SELECT forecast(ts, value, 24) FROM readings WHERE city = ?1",
+    ["SF"], |r| r.get(0))?;
+```
+
+If a migration tool manages your schema, exclude sqlite-predict's model
+registry (`_predict_*` tables) from diffs so it doesn't get dropped.
+
+Next: [Operations](../../guides/operations/).
