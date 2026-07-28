@@ -32,6 +32,29 @@ div.hero {
   padding-block: 2.5rem 3.5rem;
 }
 
+/* Wide-screen layout. Starlight scales both the reading column and the "On this
+ * page" TOC with the viewport (the TOC via a literal "MAGIC NUMBER" set to 25%
+ * of the viewport), so on wide monitors the TOC balloons and drifts far from the
+ * text. Pin both columns to fixed widths, left-aligned right after the nav, and
+ * let the surplus fall to the right as margin. Starlight's rules live in
+ * @layer starlight.core, so these un-layered rules win without !important. */
+@media (min-width: 72rem) {
+  :is([data-has-sidebar][data-has-toc]) .main-pane {
+    width: var(--sl-content-width);
+    --sl-content-margin-inline: 0;
+  }
+  .right-sidebar-container {
+    width: var(--sl-sidebar-width);
+  }
+  .right-sidebar {
+    width: var(--sl-sidebar-width);
+  }
+  .right-sidebar-panel .sl-container {
+    max-width: calc(var(--sl-sidebar-width) - 2 * var(--sl-sidebar-pad-x));
+    margin-inline: 0;
+  }
+}
+
 :root[data-theme="light"] {
   --sl-color-accent-high: hsl(20, 95%, 34%);
   --sl-color-accent: hsl(19, 100%, 50%);
