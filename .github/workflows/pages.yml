@@ -37,7 +37,7 @@ jobs:
       # public). We feed those into the Astro build so one build serves either.
       - uses: actions/configure-pages@v5
         id: pages
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm

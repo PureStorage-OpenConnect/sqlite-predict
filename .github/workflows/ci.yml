@@ -48,7 +48,7 @@ jobs:
       # rust crate: compiles the amalgamation via build.rs, register + forecast
       - name: Rust crate
         run: make rust-src && cargo test --manifest-path bindings/rust/Cargo.toml
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       # node binding: load the extension and run a forecast through node:sqlite

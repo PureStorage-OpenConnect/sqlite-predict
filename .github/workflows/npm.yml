@@ -40,7 +40,7 @@ jobs:
           - { pkg: sqlite-predict-linux-arm64,  runner: ubuntu-latest, os: linux,  cpu: arm64, ext: so,    apt: "gcc-aarch64-linux-gnu", cc: "CC=aarch64-linux-gnu-gcc", macarch: "" }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -83,7 +83,7 @@ jobs:
       - name: Build loadable DLL
         shell: msys2 {0}
         run: make loadable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -108,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
