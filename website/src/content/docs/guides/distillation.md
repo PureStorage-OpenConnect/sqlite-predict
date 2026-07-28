@@ -75,3 +75,11 @@ to another database and used there. So you can **distill once on a capable
 machine and predict everywhere SQLite runs**. Only distilling *from a live
 foundation-model teacher* needs the optional ONNX build; a student distilled
 from its own target columns needs nothing extra.
+
+One caveat that is not mechanical: **the teacher's license governs what you
+may distill**. A student is derived from its teacher, and some model
+licenses restrict distillation or commercial use of outputs (TabFM's
+non-commercial license does both; Chronos is Apache-2.0; your own labels
+and models carry no such limits). The `accept_license` option makes a
+restrictively-licensed teacher an explicit opt-in, but confirming that your
+use fits the teacher's terms is your responsibility.

@@ -49,7 +49,8 @@ a toy series.
   series.
 - **Tabular.** Distilling TabFM into a gradient-boosted student **matches or
   beats tuned XGBoost** on most [TabArena](benchmarks/results/tabarena-full.md)
-  tasks, at a couple of kilobytes and microseconds per row.
+  tasks, at a couple of kilobytes and microseconds per row (an evaluation
+  under TabFM's non-commercial license; see the license note below).
 - **Calibrated uncertainty.** On smooth data the default Gaussian prediction
   band is overconfident (measured **0.57 coverage at a nominal 0.90**); the
   `conformal` option lands at the nominal level, and `backtest()` lets a caller
@@ -198,12 +199,22 @@ where a plain MLP does not) closes most of the gap to the FM (see
 
 By default `distill_predict()` trains directly on the target column. That
 column can hold your labels, or a strong teacher's predictions computed
-offline: run TabFM once over your training rows on a GPU box, store what it
-predicts, and distill compresses it into a student that runs anywhere
+offline: run the teacher once over your training rows on a GPU box, store
+what it predicts, and distill compresses it into a student that runs anywhere
 ([example above](#distill-a-foundation-model-into-your-database)).
 Pass a `teacher` to instead relabel the rows with a registered model first
 (for example, `'{"teacher":"knn5-incontext", ...}'` compresses the in-context
 k-NN into a standalone tree).
+
+**Teacher licenses govern what you may distill.** A distilled student is
+derived from its teacher, and some model licenses restrict that: TabFM's
+non-commercial license, for example, permits testing and evaluation (which
+is what our benchmarks are) but expressly excludes distilling it for
+commercial use or deploying its outputs in production. Chronos is
+Apache-2.0, and your own labels or models carry no such limits. The
+extension's license gate (`accept_license`) makes a restrictively-licensed
+teacher an explicit opt-in rather than an accident, but checking that your
+use fits the teacher's license is on you.
 
 Three student kinds: `'tree'` is a single decision tree (a few kilobytes,
 interpretable); `'gbt'` is a gradient-boosted forest with second-order
@@ -222,8 +233,8 @@ the teacher's soft targets rather than its argmax, keeping the calibration a
 hard label throws away.
 
 ```sql
--- distill TabFM's predicted probabilities (columns p_stay, p_churn), while the
--- true `churned` label scores the holdout
+-- distill the teacher's predicted probabilities (columns p_stay, p_churn),
+-- while the true `churned` label scores the holdout
 SELECT model_id, holdout_metric FROM distill_predict(
   'SELECT tenure, spend, p_stay, p_churn, churned FROM scored',
   '{"target":"churned","proba":["p_stay","p_churn"],
