@@ -14,10 +14,14 @@ SELECT forecast(ts, value, 12, '{"model":"auto"}') FROM readings;
 ```
 
 The default pool is the bundled statistical models (`theta-classic`,
-`stub-seasonal-naive`, `tsb` for intermittent demand). Pass `candidates` to set
-the pool explicitly, and a candidate may be a **distilled forecast student**, so
-your own compressed foundation model competes with the cheap baselines per
-series:
+`stub-seasonal-naive`, `tsb` for intermittent demand) **plus every eligible
+registered forecast student**: distill a model once and `auto` competes it
+against the baselines automatically, no call-site changes. Eligibility is
+per call: a student trained for a shorter horizon than requested, or any
+student when `interval_method` is `conformal`, sits that call out quietly.
+
+Pass `candidates` to narrow the pool explicitly, for example when many
+students are registered and you only want one backtested per call:
 
 ```sql
 SELECT forecast(ts, value, 12,
@@ -25,7 +29,8 @@ SELECT forecast(ts, value, 12,
 FROM readings;
 ```
 
-The winning model's id comes back in the result document's `model` field.
+The winning model's id comes back in the result document's `model` field, so
+you can see when your student beat the baselines.
 
 ## Conformal intervals
 

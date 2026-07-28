@@ -141,10 +141,11 @@ trailing JSON object (`'{"confidence_level":0.9}'`).
 ### Calibrated intervals, auto-selection, and backtesting
 
 - **Auto-selection.** `'{"model":"auto"}'` picks the model with the lowest
-  rolling-origin error per series, so you don't hand-tune the choice. It is
-  deterministic. `'{"model":"auto","candidates":[...]}'` sets the
-  pool explicitly, and a candidate may be a distilled forecast student, so the
-  agent's own model competes head-to-head with the baselines per series.
+  rolling-origin error per series, deterministically, over the bundled
+  statistical models plus every eligible registered forecast student: distill
+  once and your model competes with the baselines automatically, at every
+  call site. `'{"model":"auto","candidates":[...]}'` narrows the pool. The
+  result document's `model` field reports the winner.
 - **Conformal intervals.** `'{"interval_method":"conformal"}'` replaces the
   default Gaussian band with a distribution-free one calibrated on out-of-sample
   residuals. On smooth data the default band is overconfident; conformal lands
@@ -169,9 +170,9 @@ honest statistical models:
 - `theta-classic` (the Theta method) and `stub-seasonal-naive` for `forecast()`
   and `detect_anomalies()`; `tsb` (Teunter-Syntetos-Babai) for
   intermittent / sparse-demand `forecast()` (rare events: errors, retries).
-  `auto` picks among them per series by rolling-origin error, and a
-  `candidates` list sets the pool explicitly, a distilled forecast student
-  included
+  `auto` picks per series by rolling-origin error over these plus every
+  eligible registered forecast student; a `candidates` list narrows the
+  pool
 - `sub-pca` for `detect_anomalies(ts, value, '{"model":"sub-pca"}')`: a
   subsequence-reconstruction detector (windowed PCA reconstruction error), the
   method family that leads the TSB-AD-U benchmark; ~2x the residual detector on

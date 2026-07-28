@@ -16,7 +16,7 @@ rather than being ignored.
 | `interval_method` | `residual` \| `conformal` | `residual` | Interval construction. |
 | `folds` | integer | 20 | Rolling origins used by `auto` / conformal. |
 | `gap` | integer | 0 | Leakage guard between train and target. |
-| `candidates` | string[] | bundled stat models | Candidate pool for `auto`. |
+| `candidates` | string[] | stat models + eligible registered students | Narrows the `auto` pool. |
 | `context_limit` | integer | model default | Cap on points fed to the model. |
 
 Aggregate rules: the `options` argument and `horizon` must be the same value

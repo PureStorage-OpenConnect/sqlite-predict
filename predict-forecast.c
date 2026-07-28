@@ -1380,6 +1380,9 @@ typedef struct {
 #endif
   Candidate *cands;
   int n_cands;
+  int implicit_pool; /* auto pool discovered from the registry */
+  char **own_ids;    /* sqlite3_malloc'd ids for discovered students */
+  int n_own;
 } FcModels;
 
 static void fc_models_free(FcModels *mc) {
@@ -1387,6 +1390,9 @@ static void fc_models_free(FcModels *mc) {
     if (mc->cands[ci].is_student)
       fcst_student_free(&mc->cands[ci].student);
   sqlite3_free(mc->cands);
+  for (int i = 0; i < mc->n_own; i++)
+    sqlite3_free(mc->own_ids[i]);
+  sqlite3_free(mc->own_ids);
   if (mc->have_fstudent)
     fcst_student_free(&mc->fstudent);
 #ifdef SQLITE_PREDICT_ONNX
@@ -1394,6 +1400,123 @@ static void fc_models_free(FcModels *mc) {
     predict0_model_row_free(&mc->onnx_row);
 #endif
   memset(mc, 0, sizeof(*mc));
+}
+
+/* Implicit auto pool: with model="auto" and no explicit candidates, the
+ * pool is the bundled statistical models plus every eligible registered
+ * forecast student, so a distilled student competes automatically the
+ * moment it is registered (pass `candidates` to narrow the pool).
+ * Eligibility filters skip quietly, because the pool means "what can
+ * serve this call": a student trained for a shorter horizon than
+ * gap+horizon, or any student when interval_method='conformal'
+ * (conformal is statistical-models-only). A student blob that fails to
+ * load is a corrupt registry row and errors loudly. When no eligible
+ * student exists the pool stays empty and auto keeps its plain
+ * statistical selection. Enumeration is a read; a database with no
+ * registry simply has no students. */
+static int fc_discover_candidates(sqlite3 *db, const ForecastOpts *opts,
+                                  int horizon, FcModels *mc, char **errmsg) {
+  if (opts->interval_conformal)
+    return SQLITE_OK; /* students cannot serve conformal intervals */
+
+  sqlite3_stmt *stmt = NULL;
+  if (sqlite3_prepare_v2(db,
+                         "SELECT model_id FROM _predict_models WHERE"
+                         " kind = 'student' AND runtime = 'tree'"
+                         " ORDER BY model_id",
+                         -1, &stmt, NULL) != SQLITE_OK)
+    return SQLITE_OK; /* no registry, no students */
+
+  int n_stats = (int)countof(TS_MODELS);
+  int cap = n_stats + 8, rc = SQLITE_OK, step = SQLITE_DONE;
+  Candidate *cands = sqlite3_malloc(sizeof(Candidate) * cap);
+  char **own = sqlite3_malloc(sizeof(char *) * cap);
+  int n = 0, n_own = 0;
+  if (!cands || !own) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  memset(cands, 0, sizeof(Candidate) * cap);
+  for (int i = 0; i < n_stats; i++) {
+    cands[n].id = TS_MODELS[i].id;
+    cands[n].stat = TS_MODELS[i].run;
+    n++;
+  }
+
+  while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+    const char *id = (const char *)sqlite3_column_text(stmt, 0);
+    if (!id)
+      continue;
+    char *lerr = NULL;
+    ForecastStudent fs;
+    int lr = load_fcst_student(db, id, &fs, &lerr);
+    sqlite3_free(lerr);
+    if (lr == 0)
+      continue; /* a tabular student, not a forecast one */
+    if (lr < 0) {
+      *errmsg = sqlite3_mprintf(
+          "%s: invalid forecast student in the registry: %s",
+          PREDICT_ERR_SCHEMA, id);
+      rc = SQLITE_ERROR;
+      goto done;
+    }
+    if (opts->gap + horizon > fs.horizon) {
+      fcst_student_free(&fs); /* trained for a shorter horizon: skip */
+      continue;
+    }
+    if (n == cap) {
+      int nc = cap * 2;
+      Candidate *gc = sqlite3_realloc(cands, sizeof(Candidate) * nc);
+      if (gc)
+        cands = gc;
+      char **go = sqlite3_realloc(own, sizeof(char *) * nc);
+      if (go)
+        own = go;
+      if (!gc || !go) {
+        fcst_student_free(&fs);
+        rc = SQLITE_NOMEM;
+        goto done;
+      }
+      memset(cands + cap, 0, sizeof(Candidate) * (nc - cap));
+      cap = nc;
+    }
+    own[n_own] = sqlite3_mprintf("%s", id);
+    if (!own[n_own]) {
+      fcst_student_free(&fs);
+      rc = SQLITE_NOMEM;
+      goto done;
+    }
+    cands[n].id = own[n_own++];
+    cands[n].student = fs;
+    cands[n].is_student = 1;
+    n++;
+  }
+  if (step != SQLITE_DONE) {
+    rc = SQLITE_ERROR;
+    if (!*errmsg)
+      *errmsg = sqlite3_mprintf("%s: could not enumerate registered models",
+                                PREDICT_ERR_RESOURCE);
+  }
+
+done:
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_OK || n_own == 0) {
+    /* error, or no eligible student: keep the plain statistical auto */
+    for (int i = 0; i < n; i++)
+      if (cands && cands[i].is_student)
+        fcst_student_free(&cands[i].student);
+    sqlite3_free(cands);
+    for (int i = 0; i < n_own; i++)
+      sqlite3_free(own[i]);
+    sqlite3_free(own);
+    return rc;
+  }
+  mc->cands = cands;
+  mc->n_cands = n;
+  mc->own_ids = own;
+  mc->n_own = n_own;
+  mc->implicit_pool = 1;
+  return SQLITE_OK;
 }
 
 /* Resolve opts->model (+ any candidates pool) into an FcModels. On
@@ -1472,6 +1595,13 @@ static int fc_resolve_models(sqlite3 *db, const ForecastOpts *opts,
       fc_models_free(mc);
       return crc;
     }
+  } else if (mc->is_auto) {
+    /* no explicit pool: discover eligible registered students */
+    int crc = fc_discover_candidates(db, opts, horizon, mc, errmsg);
+    if (crc != SQLITE_OK) {
+      fc_models_free(mc);
+      return crc;
+    }
   }
   return SQLITE_OK;
 }
@@ -1489,14 +1619,18 @@ static const char *fc_model_id(const ForecastOpts *opts, const FcModels *mc) {
  * (sqlite3_malloc'd into *rows_out). Returns SQLITE_OK, SQLITE_NOMEM,
  * or an error with *serve_err set ("CODE: detail", a registered model
  * failing mid-serve); on any failure the partial rows are freed here
- * and *rows_out is NULL. */
+ * and *rows_out is NULL. For model="auto", *used_id_out reports which
+ * candidate won (the last served series' winner: exact for the
+ * aggregate form's single series); it stays NULL otherwise, and the
+ * strings it points at outlive the call (static ids or mc-owned). */
 static int fc_run_series(sqlite3 *db, SeriesBuf *series, int n_series,
                          int horizon, const ForecastOpts *opts, FcModels *mc,
                          ForecastRow **rows_out, int *n_rows_out,
-                         char **serve_err) {
+                         const char **used_id_out, char **serve_err) {
   UNUSED_PARAMETER(db); /* used by the onnx serving branch only */
   *rows_out = NULL;
   *n_rows_out = 0;
+  *used_id_out = NULL;
   *serve_err = NULL;
   int rc = SQLITE_OK;
 
@@ -1521,8 +1655,7 @@ static int fc_run_series(sqlite3 *db, SeriesBuf *series, int n_series,
   /* rolling-origin scratch: bt_* for default auto-selection and conformal,
    * cand_fc for candidate-set selection */
   int folds_req = opts->folds > 0 ? opts->folds : FORECAST_DEFAULT_FOLDS;
-  int need_bt =
-      (mc->is_auto && opts->n_candidates == 0) || opts->interval_conformal;
+  int need_bt = (mc->is_auto && mc->n_cands == 0) || opts->interval_conformal;
   f64 *bt_act = NULL, *bt_fcst = NULL, *bt_col = NULL, *bt_q = NULL;
   if (need_bt) {
     bt_act = sqlite3_malloc(sizeof(f64) * (size_t)folds_req * horizon);
@@ -1617,16 +1750,25 @@ static int fc_run_series(sqlite3 *db, SeriesBuf *series, int n_series,
         if (rc != SQLITE_OK)
           break;
         if (best < 0) { /* no candidate had a usable fold */
-          ForecastRow *r = &rows[n_rows++];
-          memset(r, 0, sizeof(*r));
-          r->series_key = sqlite3_mprintf("%s", s->key);
-          r->status = "insufficient_history";
-          continue;
-        }
-        if (mc->cands[best].is_student)
+          if (mc->implicit_pool) {
+            /* the discovered pool preserves plain auto's degrade rule:
+             * a series too short to backtest gets theta, not a status */
+            use_model = model_theta;
+            *used_id_out = "theta-classic";
+          } else {
+            ForecastRow *r = &rows[n_rows++];
+            memset(r, 0, sizeof(*r));
+            r->series_key = sqlite3_mprintf("%s", s->key);
+            r->status = "insufficient_history";
+            continue;
+          }
+        } else if (mc->cands[best].is_student) {
           win_student = &mc->cands[best].student;
-        else
+          *used_id_out = mc->cands[best].id;
+        } else {
           use_model = mc->cands[best].stat;
+          *used_id_out = mc->cands[best].id;
+        }
       } else if (mc->is_auto) {
         int bi = ts_auto_select(y, ts, n, horizon, opts->gap, folds_req,
                                 naive_scale(y, n), bt_act, bt_fcst);
@@ -1636,6 +1778,7 @@ static int fc_run_series(sqlite3 *db, SeriesBuf *series, int n_series,
         }
         /* bi == -1: series too short to backtest -> default to theta */
         use_model = bi >= 0 ? TS_MODELS[bi].run : model_theta;
+        *used_id_out = bi >= 0 ? TS_MODELS[bi].id : "theta-classic";
       }
       if (win_student) {
         if (fcst_run(win_student, y, n, horizon, opts->confidence, fc, lo,
@@ -2939,11 +3082,12 @@ static void agg_fc_final(sqlite3_context *ctx) {
 
   ForecastRow *rows = NULL;
   int n_rows = 0;
+  const char *used_id = NULL;
   char *serve_err = NULL;
   int rc = fc_run_series(db, &s, 1, horizon, &opts, &mc, &rows, &n_rows,
-                         &serve_err);
-  fc_models_free(&mc);
+                         &used_id, &serve_err);
   if (rc != SQLITE_OK) {
+    fc_models_free(&mc);
     if (serve_err)
       agg_error(ctx, serve_err);
     else
@@ -2957,10 +3101,11 @@ static void agg_fc_final(sqlite3_context *ctx) {
   const char *status = n_rows ? rows[0].status : "ok";
 
   /* the result document (§4.2.8): row fields named as the query form's
-   * output columns */
+   * output columns. For auto, "model" reports the winning candidate,
+   * which may be an mc-owned string, so mc is freed after the build. */
   sqlite3_str *doc = sqlite3_str_new(db);
   sqlite3_str_appendall(doc, "{\"model\":");
-  agg_json_str(doc, model_id);
+  agg_json_str(doc, used_id ? used_id : model_id);
   sqlite3_str_appendf(doc, ",\"status\":\"%s\",\"rows\":[", status);
   int first = 1;
   for (int i = 0; i < n_rows; i++) {
@@ -2981,6 +3126,7 @@ static void agg_fc_final(sqlite3_context *ctx) {
   }
   sqlite3_str_appendall(doc, "]}");
 
+  fc_models_free(&mc);
   for (int i = 0; i < n_rows; i++)
     sqlite3_free(rows[i].series_key);
   sqlite3_free(rows);

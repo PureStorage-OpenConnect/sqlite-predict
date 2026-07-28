@@ -252,3 +252,79 @@ def test_forecast_student_is_deterministic(db):
     r1 = db.execute(q, (H,)).fetchone()[0]
     r2 = db.execute(q, (H,)).fetchone()[0]
     assert r1 and r1 == r2  # deterministic serving, byte for byte
+
+
+# ---- implicit auto discovery (registered students compete by default) ----
+
+
+def test_auto_discovers_registered_student(db):
+    # once distilled, the student competes under model="auto" with no
+    # candidates list; on its own training wave it wins, and the document
+    # reports the winner rather than "auto"
+    _train(db)
+    _load_series(db)
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, ?, '{\"model\":\"auto\"}') FROM s",
+        (H,)).fetchone()[0])
+    assert doc["status"] == "ok"
+    assert doc["model"] == "f"
+
+
+def test_auto_implicit_equals_explicit_pool(db):
+    _train(db)
+    _load_series(db)
+    implicit = db.execute(
+        "SELECT forecast(ts, value, ?, '{\"model\":\"auto\"}') FROM s",
+        (H,)).fetchone()[0]
+    explicit = db.execute(
+        "SELECT forecast(ts, value, ?, '{\"model\":\"auto\",\"candidates\":"
+        "[\"theta-classic\",\"stub-seasonal-naive\",\"tsb\",\"f\"]}') FROM s",
+        (H,)).fetchone()[0]
+    assert implicit == explicit
+
+
+def test_auto_skips_student_beyond_its_horizon(db):
+    # discovery filters by eligibility: a horizon the student was not
+    # trained for silently drops it from the pool (a stat model serves)
+    _train(db)
+    _load_series(db)
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, ?, '{\"model\":\"auto\"}') FROM s",
+        (H + 4,)).fetchone()[0])
+    assert doc["status"] == "ok"
+    assert doc["model"] in ("theta-classic", "stub-seasonal-naive", "tsb")
+
+
+def test_auto_conformal_skips_students(db):
+    _train(db)
+    _load_series(db)
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, 4, '{\"model\":\"auto\","
+        "\"interval_method\":\"conformal\"}') FROM s").fetchone()[0])
+    assert doc["status"] == "ok"
+    assert doc["model"] in ("theta-classic", "stub-seasonal-naive", "tsb")
+
+
+def test_auto_errors_on_corrupt_registered_student(db):
+    # discovery must not paper over a corrupt registry row
+    _train(db)
+    _load_series(db)
+    db.execute(
+        "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+        " content_hash, license) VALUES ('bad','student','tree',?,'x',"
+        "'unspecified')", (b"PSFCST01\x05\x00\x00\x00",))
+    with pytest.raises(sqlite3.OperationalError, match="invalid forecast"):
+        db.execute("SELECT forecast(ts, value, ?, '{\"model\":\"auto\"}')"
+                   " FROM s", (H,)).fetchone()
+
+
+def test_auto_stays_pure_without_a_registry(db):
+    # no registry, no students: auto serves the stats and writes nothing
+    _load_series(db)
+    doc = json.loads(db.execute(
+        "SELECT forecast(ts, value, 4, '{\"model\":\"auto\"}') FROM s"
+    ).fetchone()[0])
+    assert doc["status"] == "ok"
+    assert doc["model"] in ("theta-classic", "stub-seasonal-naive", "tsb")
+    assert db.execute("SELECT count(*) FROM sqlite_master WHERE name LIKE"
+                      " '_predict%'").fetchone()[0] == 0

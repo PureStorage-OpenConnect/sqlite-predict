@@ -31,7 +31,7 @@ SELECT model_id, train_rmse FROM distill_forecast(
 ```
 
 The student is a DLinear/TiDE-style net (a linear skip plus a small residual). It
-serves through [`forecast()`](../../reference/functions/) like any other model, and
+serves through [`forecast()`](../../reference/functions/) like any other model, competes under `'{"model":"auto"}'` automatically the moment it is registered, and
 can compete in [`auto`](../auto-and-conformal/) selection.
 
 ## Distribute the student

@@ -8,6 +8,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Registered students compete under `auto` by default.** With
+  `'{"model":"auto"}'` and no `candidates` list, the pool is the bundled
+  statistical models plus every eligible registered forecast student:
+  distill once and the student competes at every call site with no code
+  changes. Eligibility is per call and quiet on the implicit pool (a
+  student trained for a shorter horizon than gap+horizon, or any student
+  under conformal intervals, sits the call out), while a named ineligible
+  candidate still fails loudly and a corrupt registered blob errors in
+  both cases. Discovery is a read: no registry, no students, no tables
+  created. `candidates` narrows the pool for efficiency. The result
+  document's `model` field now reports the winning candidate's id for
+  `auto` instead of the string "auto".
 - **One calling convention per operation; receipts removed.**
   `forecast(ts, value, horizon[, options])` and `detect_anomalies(ts, value
   [, options])` are aggregate functions, full stop: the statement supplies
