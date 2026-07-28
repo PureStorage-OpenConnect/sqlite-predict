@@ -21,10 +21,9 @@ SQLITE_EXTENSION_INIT3
 #define PR_COL_PRED 1
 #define PR_COL_CONF 2
 #define PR_COL_STATUS 3
-#define PR_COL_RECEIPT 4
-#define PR_COL_TRAINQ 5
-#define PR_COL_APPLYQ 6
-#define PR_COL_OPTIONS 7
+#define PR_COL_TRAINQ 4
+#define PR_COL_APPLYQ 5
+#define PR_COL_OPTIONS 6
 
 typedef struct {
   int type; /* SQLITE_INTEGER/FLOAT/TEXT/NULL */
@@ -39,7 +38,6 @@ typedef struct {
   f64 confidence;
   int has_conf;
   const char *status;
-  char receipt_id[PREDICT_ULID_BUFSIZE];
 } PredRow;
 
 typedef struct {
@@ -61,7 +59,6 @@ typedef struct {
   char *device;         /* onnx: 'cpu'|'coreml'|'cuda'|'tensorrt' */
   char *precision;      /* onnx: 'fp32'|'fp16'|'int8' */
   char *accept_license; /* onnx: SPDX the caller accepts */
-  int receipt;
 } PredOpts;
 
 static void pred_opts_free(PredOpts *o) {
@@ -76,8 +73,7 @@ static void pred_opts_free(PredOpts *o) {
 static int pred_opt_cb(void *ctx, const char *key, sqlite3_value *value,
                        char **errmsg) {
   PredOpts *o = ctx;
-  if (sqlite3_value_type(value) != SQLITE_TEXT &&
-      strcmp(key, "receipt") != 0) {
+  if (sqlite3_value_type(value) != SQLITE_TEXT) {
     *errmsg = sqlite3_mprintf("%s: wrong type for option '%s'",
                               PREDICT_ERR_OPTIONS, key);
     return 1;
@@ -108,20 +104,12 @@ static int pred_opt_cb(void *ctx, const char *key, sqlite3_value *value,
     sqlite3_free(o->accept_license);
     o->accept_license = sqlite3_mprintf(
         "%s", (const char *)sqlite3_value_text(value));
-  } else if (strcmp(key, "receipt") == 0) {
-    if (sqlite3_value_type(value) != SQLITE_INTEGER) {
-      *errmsg = sqlite3_mprintf("%s: wrong type for option 'receipt'",
-                                PREDICT_ERR_OPTIONS);
-      return 1;
-    }
-    o->receipt = sqlite3_value_int(value) != 0;
   }
   return 0;
 }
 
 static const char *const PRED_OPTION_KEYS[] = {
-    "target",         "task",     "model",  "device",
-    "precision",      "accept_license", "receipt", NULL};
+    "target", "task", "model", "device", "precision", "accept_license", NULL};
 
 /* per-feature categorical vocabulary (linear; fine at spike scale) */
 typedef struct {
@@ -159,7 +147,7 @@ static int pr_connect(sqlite3 *db, void *pAux, int argc,
   v->db = db;
   int rc = sqlite3_declare_vtab(
       db, "CREATE TABLE x(row_ref, prediction TEXT, confidence REAL,"
-          " status TEXT, receipt_id TEXT, train_query HIDDEN,"
+          " status TEXT, train_query HIDDEN,"
           " apply_query HIDDEN, options HIDDEN)");
   if (rc != SQLITE_OK) {
     sqlite3_free(v);
@@ -278,8 +266,7 @@ static sqlite3_stmt *pr_prepare(pred_cursor *cur, sqlite3 *db,
 
 /* Adopt a runtime backend's neutral result array into the cursor's PredRow
  * rows, transferring string ownership so the neutral array frees cleanly. */
-static int pr_adopt(pred_cursor *cur, predict0_result *res, int n,
-                    const char *receipt_id, int receipt_on) {
+static int pr_adopt(pred_cursor *cur, predict0_result *res, int n) {
   if (n > 0) {
     cur->rows = sqlite3_malloc(sizeof(PredRow) * n);
     if (!cur->rows) {
@@ -301,8 +288,6 @@ static int pr_adopt(pred_cursor *cur, predict0_result *res, int n,
     o->confidence = r->confidence;
     o->has_conf = r->has_conf;
     o->status = r->status;
-    if (receipt_on && receipt_id && receipt_id[0])
-      memcpy(o->receipt_id, receipt_id, PREDICT_ULID_BUFSIZE);
     cur->n_rows++;
   }
   predict0_results_free(res, n);
@@ -314,7 +299,6 @@ static void backend_opts_from(predict0_backend_opts *b, PredOpts *o) {
   b->device = o->device;
   b->precision = o->precision;
   b->accept_license = o->accept_license;
-  b->receipt = o->receipt;
 }
 
 /* Dispatch to the native tree student (zero-dependency core) and adopt. */
@@ -325,17 +309,15 @@ static int run_student(pred_cursor *cur, sqlite3 *db, const char *model_id,
   backend_opts_from(&bopts, opts);
   predict0_result *res = NULL;
   int n = 0;
-  char receipt_id[PREDICT_ULID_BUFSIZE];
-  receipt_id[0] = '\0';
   char *emsg = NULL;
   int rc = predict0_tree_run(db, model_id, apply_sql, m, &bopts, &res, &n,
-                             receipt_id, &emsg);
+                             &emsg);
   if (rc != SQLITE_OK) {
     sqlite3_free(cur->base.pVtab->zErrMsg);
     cur->base.pVtab->zErrMsg = emsg;
     return SQLITE_ERROR;
   }
-  return pr_adopt(cur, res, n, receipt_id, opts->receipt);
+  return pr_adopt(cur, res, n);
 }
 
 #ifdef SQLITE_PREDICT_ONNX
@@ -347,17 +329,15 @@ static int run_onnx(pred_cursor *cur, sqlite3 *db, const char *model_id,
   backend_opts_from(&bopts, opts);
   predict0_result *res = NULL;
   int n = 0;
-  char receipt_id[PREDICT_ULID_BUFSIZE];
-  receipt_id[0] = '\0';
   char *emsg = NULL;
   int rc = predict0_onnx_predict(db, model_id, train_sql, apply_sql, m, &bopts,
-                                 &res, &n, receipt_id, &emsg);
+                                 &res, &n, &emsg);
   if (rc != SQLITE_OK) {
     sqlite3_free(cur->base.pVtab->zErrMsg);
     cur->base.pVtab->zErrMsg = emsg; /* already PREDICT_ERR_*-prefixed */
     return SQLITE_ERROR;
   }
-  return pr_adopt(cur, res, n, receipt_id, opts->receipt);
+  return pr_adopt(cur, res, n);
 }
 #endif
 
@@ -381,7 +361,6 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
 
   PredOpts opts;
   memset(&opts, 0, sizeof(opts));
-  opts.receipt = 1;
   char *errmsg = NULL;
   const char *options_json =
       argc >= 3 ? (const char *)sqlite3_value_text(argv[2]) : NULL;
@@ -399,8 +378,8 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
                              : "knn5-incontext";
 
   /* Non-default model: dispatch through the registry to a runtime backend.
-   * The default knn path below never consults the registry, so it still
-   * runs on read-only databases with receipt:0. */
+   * The default knn path below never consults the registry, so it runs on
+   * read-only databases. */
   if (strcmp(model_id, "knn5-incontext") != 0) {
     predict0_model_row m;
     int look = predict0_registry_lookup(db, model_id, &m);
@@ -758,83 +737,6 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
     goto fail_train;
   }
 
-  /* ---- receipt ---- */
-  if (opts.receipt) {
-    char *rerr = NULL;
-    predict0_hasher h;
-    predict0_hash_init(&h);
-    for (int i = 0; i < cur->n_rows; i++) {
-      PredRow *r = &cur->rows[i];
-      switch (r->ref.type) {
-      case SQLITE_INTEGER:
-        predict0_hash_int(&h, r->ref.i);
-        break;
-      case SQLITE_FLOAT:
-        predict0_hash_real(&h, r->ref.f);
-        break;
-      case SQLITE_NULL:
-        predict0_hash_null(&h);
-        break;
-      default:
-        predict0_hash_text(&h, r->ref.t);
-        break;
-      }
-      if (r->prediction)
-        predict0_hash_text(&h, r->prediction);
-      else
-        predict0_hash_null(&h);
-      if (r->has_conf)
-        predict0_hash_real(&h, r->confidence);
-      else
-        predict0_hash_null(&h);
-      predict0_hash_row_end(&h);
-    }
-    char result_hash[PREDICT_HEX_BUFSIZE];
-    predict0_hash_hex(&h, result_hash);
-
-    sqlite3_stmt *pj = NULL;
-    char *params = NULL, *input_json = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "SELECT json_object('model', ?1, 'receipt', 1, 'target', ?2,"
-            " 'task', ?3), json_object('train', ?4, 'apply', ?5)",
-            -1, &pj, NULL) == SQLITE_OK) {
-      sqlite3_bind_text(pj, 1, model_id, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 2, opts.target, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 3, classify ? "classify" : "regress", -1,
-                        SQLITE_STATIC);
-      sqlite3_bind_text(pj, 4, train_sql, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 5, apply_sql, -1, SQLITE_STATIC);
-      if (sqlite3_step(pj) == SQLITE_ROW) {
-        params = sqlite3_mprintf(
-            "%s", (const char *)sqlite3_column_text(pj, 0));
-        input_json = sqlite3_mprintf(
-            "%s", (const char *)sqlite3_column_text(pj, 1));
-      }
-      sqlite3_finalize(pj);
-    }
-    if (!params || !input_json) {
-      sqlite3_free(params);
-      sqlite3_free(input_json);
-      rc = pr_error(cur, PREDICT_ERR_RESOURCE,
-                    "could not canonicalize params", NULL);
-      goto fail_train;
-    }
-    char receipt_id[PREDICT_ULID_BUFSIZE];
-    int irc = predict0_emit_receipt(db, "predict", model_id, params,
-                                    input_json, result_hash, receipt_id,
-                                    &rerr);
-    sqlite3_free(params);
-    sqlite3_free(input_json);
-    if (irc != SQLITE_OK) {
-      sqlite3_free(vtab->base.zErrMsg);
-      vtab->base.zErrMsg = rerr;
-      rc = SQLITE_ERROR;
-      goto fail_train;
-    }
-    for (int i = 0; i < cur->n_rows; i++)
-      memcpy(cur->rows[i].receipt_id, receipt_id, sizeof(receipt_id));
-  }
 
   rc = SQLITE_OK;
   cur->i = 0;
@@ -899,10 +801,6 @@ static int pr_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx,
     break;
   case PR_COL_STATUS:
     sqlite3_result_text(ctx, r->status, -1, SQLITE_STATIC);
-    break;
-  case PR_COL_RECEIPT:
-    if (r->receipt_id[0])
-      sqlite3_result_text(ctx, r->receipt_id, -1, SQLITE_TRANSIENT);
     break;
   default:
     break;

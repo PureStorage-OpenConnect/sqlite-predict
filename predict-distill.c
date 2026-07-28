@@ -644,7 +644,6 @@ typedef struct {
   char *target, *task, *student_id, *teacher, *student_kind;
   char *proba;   /* JSON array of soft-target probability column names */
   char *classes; /* JSON array of class labels, same order as `proba` */
-  int receipt;
 } DistOpts;
 
 static void dist_opts_free(DistOpts *o) {
@@ -686,15 +685,6 @@ static int intern_label(char ***labels, int *nclass, int *cap, const char *s,
 static int dist_opt_cb(void *ctx, const char *key, sqlite3_value *value,
                        char **errmsg) {
   DistOpts *o = ctx;
-  if (strcmp(key, "receipt") == 0) {
-    if (sqlite3_value_type(value) != SQLITE_INTEGER) {
-      *errmsg = sqlite3_mprintf("%s: wrong type for option 'receipt'",
-                                PREDICT_ERR_OPTIONS);
-      return 1;
-    }
-    o->receipt = sqlite3_value_int(value) != 0;
-    return 0;
-  }
   if (sqlite3_value_type(value) != SQLITE_TEXT) {
     *errmsg = sqlite3_mprintf("%s: wrong type for option '%s'",
                               PREDICT_ERR_OPTIONS, key);
@@ -716,8 +706,8 @@ static int dist_opt_cb(void *ctx, const char *key, sqlite3_value *value,
 }
 
 static const char *const DIST_OPTION_KEYS[] = {
-    "target",       "task",    "student_id", "teacher", "student_kind",
-    "proba",        "classes", "receipt",    NULL};
+    "target", "task",  "student_id", "teacher", "student_kind",
+    "proba",  "classes", NULL};
 
 /* Parse a JSON array of strings into a heap array of sqlite3_mprintf'd
  * strings. Returns SQLITE_OK and sets out and n (caller frees each element and
@@ -771,7 +761,6 @@ typedef struct {
   char content_hash[PREDICT_HEX_BUFSIZE];
   int train_rows;
   double metric;
-  char receipt_id[PREDICT_ULID_BUFSIZE];
 } DistResult;
 
 static void append_ident(sqlite3_str *s, const char *nm) {
@@ -1102,7 +1091,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
         feat_list, tq);
     teacher_sql = sqlite3_mprintf(
         "SELECT prediction FROM predict(%Q, %Q, json_object('target',%Q,'task',"
-        "%Q,'model',%Q,'receipt',0))",
+        "%Q,'model',%Q))",
         tq, apply_sql, o->target, task, teacher);
     if (!apply_sql || !teacher_sql) {
       rc = SQLITE_NOMEM;
@@ -1375,49 +1364,6 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
   res->model_id = sqlite3_mprintf("%s", o->student_id);
   res->train_rows = n;
 
-  /* ---- 7. receipt (anchors the training data state) ---- */
-  if (o->receipt) {
-    predict0_hasher rh;
-    predict0_hash_init(&rh);
-    predict0_hash_text(&rh, res->model_id);
-    predict0_hash_text(&rh, res->content_hash);
-    predict0_hash_int(&rh, res->train_rows);
-    predict0_hash_real(&rh, res->metric);
-    predict0_hash_row_end(&rh);
-    char result_hash[PREDICT_HEX_BUFSIZE];
-    predict0_hash_hex(&rh, result_hash);
-
-    sqlite3_stmt *pj = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "SELECT json_object('target',?1,'task',?2,'teacher',?3,"
-            "'student_kind',?4,'proba',json(?5),'classes',json(?6),"
-            "'receipt',1)",
-            -1, &pj, NULL) == SQLITE_OK) {
-      sqlite3_bind_text(pj, 1, o->target, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 2, task, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 3, teacher, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 4,
-                        o->student_kind ? o->student_kind
-                                        : (soft ? "gbt" : "tree"),
-                        -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 5, o->proba, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 6, o->classes, -1, SQLITE_STATIC);
-      if (sqlite3_step(pj) == SQLITE_ROW)
-        params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
-      sqlite3_finalize(pj);
-    }
-    char *rerr = NULL;
-    rc = predict0_emit_receipt(db, "distill", res->model_id,
-                               params ? params : "{}", tq, result_hash,
-                               res->receipt_id, &rerr);
-    if (rc != SQLITE_OK) {
-      *errmsg = rerr ? rerr
-                     : sqlite3_mprintf("%s: receipt write failed",
-                                       PREDICT_ERR_RESOURCE);
-      goto done;
-    }
-  }
   rc = SQLITE_OK;
 
 done:
@@ -1470,9 +1416,8 @@ done:
 #define DL_HASH 1
 #define DL_ROWS 2
 #define DL_METRIC 3
-#define DL_RECEIPT 4
-#define DL_TRAINQ 5
-#define DL_OPTIONS 6
+#define DL_TRAINQ 4
+#define DL_OPTIONS 5
 
 typedef struct {
   sqlite3_vtab base;
@@ -1499,7 +1444,7 @@ static int dl_connect(sqlite3 *db, void *pAux, int argc,
   v->db = db;
   int rc = sqlite3_declare_vtab(
       db, "CREATE TABLE x(model_id TEXT, content_hash TEXT, train_rows INTEGER,"
-          " holdout_metric REAL, receipt_id TEXT, train_query HIDDEN,"
+          " holdout_metric REAL, train_query HIDDEN,"
           " options HIDDEN)");
   if (rc != SQLITE_OK) {
     sqlite3_free(v);
@@ -1581,7 +1526,6 @@ static int dl_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
 
   DistOpts o;
   memset(&o, 0, sizeof(o));
-  o.receipt = 1;
   char *emsg = NULL;
   if (predict0_options_parse(db, options, DIST_OPTION_KEYS, dist_opt_cb, &o,
                              &emsg)) {
@@ -1615,7 +1559,7 @@ static int dl_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
             PREDICT_ERR_OPTIONS, o.student_kind);
 
   char *ensure_err = NULL;
-  if (predict0_receipts_ensure(db, &ensure_err) != SQLITE_OK) {
+  if (predict0_registry_ensure(db, &ensure_err) != SQLITE_OK) {
     sqlite3_free(vtab->base.zErrMsg);
     vtab->base.zErrMsg = ensure_err;
     dist_opts_free(&o);
@@ -1662,10 +1606,6 @@ static int dl_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col) {
     break;
   case DL_METRIC:
     sqlite3_result_double(ctx, c->res.metric);
-    break;
-  case DL_RECEIPT:
-    if (c->res.receipt_id[0])
-      sqlite3_result_text(ctx, c->res.receipt_id, -1, SQLITE_TRANSIENT);
     break;
   default:
     break;
@@ -1725,7 +1665,6 @@ typedef struct {
   char content_hash[PREDICT_HEX_BUFSIZE];
   int train_rows;
   f64 metric; /* holdout RMSE in normalized space */
-  char receipt_id[PREDICT_ULID_BUFSIZE];
 } FcstResult;
 
 #define FCST_TEACHER_MAX_WIN 4000 /* teacher= mode: window budget per call */
@@ -1734,8 +1673,8 @@ typedef struct {
  * training matrix X [n,L], Y [n,H*Q]. Does not own X/Y. */
 static int fdistill_fit(sqlite3 *db, const f32 *X, const f32 *Y, int n, int L,
                         int H, int Q, const f32 *levels, const char *student_id,
-                        int nhid, int epochs, f32 lr, int receipt,
-                        const char *tq, FcstResult *res, char **errmsg) {
+                        int nhid, int epochs, f32 lr, FcstResult *res,
+                        char **errmsg) {
   int nout = H * Q, rc = SQLITE_OK, blob_len = 0;
   void *blob = NULL;
   MLP mlp;
@@ -1823,33 +1762,6 @@ static int fdistill_fit(sqlite3 *db, const f32 *X, const f32 *Y, int n, int L,
   }
   res->model_id = sqlite3_mprintf("%s", student_id);
   res->train_rows = n;
-  if (receipt) { /* anchors the training data state */
-    predict0_hasher rh;
-    predict0_hash_init(&rh);
-    predict0_hash_text(&rh, res->model_id);
-    predict0_hash_text(&rh, res->content_hash);
-    predict0_hash_int(&rh, res->train_rows);
-    predict0_hash_real(&rh, res->metric);
-    predict0_hash_row_end(&rh);
-    char result_hash[PREDICT_HEX_BUFSIZE];
-    predict0_hash_hex(&rh, result_hash);
-    char *params = sqlite3_mprintf(
-        "{\"context\":%d,\"horizon\":%d,\"nquant\":%d,\"hidden\":%d,"
-        "\"student_id\":\"%s\"}",
-        L, H, Q, nhid, student_id);
-    char *rerr = NULL;
-    if (params && predict0_emit_receipt(db, "distill", res->model_id, params, tq,
-                                        result_hash, res->receipt_id,
-                                        &rerr) != SQLITE_OK) {
-      sqlite3_free(params);
-      *errmsg = rerr ? rerr
-                     : sqlite3_mprintf("%s: receipt write failed",
-                                       PREDICT_ERR_RESOURCE);
-      rc = SQLITE_ERROR;
-      goto done;
-    }
-    sqlite3_free(params);
-  }
   rc = SQLITE_OK;
 done:
   sqlite3_free(blob);
@@ -1861,7 +1773,7 @@ done:
  * columns; instance-normalize and fit. */
 static int fdistill_train(sqlite3 *db, const char *tq, int L, int H, int Q,
                           const f32 *levels, const char *student_id, int nhid,
-                          int epochs, f32 lr, int receipt, FcstResult *res,
+                          int epochs, f32 lr, FcstResult *res,
                           char **errmsg) {
   int nout = H * Q, rc = SQLITE_OK, ncol = L + nout, cap = 0, n = 0;
   f32 *X = NULL, *Y = NULL;
@@ -1921,8 +1833,8 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H, int Q,
     n++;
   }
   if (rc == SQLITE_OK)
-    rc = fdistill_fit(db, X, Y, n, L, H, Q, levels, student_id, nhid, epochs, lr,
-                      receipt, tq, res, errmsg);
+    rc = fdistill_fit(db, X, Y, n, L, H, Q, levels, student_id, nhid, epochs,
+                      lr, res, errmsg);
 done:
   if (q)
     sqlite3_finalize(q);
@@ -1940,7 +1852,7 @@ done:
 static int fdistill_train_teacher(sqlite3 *db, const char *tq,
                                   const char *teacher, int L, int H,
                                   const char *student_id, int nhid, int epochs,
-                                  f32 lr, int receipt, FcstResult *res,
+                                  f32 lr, FcstResult *res,
                                   char **errmsg) {
   int rc = SQLITE_OK, Q = 0, cap = 0, n = 0;
   f32 *X = NULL, *Y = NULL, *levels = NULL;
@@ -2057,8 +1969,8 @@ static int fdistill_train_teacher(sqlite3 *db, const char *tq,
 #undef FLUSH_SERIES
 
   if (rc == SQLITE_OK)
-    rc = fdistill_fit(db, X, Y, n, L, H, Q, levels, student_id, nhid, epochs, lr,
-                      receipt, tq, res, errmsg);
+    rc = fdistill_fit(db, X, Y, n, L, H, Q, levels, student_id, nhid, epochs,
+                      lr, res, errmsg);
 done:
   if (q)
     sqlite3_finalize(q);
@@ -2080,9 +1992,8 @@ done:
 #define FD_HASH 1
 #define FD_ROWS 2
 #define FD_METRIC 3
-#define FD_RECEIPT 4
-#define FD_TRAINQ 5
-#define FD_OPTIONS 6
+#define FD_TRAINQ 4
+#define FD_OPTIONS 5
 
 typedef struct {
   sqlite3_vtab base;
@@ -2109,7 +2020,7 @@ static int fd_connect(sqlite3 *db, void *pAux, int argc,
   v->db = db;
   int rc = sqlite3_declare_vtab(
       db, "CREATE TABLE x(model_id TEXT, content_hash TEXT, train_rows INTEGER,"
-          " train_rmse REAL, receipt_id TEXT, train_query HIDDEN,"
+          " train_rmse REAL, train_query HIDDEN,"
           " options HIDDEN)");
   if (rc != SQLITE_OK) {
     sqlite3_free(v);
@@ -2194,7 +2105,7 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
 
   char *student_id = NULL, *teacher = NULL;
   f32 *levels = NULL;
-  int L = 0, H = 0, Q = 1, nhid = FCST_HIDDEN, epochs = FCST_EPOCHS, receipt = 1;
+  int L = 0, H = 0, Q = 1, nhid = FCST_HIDDEN, epochs = FCST_EPOCHS;
   f32 lr = FCST_LR;
   if (!tq)
     FD_FAIL("%s: train_query is required", PREDICT_ERR_SCHEMA);
@@ -2204,7 +2115,7 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
             db,
             "SELECT json_extract(?1,'$.context'), json_extract(?1,'$.horizon'),"
             " json_extract(?1,'$.student_id'), json_extract(?1,'$.hidden'),"
-            " json_extract(?1,'$.receipt'), json_extract(?1,'$.epochs'),"
+            " json_extract(?1,'$.epochs'),"
             " json_extract(?1,'$.lr'), json_extract(?1,'$.teacher')",
             -1, &op, NULL) == SQLITE_OK) {
       sqlite3_bind_text(op, 1, options, -1, SQLITE_STATIC);
@@ -2217,12 +2128,10 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
         if (sqlite3_column_type(op, 3) != SQLITE_NULL)
           nhid = sqlite3_column_int(op, 3);
         if (sqlite3_column_type(op, 4) != SQLITE_NULL)
-          receipt = sqlite3_column_int(op, 4);
+          epochs = sqlite3_column_int(op, 4);
         if (sqlite3_column_type(op, 5) != SQLITE_NULL)
-          epochs = sqlite3_column_int(op, 5);
-        if (sqlite3_column_type(op, 6) != SQLITE_NULL)
-          lr = (f32)sqlite3_column_double(op, 6);
-        const char *tch = (const char *)sqlite3_column_text(op, 7);
+          lr = (f32)sqlite3_column_double(op, 5);
+        const char *tch = (const char *)sqlite3_column_text(op, 6);
         if (tch)
           teacher = sqlite3_mprintf("%s", tch);
       }
@@ -2290,7 +2199,7 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
               PREDICT_ERR_OPTIONS);
 
   char *ensure_err = NULL;
-  if (predict0_receipts_ensure(db, &ensure_err) != SQLITE_OK) {
+  if (predict0_registry_ensure(db, &ensure_err) != SQLITE_OK) {
     sqlite3_free(vtab->base.zErrMsg);
     vtab->base.zErrMsg = ensure_err;
     sqlite3_free(student_id);
@@ -2311,7 +2220,7 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
   if (teacher) { /* in-DB labeling: an onnx teacher labels the series' windows */
 #ifdef SQLITE_PREDICT_ONNX
     rc = fdistill_train_teacher(db, tq, teacher, L, H, student_id, nhid, epochs,
-                                lr, receipt, &cur->res, &emsg);
+                                lr, &cur->res, &emsg);
 #else
     rc = SQLITE_ERROR;
     emsg = sqlite3_mprintf("%s: distill_forecast teacher= needs the onnx build",
@@ -2319,7 +2228,7 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
 #endif
   } else {
     rc = fdistill_train(db, tq, L, H, Q, levels, student_id, nhid, epochs, lr,
-                        receipt, &cur->res, &emsg);
+                        &cur->res, &emsg);
   }
   sqlite3_free(student_id);
   sqlite3_free(levels);
@@ -2355,10 +2264,6 @@ static int fd_column(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col) {
     break;
   case FD_METRIC:
     sqlite3_result_double(ctx, c->res.metric);
-    break;
-  case FD_RECEIPT:
-    if (c->res.receipt_id[0])
-      sqlite3_result_text(ctx, c->res.receipt_id, -1, SQLITE_TRANSIENT);
     break;
   default:
     break;

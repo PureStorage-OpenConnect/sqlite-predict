@@ -475,7 +475,7 @@ static int onnx_build_session(const predict0_model_row *model,
       BUILD_CHECK(g_ort->CreateCUDAProviderOptions(&cu),
                   PREDICT_ERR_RUNTIME_UNAVAILABLE, "CreateCUDAProviderOptions");
       /* CUDA EP runs the model's own dtype; fp16 comes from an fp16 model,
-       * not an EP flag. precision is recorded in the receipt regardless. */
+       * not an EP flag. */
       OrtStatus *ap =
           g_ort->SessionOptionsAppendExecutionProvider_CUDA_V2(so, cu);
       g_ort->ReleaseCUDAProviderOptions(cu);
@@ -608,7 +608,7 @@ static int license_ok(const char *license, const char *accepted) {
   return accepted && strcmp(accepted, license) == 0;
 }
 
-/* ---- output decoding + receipts (shared by both layouts) ---- */
+/* ---- output decoding (shared by both layouts) ---- */
 
 /* Decode a [nbatch, width] float output tensor into predictions on
  * rows[batch_row[b]]. Does not take ownership of `output`. */
@@ -1215,88 +1215,6 @@ int predict0_onnx_forecast(sqlite3 *db, const predict0_model_row *model,
   return SQLITE_OK;
 }
 
-/* Hash results canonically (ref, prediction, confidence per row) and write
- * a receipt. input_json is {"train","apply"} when train_sql is given, else
- * {"apply"}; params pin the model, device, and precision. Shared by the
- * vector and in-context paths. */
-static int emit_predict_receipt(sqlite3 *db, const char *model_id,
-                                const predict0_backend_opts *opts,
-                                predict0_result *rows, int nrows,
-                                const char *train_sql, const char *apply_sql,
-                                char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                                char **errmsg) {
-  predict0_hasher h;
-  predict0_hash_init(&h);
-  for (int i = 0; i < nrows; i++) {
-    predict0_result *r = &rows[i];
-    switch (r->ref_type) {
-    case SQLITE_INTEGER:
-      predict0_hash_int(&h, r->ref_i);
-      break;
-    case SQLITE_FLOAT:
-      predict0_hash_real(&h, r->ref_f);
-      break;
-    case SQLITE_NULL:
-      predict0_hash_null(&h);
-      break;
-    default:
-      predict0_hash_text(&h, r->ref_t);
-      break;
-    }
-    if (r->prediction)
-      predict0_hash_text(&h, r->prediction);
-    else
-      predict0_hash_null(&h);
-    if (r->has_conf)
-      predict0_hash_real(&h, r->confidence);
-    else
-      predict0_hash_null(&h);
-    predict0_hash_row_end(&h);
-  }
-  char result_hash[PREDICT_HEX_BUFSIZE];
-  predict0_hash_hex(&h, result_hash);
-
-  const char *precision = opts->precision ? opts->precision : "fp32";
-  const char *device = opts->device ? opts->device : "cpu";
-  char *params = NULL, *input_json = NULL;
-  sqlite3_stmt *pj = NULL;
-  const char *sql =
-      train_sql ? "SELECT json_object('model', ?1, 'device', ?2, 'precision',"
-                  " ?3, 'receipt', 1), json_object('train', ?4, 'apply', ?5)"
-                : "SELECT json_object('model', ?1, 'device', ?2, 'precision',"
-                  " ?3, 'receipt', 1), json_object('apply', ?5)";
-  if (sqlite3_prepare_v2(db, sql, -1, &pj, NULL) == SQLITE_OK) {
-    sqlite3_bind_text(pj, 1, model_id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(pj, 2, device, -1, SQLITE_STATIC);
-    sqlite3_bind_text(pj, 3, precision, -1, SQLITE_STATIC);
-    if (train_sql)
-      sqlite3_bind_text(pj, 4, train_sql, -1, SQLITE_STATIC);
-    sqlite3_bind_text(pj, 5, apply_sql, -1, SQLITE_STATIC);
-    if (sqlite3_step(pj) == SQLITE_ROW) {
-      params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
-      input_json =
-          sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 1));
-    }
-    sqlite3_finalize(pj);
-  }
-  if (!params || !input_json) {
-    sqlite3_free(params);
-    sqlite3_free(input_json);
-    *errmsg = sqlite3_mprintf("%s: could not canonicalize params",
-                              PREDICT_ERR_RESOURCE);
-    return SQLITE_ERROR;
-  }
-  char *rerr = NULL;
-  int rc = predict0_emit_receipt(db, "predict", model_id, params, input_json,
-                                 result_hash, receipt_id_out, &rerr);
-  sqlite3_free(params);
-  sqlite3_free(input_json);
-  if (rc != SQLITE_OK)
-    *errmsg = rerr ? rerr
-                   : sqlite3_mprintf("%s: receipt write failed",
-                                     PREDICT_ERR_RESOURCE);
-  return rc;
-}
 
 /* Map the apply query's feature columns (1..an-1) to model feature slots.
  * With names in io->features, match by name (an exact set). Without names,
@@ -1343,8 +1261,7 @@ static int map_apply_features(const onnx_io *io, sqlite3_stmt *as, int an,
 static int onnx_vector(sqlite3 *db, const char *model_id, const char *apply_sql,
                        const predict0_backend_opts *opts, const onnx_io *io,
                        OrtSession *session, predict0_result **out_rows,
-                       int *out_n, char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                       char **errmsg) {
+                       int *out_n, char **errmsg) {
   int classify = strcmp(io->output_kind, "value") != 0;
   int rc = SQLITE_OK;
 
@@ -1465,13 +1382,6 @@ static int onnx_vector(sqlite3 *db, const char *model_id, const char *apply_sql,
     nbatch = 0;
     if (step == SQLITE_DONE)
       break;
-  }
-
-  if (opts->receipt) {
-    rc = emit_predict_receipt(db, model_id, opts, rows, nrows, NULL, apply_sql,
-                              receipt_id_out, errmsg);
-    if (rc != SQLITE_OK)
-      goto done;
   }
 
   rc = SQLITE_OK;
@@ -1668,8 +1578,7 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
                           const char *train_sql, const char *apply_sql,
                           const predict0_backend_opts *opts, const onnx_io *io,
                           OrtSession *session, predict0_result **out_rows,
-                          int *out_n, char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                          char **errmsg) {
+                          int *out_n, char **errmsg) {
   int classify = strcmp(io->output_kind, "value") != 0;
   int rc = SQLITE_OK;
 
@@ -1859,12 +1768,6 @@ static int onnx_incontext(sqlite3 *db, const char *model_id,
       goto done;
   }
 
-  if (opts->receipt) {
-    rc = emit_predict_receipt(db, model_id, opts, rows, nrows, train_sql,
-                              apply_sql, receipt_id_out, errmsg);
-    if (rc != SQLITE_OK)
-      goto done;
-  }
   rc = SQLITE_OK;
 
 done:
@@ -1897,7 +1800,6 @@ int predict0_onnx_predict(sqlite3 *db, const char *model_id,
                           const predict0_model_row *model,
                           const predict0_backend_opts *opts,
                           predict0_result **out_rows, int *out_n,
-                          char receipt_id_out[PREDICT_ULID_BUFSIZE],
                           char **errmsg) {
   *out_rows = NULL;
   *out_n = 0;
@@ -1960,10 +1862,10 @@ int predict0_onnx_predict(sqlite3 *db, const char *model_id,
 
   if (io.layout == LAYOUT_VECTOR)
     rc = onnx_vector(db, model_id, apply_sql, opts, &io, session, out_rows,
-                     out_n, receipt_id_out, errmsg);
+                     out_n, errmsg);
   else
     rc = onnx_incontext(db, model_id, train_sql, apply_sql, opts, &io, session,
-                        out_rows, out_n, receipt_id_out, errmsg);
+                        out_rows, out_n, errmsg);
 
   onnx_io_free(&io);
   return rc;

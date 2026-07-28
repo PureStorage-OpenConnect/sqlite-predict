@@ -67,12 +67,8 @@ typedef size_t usize;
 #define PREDICT_ERR_INFERENCE "PREDICT_ERR_INFERENCE"
 #define PREDICT_ERR_STUDENT_EXISTS "PREDICT_ERR_STUDENT_EXISTS"
 #define PREDICT_ERR_RESOURCE "PREDICT_ERR_RESOURCE"
-#define PREDICT_ERR_RECEIPT_NOT_FOUND "PREDICT_ERR_RECEIPT_NOT_FOUND"
-#define PREDICT_ERR_ANCHOR_UNAVAILABLE "PREDICT_ERR_ANCHOR_UNAVAILABLE"
-#define PREDICT_ERR_REPLAY_MISMATCH "PREDICT_ERR_REPLAY_MISMATCH"
 
 int predict0_forecast_init(sqlite3 *db);
-int predict0_receipts_init(sqlite3 *db);
 int predict0_tabular_init(sqlite3 *db);
 int predict0_distill_init(sqlite3 *db);
 
@@ -107,12 +103,12 @@ void predict0_ulid_min(i64 ms, char *buf);
 /* Fresh ULID for the given epoch ms with sqlite3_randomness entropy. */
 void predict0_ulid_new(i64 ms, char *buf);
 
-/* ---- receipts (predict-receipts.c) ---- */
+/* ---- model registry (predict-receipts.c) ---- */
 
 #include "sha256.h"
 
-/* RFC §4.1.3 canonical row hashing: type-tagged fields, 0x1F between
- * fields, 0x1E after each row. */
+/* Content hashing for model integrity (content_hash pinning):
+ * type-tagged fields, 0x1F between fields, 0x1E after each row. */
 typedef struct {
   sha256_ctx sha;
 } predict0_hasher;
@@ -125,8 +121,8 @@ void predict0_hash_text(predict0_hasher *h, const char *s);
 void predict0_hash_row_end(predict0_hasher *h);
 void predict0_hash_hex(predict0_hasher *h, char hex[PREDICT_HEX_BUFSIZE]);
 
-/* Idempotent DDL for _predict_models/_predict_receipts + bundled rows. */
-int predict0_receipts_ensure(sqlite3 *db, char **errmsg);
+/* Idempotent DDL for _predict_models + bundled rows. */
+int predict0_registry_ensure(sqlite3 *db, char **errmsg);
 
 /* content_hash of a registered model; sqlite3_malloc'd. NULL = absent. */
 char *predict0_registry_model_hash(sqlite3 *db, const char *model_id);
@@ -164,7 +160,6 @@ typedef struct {
   const char *device;         /* 'cpu'|'coreml'|'cuda'|'tensorrt'; NULL=cpu */
   const char *precision;      /* 'fp32'|'fp16'|'int8'; NULL=fp32 */
   const char *accept_license; /* SPDX the caller accepts; NULL=none */
-  int receipt;                /* emit a receipt? */
 } predict0_backend_opts;
 
 /* One prediction a runtime backend hands back, in apply-query order. */
@@ -182,16 +177,15 @@ typedef struct {
 void predict0_results_free(predict0_result *rows, int n);
 
 /* Execute a native tree student (runtime='tree') from its inline-BLOB
- * weights, over the rows of apply_sql. Fills rows/n (apply order; free with
- * predict0_results_free) and, when opts->receipt, emits a receipt into
- * receipt_id_out. The tree runtime lives in the zero-dependency core, so a
- * distilled student runs with no onnxruntime. Returns SQLITE_OK or an
- * SQLITE_ code with *errmsg set (PREDICT_ERR_* lead). */
+ * weights, over the rows of apply_sql. Fills rows/n (apply order; free
+ * with predict0_results_free). The tree runtime lives in the
+ * zero-dependency core, so a distilled student runs with no
+ * onnxruntime. Returns SQLITE_OK or an SQLITE_ code with *errmsg set
+ * (PREDICT_ERR_* lead). */
 int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
                       const predict0_model_row *model,
                       const predict0_backend_opts *opts,
-                      predict0_result **rows, int *n,
-                      char receipt_id_out[PREDICT_ULID_BUFSIZE], char **errmsg);
+                      predict0_result **rows, int *n, char **errmsg);
 
 /* Interpolate the quantile at level p over ascending levels lev[Q] with the
  * (ascending) values val[Q], extrapolating the tails (e.g. deciles to a 95%
@@ -225,16 +219,13 @@ int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
  * unused) or 'in_context' (a teacher that ingests the train rows as context
  * each call, so train_sql is required). Reads row_ref + named features from
  * apply_sql, runs batched inference on the requested execution provider, and
- * fills rows/n (apply order; free with predict0_results_free). When
- * opts->receipt, emits a receipt and writes receipt_id_out. Returns
+ * fills rows/n (apply order; free with predict0_results_free). Returns
  * SQLITE_OK, or an SQLITE_ code with *errmsg set (PREDICT_ERR_* lead). */
 int predict0_onnx_predict(sqlite3 *db, const char *model_id,
                           const char *train_sql, const char *apply_sql,
                           const predict0_model_row *model,
                           const predict0_backend_opts *opts,
-                          predict0_result **rows, int *n,
-                          char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                          char **errmsg);
+                          predict0_result **rows, int *n, char **errmsg);
 
 /* Derive an io_spec by reading a model's input/output tensors, so a caller
  * can register with just a weights path. On success returns SQLITE_OK and a
@@ -246,43 +237,5 @@ int predict0_onnx_predict(sqlite3 *db, const char *model_id,
 int predict0_onnx_introspect(sqlite3 *db, const char *weights_uri,
                              char **io_spec_out, char **errmsg);
 #endif
-
-/* Deterministic logical digest of all user tables (schema + rows,
- * excluding _predict_% and sqlite_%), hex into out[65]. */
-int predict0_logical_digest(sqlite3 *db, char out[PREDICT_HEX_BUFSIZE], char **errmsg);
-
-/* Insert one receipt row. anchor/params/input_sql/result_hash owned by
- * caller; input_sql is NULL for aggregate-form (input-digest) receipts.
- * receipt_id_out[27] receives the new ULID. */
-int predict0_receipt_insert(sqlite3 *db, const char *operation,
-                            const char *model_id, const char *model_hash,
-                            const char *anchor_kind, const char *anchor,
-                            const char *params, const char *input_sql,
-                            const char *result_hash,
-                            char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                            char **errmsg);
-
-/* Shared receipt tail: ensure tables + model hash + digest + insert.
- * Caller supplies the op-specific params and result_hash. */
-int predict0_emit_receipt(sqlite3 *db, const char *op, const char *model_id,
-                          const char *params, const char *input_sql,
-                          const char *result_hash,
-                          char receipt_id_out[PREDICT_ULID_BUFSIZE],
-                          char **errmsg);
-
-/* Content hash of a model for the aggregate form's document receipt
- * (RFC §4.1.7): registry row when present (a read), else the
- * bundled-model formula. Writes nothing. 0 on success. */
-int predict0_model_hash_for(sqlite3 *db, const char *model_id,
-                            char out[PREDICT_HEX_BUFSIZE]);
-
-/* predict_verify's collection half (predict-forecast.c, RFC §4.2.10):
- * collect `query` as one series under the aggregate form's rules and
- * produce the §4.1.4 digest plus the canonical series JSON for the
- * re-run. Caller owns *doc_out (sqlite3_malloc'd). */
-int predict0_verify_collect(sqlite3 *db, const char *query, int context_limit,
-                            char **doc_out,
-                            char digest_out[PREDICT_HEX_BUFSIZE],
-                            char **errmsg);
 
 #endif /* PREDICT_INTERNAL_H */

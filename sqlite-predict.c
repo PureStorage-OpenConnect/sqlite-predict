@@ -241,8 +241,7 @@ int predict0_options_parse(sqlite3 *db, const char *json,
       sqlite3_finalize(stmt);
       return 1;
     }
-    /* a null value is equivalent to omitting the key (lets recorded
-     * receipt params round-trip as options) */
+    /* a null value is equivalent to omitting the key */
     if (sqlite3_column_type(stmt, 1) == SQLITE_NULL)
       continue;
     if (cb(ctx, key, sqlite3_column_value(stmt, 1), errmsg)) {
@@ -331,9 +330,8 @@ static void predict_ulid_fn(sqlite3_context *context, int argc,
  *   { "runtime":"onnx", "kind":"tabular-fm"|"student"|...,
  *     "license":"<SPDX>", "weights_uri":"/path/model.onnx",
  *     "io_spec": { ...tensor mapping... } }
- * The content_hash is computed from the weights file, so the receipt pins
- * the exact bytes and replay can detect a changed model. Returns the
- * content_hash. Registration is metadata only: executing the model still
+ * The content_hash is computed from the weights file and pins the exact
+ * bytes (verified before deserialization). Returns the content_hash. Registration is metadata only: executing the model still
  * requires the matching runtime to be compiled in. */
 static void predict_register_fn(sqlite3_context *context, int argc,
                                 sqlite3_value **argv) {
@@ -350,7 +348,7 @@ static void predict_register_fn(sqlite3_context *context, int argc,
     return;
   }
   char *emsg = NULL;
-  if (predict0_receipts_ensure(db, &emsg) != SQLITE_OK) {
+  if (predict0_registry_ensure(db, &emsg) != SQLITE_OK) {
     sqlite3_result_error(context, emsg ? emsg : "registry unavailable", -1);
     sqlite3_free(emsg);
     return;
@@ -544,7 +542,6 @@ __declspec(dllexport)
   if (rc != SQLITE_OK)
     return rc;
 
-  rc = predict0_receipts_init(db);
   if (rc != SQLITE_OK)
     return rc;
   rc = predict0_forecast_init(db);

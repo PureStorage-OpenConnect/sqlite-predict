@@ -747,8 +747,8 @@ oom:
 int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
                       const predict0_model_row *model,
                       const predict0_backend_opts *opts,
-                      predict0_result **out_rows, int *out_n,
-                      char receipt_id_out[PREDICT_ULID_BUFSIZE], char **errmsg) {
+                      predict0_result **out_rows, int *out_n, char **errmsg) {
+  UNUSED_PARAMETER(model_id);
   *out_rows = NULL;
   *out_n = 0;
   *errmsg = NULL;
@@ -944,74 +944,6 @@ int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
     goto done;
   }
 
-  if (opts->receipt) {
-    predict0_hasher h;
-    predict0_hash_init(&h);
-    for (int i = 0; i < nrows; i++) {
-      predict0_result *r = &rows[i];
-      switch (r->ref_type) {
-      case SQLITE_INTEGER:
-        predict0_hash_int(&h, r->ref_i);
-        break;
-      case SQLITE_FLOAT:
-        predict0_hash_real(&h, r->ref_f);
-        break;
-      case SQLITE_NULL:
-        predict0_hash_null(&h);
-        break;
-      default:
-        predict0_hash_text(&h, r->ref_t);
-        break;
-      }
-      if (r->prediction)
-        predict0_hash_text(&h, r->prediction);
-      else
-        predict0_hash_null(&h);
-      if (r->has_conf)
-        predict0_hash_real(&h, r->confidence);
-      else
-        predict0_hash_null(&h);
-      predict0_hash_row_end(&h);
-    }
-    char result_hash[PREDICT_HEX_BUFSIZE];
-    predict0_hash_hex(&h, result_hash);
-
-    char *params = NULL, *input_json = NULL;
-    sqlite3_stmt *pj = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "SELECT json_object('model', ?1, 'receipt', 1),"
-            " json_object('apply', ?2)",
-            -1, &pj, NULL) == SQLITE_OK) {
-      sqlite3_bind_text(pj, 1, model_id, -1, SQLITE_STATIC);
-      sqlite3_bind_text(pj, 2, apply_sql, -1, SQLITE_STATIC);
-      if (sqlite3_step(pj) == SQLITE_ROW) {
-        params = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 0));
-        input_json =
-            sqlite3_mprintf("%s", (const char *)sqlite3_column_text(pj, 1));
-      }
-      sqlite3_finalize(pj);
-    }
-    if (!params || !input_json) {
-      sqlite3_free(params);
-      sqlite3_free(input_json);
-      rc = SQLITE_ERROR;
-      *errmsg = sqlite3_mprintf("%s: could not canonicalize params",
-                                PREDICT_ERR_RESOURCE);
-      goto done;
-    }
-    char *rerr = NULL;
-    rc = predict0_emit_receipt(db, "predict", model_id, params, input_json,
-                               result_hash, receipt_id_out, &rerr);
-    sqlite3_free(params);
-    sqlite3_free(input_json);
-    if (rc != SQLITE_OK) {
-      *errmsg = rerr ? rerr
-                     : sqlite3_mprintf("%s: receipt write failed",
-                                       PREDICT_ERR_RESOURCE);
-      goto done;
-    }
-  }
   rc = SQLITE_OK;
 
 done:
