@@ -5,8 +5,9 @@ description: >-
   distrust prediction intervals, and decide when auto-selection needs
   narrowing. Use before serving forecasts that feed decisions, when
   intervals matter, or when choosing between models on a specific series.
+license: MIT OR Apache-2.0
 metadata:
-  version: 0.1.0
+  version: "0.1.0"
 ---
 
 # Interpreting backtest()

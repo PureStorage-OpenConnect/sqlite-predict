@@ -6,8 +6,9 @@ description: >-
   be replayed and checked later. Use when a prediction feeds a decision
   worth auditing, when results are shared with other agents or humans,
   or when you need to prove a result was not altered after the fact.
+license: MIT OR Apache-2.0
 metadata:
-  version: 0.1.0
+  version: "0.1.0"
 ---
 
 # Prediction receipts

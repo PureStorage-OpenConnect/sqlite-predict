@@ -6,8 +6,9 @@ description: >-
   respect the teacher's license. Use when per-call serving needs to be
   instant and self-contained, when a prediction runs at volume, or when a
   model must travel inside the database file.
+license: MIT OR Apache-2.0
 metadata:
-  version: 0.1.0
+  version: "0.1.0"
 ---
 
 # The distillation lifecycle

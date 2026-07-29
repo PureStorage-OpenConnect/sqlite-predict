@@ -5,8 +5,9 @@ description: >-
   SQLite database using the sqlite-predict extension. Use when an agent
   holds time series or tabular data in SQLite and needs predictions
   without exporting data, calling a cloud model, or building a pipeline.
+license: MIT OR Apache-2.0
 metadata:
-  version: 0.1.0
+  version: "0.1.0"
 ---
 
 # Using sqlite-predict
