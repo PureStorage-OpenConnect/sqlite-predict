@@ -14,8 +14,8 @@ Source layout:
 
 | File | Responsibility |
 | --- | --- |
-| `sqlite-predict.c` | entry point, function registration, shared helpers (timestamp parse/format, ULID, options parsing, normal-quantile) |
-| `predict-forecast.c` | the `forecast()` and `detect_anomalies()` aggregates, `backtest()`, the expansion TVFs, the statistical models, the native forecast-student serving path, and the shared `collect_series()` helper |
+| `sqlite-predict.c` | entry point, function registration, shared helpers (timestamp parse/format, ULID, options parsing, read-only query prepare, JSON string-array parse, normal-quantile) |
+| `predict-forecast.c` | the `forecast()` and `detect_anomalies()` aggregates, `backtest()`, the expansion TVFs, the statistical models, the native forecast-student serving path, and the `collect_series()` helper `backtest()` uses |
 | `predict-tabular.c` | `predict()` vtab, the in-context k-NN model, and dispatch to a runtime backend for registered models |
 | `predict-registry.c` | the model registry (`_predict_models`) and content hashing |
 | `predict-onnx.c` | ONNX runtime backend (opt-in build only); the only file that links onnxruntime |
@@ -126,7 +126,7 @@ deterministic full-batch Adam, for warped boundaries an axis-aligned tree
 ensemble cannot render however good the targets are. It also consumes soft
 targets, so a smooth student learns a smooth teacher's distribution directly.
 `predict()` dispatches
-a `tree`-runtime model to the native runtime in the same file, which tells a
+a `tree`-runtime model to the native runtime in `predict-student.c`, which tells a
 single tree (`PSTREE` blob) from a forest (`PSGBT` blob) from a net (`PSMLP`
 blob) by magic and needs
 no onnxruntime. The blob formats are little-endian and normatively specified

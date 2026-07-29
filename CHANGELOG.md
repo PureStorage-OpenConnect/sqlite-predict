@@ -6,6 +6,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Model weight integrity is now enforced, not just recorded.** A
+  registered model's `content_hash` is verified before its weights are
+  used: inline student blobs at registry load, ONNX weight files when a
+  session is created. A mismatch fails loudly with
+  `PREDICT_ERR_MODEL_HASH` everywhere, including `auto` discovery, so a
+  tampered registry row cannot serve or be silently skipped.
+- `distill_predict` and `distill_forecast` now enforce the same inner-
+  query contract as every other operation: `train_query` must parse, be
+  a single statement, and be read-only.
+- `predict_register` rejects `runtime:'tree'` (tree students carry
+  inline weights only the distillers write; a URI-registered tree row
+  could never be served). `predict()` on a model with an unsupported
+  runtime now raises `PREDICT_ERR_RUNTIME_UNAVAILABLE` instead of
+  `PREDICT_ERR_MODEL_NOT_FOUND`, and a teacher query that fails to
+  prepare reports `PREDICT_ERR_SCHEMA`.
+- `predict_version()` lists the bundled model ids in `models` (it was an
+  empty array) and no longer reports an internal spec identifier.
+- Error wording unified: student blob rejections all say "malformed",
+  model lookups all say "no such model".
+
+### Added
+
+- Benchmark campaigns for the permissively licensed tabular teachers:
+  TabPFN-2 and the latest TabPFN-3 (zero-shot only, per its license),
+  TabICL v2, and Mitra, with distillation retention measured for every
+  teacher whose license permits it
+  (`benchmarks/results/tabpfn.md`, `permissive-teachers.md`).
+
+## [0.0.1-alpha.6] - 2026-07-28
+
+The pre-release simplification: one calling convention per operation,
+receipts removed, `auto` by default. Breaking relative to alpha.5
+(query-form `forecast('SELECT ...')` calls stop working).
+
 ### Added
 
 - **`auto` is the forecast default.** A `forecast(ts, value, h)` call with
@@ -51,6 +87,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   model registry (`_predict_models`) remains:
   content-addressed models and distilled students, hashes verified before
   deserialization.
+- **Documentation site** (Astro Starlight): per-language quickstarts,
+  guides, reference, and benchmarks, deployed to GitHub Pages. A full
+  pre-release audit executed every example; the gaps it found were
+  fixed, including three fail-loud holes (`distill_forecast` silently
+  ignored unknown option keys, `predict` silently ignored `train_query`
+  for a student, and the backtest model error omitted `tsb`).
+
+### Fixed
+
+- Package distribution metadata (PyPI/npm/crates descriptions, module
+  docstrings, `__version__`) scrubbed of stale branding and removed
+  features; `make sync-version` now stamps every version surface.
+
+## [0.0.1-alpha.5] - 2026-07-27
+
+The first fully working release, live and installable from PyPI, npm,
+crates.io, and GitHub Releases. (alpha.1 through alpha.4 were partial
+name-claim and release-pipeline shakedown pre-releases, superseded.)
+
+### Added
+
 - **Auto model selection, conformal intervals, and `backtest()`.**
   `'{"model":"auto"}'` selects the statistical model with the
   lowest rolling-origin MASE per series, deterministically.
@@ -139,7 +196,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   NOT close it: a stronger forecaster masks anomalies by predicting them (verified
   against a Chronos one-step baseline on TSB-AD-U, which only tied the theta
   z-score), so the win comes from the detector family, not a better forecaster.
-  a recorded call reproduces against its anchored data state.
 - Bundled zero-dependency models: `theta-classic`, `stub-seasonal-naive`,
   `sub-pca` (time series) and `knn5-incontext` (tabular). Forecast prediction intervals
   are calibrated from a per-horizon in-sample backtest of each model, rather
@@ -195,5 +251,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tag; and `examples/quickstart.sql`. CI regenerates and compiles the
   amalgamation on every push so it cannot drift.
 
-_This project is pre-alpha; everything above is subject to change before a
-tagged release._
+[Unreleased]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.0.1-alpha.6...HEAD
+[0.0.1-alpha.6]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.0.1-alpha.5...v0.0.1-alpha.6
+[0.0.1-alpha.5]: https://github.com/PureStorage-OpenConnect/sqlite-predict/releases/tag/v0.0.1-alpha.5
