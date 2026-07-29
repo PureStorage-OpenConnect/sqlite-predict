@@ -213,6 +213,11 @@ def oof_proba(make_estimator, Xtr, ytr, n_splits=5, seed=0):
         est = make_estimator()
         est.fit(Xtr.values[tr_i], y[tr_i])
         p = est.predict_proba(Xtr.values[te_i])
+        if not np.isfinite(p).all():
+            # seen from TabICL on MPS; silently binding NaN as SQL NULL
+            # would corrupt the distillation, so fail loudly instead
+            raise ValueError("teacher returned non-finite probabilities on"
+                             " a fold; retry on cpu")
         for j, c in enumerate(est.classes_):
             out[te_i, idx[c]] += p[:, j]
     return out, [str(c) for c in classes]

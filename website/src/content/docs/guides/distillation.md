@@ -49,13 +49,17 @@ student to learn. Label out-of-fold instead: split the training rows
 into folds, fit the teacher on the other folds, and take probabilities
 for each row from the fold that held it out. This is the fix identified
 by Tanna et al., ["Pocket Foundation
-Models"](https://arxiv.org/abs/2605.18654). Our
-[benchmarks](../../benchmarks/) measure it both ways: on small data
-(1500 rows) scored by accuracy it made no difference, while their
-larger-scale AUC results show a real gain, so the smaller your data and
-the more you only need the argmax, the less it matters; the more you
-care about calibrated probabilities, the more it does. Teachers that
-train normally (your own model, a fitted classifier) do not need it.
+Models"](https://arxiv.org/abs/2605.18654), and how much it matters is
+teacher-dependent, so measure before paying for it: compare the
+teacher's agreement with its own training labels to its held-out
+accuracy. That gap is the leak. The paper's teachers memorize their
+context almost perfectly (a large gap; out-of-fold labeling is
+essential); our [benchmarks](../../benchmarks/) measured TabICL v2 at
+about five points of leak on 1500-row data, and out-of-fold labels
+changed nothing. When the gap is large, label out-of-fold; when it is
+small, the fold fits cost teacher context for no gain. Teachers that
+train normally (your own model, a fitted classifier) do not need any of
+this.
 Feature columns must be numeric: encode categorical text before distilling
 (the in-context `knn5-incontext` handles text features itself; the distiller
 does not).

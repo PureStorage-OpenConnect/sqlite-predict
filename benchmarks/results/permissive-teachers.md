@@ -44,7 +44,7 @@ Device: mps. First calls include one-time weight download.
 | heloc | cls | 0.757 | 0.776 | 0.773 | 0.765 | 0.771 | 0.752 | 0.757 | 0.760 | 1.28 |
 | jm1 | cls | 0.776 | 0.805 | 0.805 | 0.797 | 0.795 | 0.800 | 0.795 | 0.797 | 1.4 |
 | E-CommerceShipping | cls | 0.645 | 0.693 | 0.693 | 0.707 | 0.685 | 0.691 | 0.699 | 0.707 | 0.95 |
-| online_shoppers_intention | cls | 0.883 | 0.901 | 0.901 | 0.891 | 0.893 | 0.901 | 0.808 | 0.893 | 1.07 |
+| online_shoppers_intention | cls | 0.883 | 0.901 | 0.901 | 0.891 | 0.893 | 0.901 | 0.891 | 0.893 | 1.07 |
 | in_vehicle_coupon | cls | 0.632 | 0.643 | 0.669 | 0.683 | 0.629 | 0.643 | 0.648 | 0.667 | 1.28 |
 | miami_housing | reg | 149102.718 | 83065.624 | 90764.039 | 96749.143 | 195469.481 | - | - | 105196.030 | 1.17 |
 | HR_job_change | cls | 0.728 | 0.744 | 0.731 | 0.747 | 0.755 | 0.733 | 0.741 | 0.741 | 0.89 |
@@ -71,17 +71,20 @@ Device: mps. First calls include one-time weight download.
 - our gbt<-TabICL beats xgboost: 30/46
 - out-of-fold soft labels beat in-context soft labels: 17/38
 
-The soft-oof column uses stratified out-of-fold teacher labels:
-an in-context teacher scoring rows already in its own context
-leaks labels and collapses the soft targets toward one-hot
-(Tanna et al., "Pocket Foundation Models", arXiv:2605.18654;
-technique adopted from their paper with thanks). Measured
-honestly: on this suite the fix does not lift accuracy (win
-count above; median delta 0.000). The likely reasons: these
-datasets cap at 1500 rows, so each fold-fit teacher loses
-context it can ill afford; the paper's gains are measured in
-AUC, where soft-label structure matters, while this table is
-accuracy, where only the argmax does; and their pipeline adds
-temperature scaling ours does not. The two results bracket
-where the technique earns its keep: larger data, probability
-metrics.
+The soft-oof column uses stratified out-of-fold teacher labels,
+the fix from Tanna et al., "Pocket Foundation Models"
+(arXiv:2605.18654), for in-context teachers whose soft targets
+collapse toward one-hot on rows already in their context. On
+this suite it does not lift accuracy (win count above; median
+delta 0.000), and we measured why: the collapse is
+teacher-dependent, and TabICL v2 barely leaks here. Its
+in-context labels average 0.899 max-probability and 0.249
+entropy (collapse would be near 1.0 and near 0), and they agree
+with the training labels at 92.5% against an 87.5% held-out
+accuracy: about five points of leak, where the paper's teachers
+memorize their context nearly perfectly. MLP students show the
+same null as gbt students, consistent with mild leak rather
+than student insensitivity. The practical diagnostic: compare
+your teacher's agreement with its own training labels to its
+held-out accuracy; that gap is the leak, and out-of-fold
+labeling is worth its 5x teacher cost when the gap is large.
