@@ -199,9 +199,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "sqlalchemy", specifier = ">=2" },
-    { name = "syrupy", specifier = ">=4" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "sqlalchemy", specifier = ">=2.0.51" },
+    { name = "syrupy", specifier = ">=5.5.3" },
 ]
 
 [[package]]

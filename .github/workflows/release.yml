@@ -20,7 +20,7 @@ jobs:
           - os: macos-latest
             ext: dylib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build loadable extension
         run: make loadable
       - name: Stage artifact
@@ -40,7 +40,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -62,7 +62,7 @@ jobs:
     name: amalgamation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # the single-file drop-in build, attached so users can grab one .c file
       - name: Generate + compile amalgamation
         run: make amalgamation-check
@@ -75,7 +75,7 @@ jobs:
     needs: [binaries, windows, amalgamation]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true

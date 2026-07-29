@@ -24,7 +24,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Stage amalgamation into the package
         run: make python-src
       - name: Build wheels
@@ -46,7 +46,7 @@ jobs:
     name: sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Stage amalgamation into the package
         run: make python-src
       - name: Build sdist
@@ -65,7 +65,7 @@ jobs:
     permissions:
       id-token: write # PyPI Trusted Publishing (OIDC), no token needed
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
