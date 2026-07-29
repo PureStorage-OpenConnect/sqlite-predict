@@ -6,6 +6,11 @@ committing, and tagging.
 
 ## Cut a release
 
+0. Make sure `CHANGELOG.md`'s `[Unreleased]` section reflects the
+   release. Entries are written with the changes themselves (a
+   user-visible change adds its line in the same PR); this step is only
+   a review that nothing is missing.
+
 1. Sync every manifest to the new version:
 
    ```sh
@@ -16,8 +21,12 @@ committing, and tagging.
    `bindings/python/pyproject.toml` (PEP 440 form, e.g. `0.0.1-alpha.5`
    becomes `0.0.1a5`), `bindings/python/sqlite_predict/__init__.py`
    (`__version__`), and `bindings/node/package.json` (including the
-   per-platform `optionalDependencies` pins). The C header derives its
-   version from `VERSION` at build time and needs no edit.
+   per-platform `optionalDependencies` pins), and promotes
+   `CHANGELOG.md`'s `[Unreleased]` section into a dated `[<version>]`
+   section with updated compare links. It refuses to run if
+   `[Unreleased]` is empty, so a release cannot ship without notes. The
+   C header derives its version from `VERSION` at build time and needs
+   no edit.
 
 2. Commit the version bump.
 

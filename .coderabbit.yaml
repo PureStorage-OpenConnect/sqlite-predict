@@ -114,6 +114,17 @@ reviews:
       requirements: >-
         Conventional-commit style prefix (feat/fix/docs/bench/site/chore/
         refactor/test/ci) with a concise, specific subject.
+    custom_checks:
+      - name: "Changelog entry for user-visible changes"
+        mode: "warning"
+        instructions: >-
+          If the PR changes user-visible behavior (SQL surface, option
+          keys, error codes, defaults, output formats, packaging), it
+          should add an entry under CHANGELOG.md's [Unreleased] section
+          in the same PR. Refactors, docs, tests, benchmarks, and CI
+          changes do not need one. Release-time promotion of
+          [Unreleased] into a dated section is owned by make
+          sync-version; PRs should never do that themselves.
 
 chat:
   auto_reply: true

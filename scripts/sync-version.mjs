@@ -65,4 +65,43 @@ for (const d of deps) pkg.optionalDependencies[d] = version;
 fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
 console.log(`  bindings/node/package.json -> ${version} (+ ${deps.length} optionalDependencies)`);
 
+/* Promote CHANGELOG's [Unreleased] into a dated section for this version.
+ * Idempotent: if the section already exists, leave the file alone. The
+ * changelog itself is written with the change; this owns only the
+ * release-time promotion, like every other version stamp here. */
+const clPath = path.join(root, "CHANGELOG.md");
+let cl = fs.readFileSync(clPath, "utf8");
+if (cl.includes(`## [${version}]`)) {
+  console.log(`  CHANGELOG.md already has a [${version}] section`);
+} else {
+  if (!/## \[Unreleased\]\n/.test(cl)) {
+    console.error("CHANGELOG.md has no [Unreleased] section to promote");
+    process.exit(1);
+  }
+  const unreleasedBody = cl
+    .split("## [Unreleased]\n")[1]
+    .split(/\n## \[/)[0]
+    .trim();
+  if (!unreleasedBody) {
+    console.error(`CHANGELOG.md [Unreleased] is empty; write the release's
+entries before running sync-version`);
+    process.exit(1);
+  }
+  const date = new Date().toISOString().slice(0, 10);
+  cl = cl.replace("## [Unreleased]\n",
+                  `## [Unreleased]\n\n## [${version}] - ${date}\n`);
+  /* retarget the compare links: Unreleased diffs from the new tag, and the
+   * new tag diffs from the previous one (the old Unreleased base). */
+  const linkRe = /^\[Unreleased\]: (.*)\/compare\/(v[^.]+[^ ]*)\.\.\.HEAD$/m;
+  const lm = cl.match(linkRe);
+  if (lm) {
+    const [, repo, prevTag] = lm;
+    cl = cl.replace(linkRe,
+      `[Unreleased]: ${repo}/compare/v${version}...HEAD\n` +
+      `[${version}]: ${repo}/compare/${prevTag}...v${version}`);
+  }
+  fs.writeFileSync(clPath, cl);
+  console.log(`  CHANGELOG.md -> [${version}] - ${date}`);
+}
+
 console.log(`VERSION = ${version}  (PyPI: ${pv})`);
