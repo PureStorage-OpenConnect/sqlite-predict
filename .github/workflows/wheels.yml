@@ -28,7 +28,7 @@ jobs:
       - name: Stage amalgamation into the package
         run: make python-src
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v4.1
         with:
           package-dir: bindings/python
         env:
