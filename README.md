@@ -139,6 +139,17 @@ permissively licensed (MIT/Apache-2.0), so you ship it inside your product
 rather than rent it. And it composes with the rest of the in-database AI
 toolbox: sqlite-vec gave SQLite vector search; this gives it prediction.
 
+### Agent skills
+
+For agents, the SQL surface is the whole API, so what ships in
+[`skills/`](skills/) is judgment, not wrappers: four
+[agentskills.io](https://agentskills.io)-format skills covering core
+usage, provenance receipts (record what was asked, which model answered,
+and a hash that replays; serving determinism makes this verifiable),
+the distillation lifecycle (verify before serving, re-distill on drift,
+license discipline), and backtest interpretation. Install them into any
+skills-capable agent, or read them as the condensed operator's manual.
+
 ## Operations
 
 | Function | Question | Returns |
