@@ -82,9 +82,12 @@ reviews:
       instructions: >-
         Docs must read standalone for a first-time public reader. Flag:
         em or en dashes (house style forbids them; use periods, colons,
-        commas, or parentheses), references to internal design docs or
-        RFC section numbers, receipts-era terminology (the feature was
-        removed), title-case headings (use sentence case), and any
+        commas, or parentheses), "an SQL" (house style is "a SQL", the
+        sequel pronunciation; "an SQLITE_" for the spelled-out C
+        identifier prefix is correct and exempt), references to internal
+        design docs or RFC section numbers, receipts-era terminology
+        (the feature was removed), title-case headings (use sentence
+        case), and any
         distillation framing that suggests distilling a non-commercial
         model for production use. Claims of accuracy or speed must match
         the benchmarks pages.
