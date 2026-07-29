@@ -123,6 +123,7 @@ window laid out by position as `context` input columns followed by the
 | --- | --- |
 | `predict_version()` | the extension version string |
 | `predict_ulid(ts)` | the smallest ULID for an ISO-8601 UTC timestamp: deterministic (the time component is set, the entropy bits are zero), useful as a range key |
+| `predict_sha256(x)` | lowercase hex SHA-256 of a TEXT or BLOB value (NULL passes through). The same hash that pins model weights, exposed so provenance workflows like the prediction-receipts skill can record and replay-verify results in pure SQL |
 | `predict_debug()` | build info: profile, compiled features, available runtimes |
 | `predict_register(model_id, config)` | registers an external model in `_predict_models` and returns its content hash; `config` is a bare weights path or a JSON object (`runtime`, `kind`, `license`, `weights_uri`, `io_spec`, `target`). Registration is metadata only: executing an `onnx` model still needs the ONNX build |
 

@@ -420,6 +420,37 @@ static void predict_ulid_fn(sqlite3_context *context, int argc,
   sqlite3_result_text(context, buf, 26, SQLITE_TRANSIENT);
 }
 
+/* predict_sha256(X): lowercase hex SHA-256 of a TEXT or BLOB value.
+ * The same hash that pins model weights (content_hash), exposed so
+ * agent-layer workflows (provenance receipts, content addressing) can
+ * run in pure SQL with no host language. NULL in, NULL out. */
+static void predict_sha256_fn(sqlite3_context *context, int argc,
+                              sqlite3_value **argv) {
+  UNUSED_PARAMETER(argc);
+  int vt = sqlite3_value_type(argv[0]);
+  if (vt == SQLITE_NULL) {
+    sqlite3_result_null(context);
+    return;
+  }
+  const void *data;
+  int n;
+  if (vt == SQLITE_BLOB) {
+    data = sqlite3_value_blob(argv[0]);
+    n = sqlite3_value_bytes(argv[0]);
+  } else { /* TEXT and numeric values hash their text form */
+    data = sqlite3_value_text(argv[0]);
+    n = sqlite3_value_bytes(argv[0]);
+  }
+  predict0_hasher h;
+  predict0_hash_init(&h);
+  if (n > 0 && data)
+    sha256_update(&h.sha, (const u8 *)data, (usize)n);
+  char hex[PREDICT_HEX_BUFSIZE];
+  predict0_hash_hex(&h, hex);
+  sqlite3_result_text(context, hex, PREDICT_HEX_BUFSIZE - 1,
+                      SQLITE_TRANSIENT);
+}
+
 /* predict_register(model_id, config_json): record an external model in
  * _predict_models so predict() can dispatch to it. config is a JSON object:
  *   { "runtime":"onnx", "kind":"tabular-fm"|"student"|...,
@@ -635,6 +666,10 @@ __declspec(dllexport)
     return rc;
   rc = sqlite3_create_function_v2(db, "predict_ulid", 1, flags, NULL,
                                   predict_ulid_fn, NULL, NULL, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = sqlite3_create_function_v2(db, "predict_sha256", 1, flags, NULL,
+                                  predict_sha256_fn, NULL, NULL, NULL);
   if (rc != SQLITE_OK)
     return rc;
   /* predict_register mutates the registry, so it is not INNOCUOUS and not

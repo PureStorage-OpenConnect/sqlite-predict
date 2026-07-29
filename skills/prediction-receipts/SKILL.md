@@ -16,7 +16,9 @@ metadata:
 sqlite-predict serving is deterministic and pure: the same rows, options,
 and model produce byte-identical result documents, and registered model
 weights are pinned by content hash. That makes provenance a recording
-problem the agent can own, with no support needed from the extension.
+problem the agent can own; the only support the extension provides is
+the `predict_sha256()` hash utility, so the whole workflow can run in
+pure SQL.
 
 Record receipts for predictions that matter (decisions, reports, handoffs),
 not for every exploratory call.
@@ -40,10 +42,50 @@ CREATE TABLE IF NOT EXISTS _predict_receipts (
 );
 ```
 
-## The reference script
+## Recording in pure SQL
 
-Prefer the bundled implementation over hand-rolling the steps below, so
-receipts stay interoperable across agents:
+The extension exposes `predict_sha256()` (the same hash that pins model
+weights), so the whole workflow runs in SQL with no host language:
+
+```sql
+INSERT INTO _predict_receipts (operation, input_sql, options, model_id,
+                               content_hash, extension, result_sha256)
+SELECT 'forecast',
+       'SELECT forecast(ts, value, 24) FROM readings',
+       NULL,
+       json_extract(doc, '$.model'),
+       (SELECT content_hash FROM _predict_models
+        WHERE model_id = json_extract(doc, '$.model')),
+       json_extract(predict_version(), '$.extension'),
+       predict_sha256(doc)
+FROM (SELECT (SELECT forecast(ts, value, 24) FROM readings) AS doc);
+```
+
+The inner `input_sql` string and the query that computes `doc` must be
+the same SQL, verbatim; that is what makes the receipt replayable. If
+nothing has been distilled or registered, `_predict_models` does not
+exist yet: record `NULL` for `content_hash` instead of the subquery.
+
+## Verifying in pure SQL
+
+```sql
+SELECT id,
+       result_sha256 = predict_sha256(
+         (SELECT forecast(ts, value, 24) FROM readings)) AS match
+FROM _predict_receipts WHERE id = 1;
+```
+
+`match` is 1 when the replay reproduces the recorded result. On 0,
+compare the receipt's `extension` against `predict_version()` and its
+`content_hash` against the registry to find what moved; unchanged data
+with an unchanged model and extension should never mismatch.
+
+## The reference script (optional)
+
+For row-shaped results (`predict`, `backtest`) the document needs
+canonical serialization, and pure SQL float formatting is not
+round-trip safe. Use the bundled script for those, or when you want
+mismatch diagnostics computed for you:
 
 ```
 scripts/receipt.py record  DB "SELECT forecast(ts, value, 24) FROM t"
@@ -51,39 +93,11 @@ scripts/receipt.py verify  DB RECEIPT_ID   # exit 0 match, 2 mismatch
 scripts/receipt.py list    DB
 ```
 
-It creates the table, canonicalizes the result (the aggregate document
-verbatim; rows as compact JSON with shortest round-trip floats), hashes
-it, resolves the model's registry pin, and on verify reports what
-changed (data, extension version, or model hash). Python stdlib only;
-pass the loadable with --extension or SQLITE_PREDICT_EXTENSION.
-
-## Writing a receipt by hand
-
-1. Run the prediction and keep the raw result document text (the JSON the
-   aggregate returned, or the concatenated rows for a TVF, in a fixed
-   order).
-2. `model_id` comes from the document's `model` field. For a registered
-   model or student, read its pin:
-   `SELECT content_hash FROM _predict_models WHERE model_id = ?`.
-3. Hash the exact document text with SHA-256 (any host language; SQLite
-   itself has no sha256 built in).
-4. Insert the row. Store the document itself wherever the result is used;
-   the receipt stores its hash, not the data.
-
-## Replaying a receipt
-
-To verify a receipt later: re-run `input_sql` through the same operation
-with the same `options`, hash the new document, and compare to
-`result_sha256`. Three outcomes:
-
-- Hashes match: the result reproduces. With an unchanged `content_hash`,
-  the same model on the same data gave the same answer.
-- Hashes differ and the underlying table changed: the data moved, which
-  is normal; the receipt documents what was true at `created_at`.
-- Hashes differ on unchanged data: investigate. Check the extension
-  version (`predict_version()` vs the receipt's `extension`) and the
-  model's `content_hash` (tampered weights fail loudly at load with
-  `PREDICT_ERR_MODEL_HASH`, so a swap cannot hide).
+Python stdlib only; pass the loadable with --extension or
+SQLITE_PREDICT_EXTENSION. It creates the table, canonicalizes (the
+aggregate document verbatim; rows as compact JSON with shortest
+round-trip floats), resolves the model pin, and reports what changed on
+verify.
 
 ## Honest limits
 

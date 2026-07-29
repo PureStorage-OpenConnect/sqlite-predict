@@ -101,6 +101,48 @@ def test_receipt_record_verify_and_tamper(receipt_db):
     assert json.loads(bad.stdout)["match"] is False
 
 
+def test_pure_sql_receipt_path(receipt_db):
+    """The skill's primary path: record and verify with no host language
+    beyond SQL, using predict_sha256."""
+    db = sqlite3.connect(receipt_db)
+    db.enable_load_extension(True)
+    db.load_extension(EXT)
+    import hashlib
+    assert db.execute("SELECT predict_sha256('abc')").fetchone()[0] == \
+        hashlib.sha256(b"abc").hexdigest()
+    assert db.execute("SELECT predict_sha256(NULL)").fetchone()[0] is None
+
+    db.execute("""CREATE TABLE _predict_receipts (
+      id INTEGER PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      operation TEXT NOT NULL, input_sql TEXT NOT NULL, options TEXT,
+      model_id TEXT NOT NULL, content_hash TEXT,
+      extension TEXT NOT NULL, result_sha256 TEXT NOT NULL)""")
+    db.execute("""
+      INSERT INTO _predict_receipts (operation, input_sql, options, model_id,
+                                     content_hash, extension, result_sha256)
+      SELECT 'forecast', 'SELECT forecast(ts, value, 6) FROM readings', NULL,
+             json_extract(doc, '$.model'), NULL,
+             json_extract(predict_version(), '$.extension'),
+             predict_sha256(doc)
+      FROM (SELECT (SELECT forecast(ts, value, 6) FROM readings) AS doc)""")
+    db.commit()
+
+    (match,) = db.execute("""
+      SELECT result_sha256 = predict_sha256(
+        (SELECT forecast(ts, value, 6) FROM readings))
+      FROM _predict_receipts WHERE id = 1""").fetchone()
+    assert match == 1
+
+    db.execute("UPDATE readings SET value = value + 100 WHERE rowid = 3")
+    (match,) = db.execute("""
+      SELECT result_sha256 = predict_sha256(
+        (SELECT forecast(ts, value, 6) FROM readings))
+      FROM _predict_receipts WHERE id = 1""").fetchone()
+    assert match == 0
+    db.close()
+
+
 def test_receipt_pins_a_registered_student(receipt_db):
     db = sqlite3.connect(receipt_db)
     db.enable_load_extension(True)
