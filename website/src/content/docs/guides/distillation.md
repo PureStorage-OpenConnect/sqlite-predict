@@ -39,6 +39,23 @@ with second-order leaves, which matches or beats tuned XGBoost on most
 tasks), or `mlp` (a one-hidden-layer net for boundaries a tree renders
 poorly). With `proba` and `classes` the student learns the teacher's full
 probability distribution (soft-label distillation), not just its argmax.
+
+One trap when the teacher is an in-context model (TabPFN, TabICL, or any
+model that takes the training rows as context): do not fill the `proba`
+columns by scoring the same rows the teacher has in its context. The
+teacher effectively already knows those labels, so its probabilities
+collapse toward one-hot and carry no inter-class structure for the
+student to learn. Label out-of-fold instead: split the training rows
+into folds, fit the teacher on the other folds, and take probabilities
+for each row from the fold that held it out. This is the fix identified
+by Tanna et al., ["Pocket Foundation
+Models"](https://arxiv.org/abs/2605.18654). Our
+[benchmarks](../../benchmarks/) measure it both ways: on small data
+(1500 rows) scored by accuracy it made no difference, while their
+larger-scale AUC results show a real gain, so the smaller your data and
+the more you only need the argmax, the less it matters; the more you
+care about calibrated probabilities, the more it does. Teachers that
+train normally (your own model, a fitted classifier) do not need it.
 Feature columns must be numeric: encode categorical text before distilling
 (the in-context `knn5-incontext` handles text features itself; the distiller
 does not).

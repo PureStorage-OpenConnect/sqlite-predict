@@ -193,6 +193,31 @@ def run_tabfm(Xtr, ytr, Xte, task):
     return est.predict(Xte.values), est
 
 
+def oof_proba(make_estimator, Xtr, ytr, n_splits=5, seed=0):
+    """Stratified out-of-fold teacher probabilities.
+
+    In-context teachers leak labels when scoring rows already in their
+    context: the soft targets collapse toward one-hot and carry no
+    inter-class structure to distill. Labeling each fold with a teacher
+    fitted on the other folds prevents it (Tanna et al., "Pocket
+    Foundation Models", arXiv:2605.18654). Returns (proba [n, K],
+    classes) aligned to a global class order.
+    """
+    from sklearn.model_selection import StratifiedKFold
+    y = np.asarray(ytr)
+    classes = sorted(set(y.tolist()))
+    idx = {c: i for i, c in enumerate(classes)}
+    out = np.zeros((len(y), len(classes)))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for tr_i, te_i in skf.split(Xtr, y):
+        est = make_estimator()
+        est.fit(Xtr.values[tr_i], y[tr_i])
+        p = est.predict_proba(Xtr.values[te_i])
+        for j, c in enumerate(est.classes_):
+            out[te_i, idx[c]] += p[:, j]
+    return out, [str(c) for c in classes]
+
+
 def sklearn_tree(Xtr, teacher_tr, Xte, task):
     from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
     T = (DecisionTreeClassifier if task == "cls" else DecisionTreeRegressor)
