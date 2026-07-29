@@ -120,7 +120,9 @@ The honest asterisk: a frontier model called zero-shot is still the accuracy
 ceiling. The [benchmarks](./benchmarks/) measure the gap; a distilled student
 typically gives up about half a point of accuracy against its teacher.
 
-:::caution[Pre-alpha]
-The API and the SQL surface are unstable and may change without notice. Not yet
-recommended for production.
+:::caution[Pre-1.0]
+The SQL surface and option keys may change between minor versions, and the
+changelog documents every break. Your data outlives the churn: stored
+students and the model registry use versioned on-disk formats that stay
+servable across upgrades, and migrations are idempotent.
 :::

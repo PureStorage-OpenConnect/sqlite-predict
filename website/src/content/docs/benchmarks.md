@@ -5,7 +5,7 @@ description: Measured, reproducible accuracy numbers for the bundled models.
 
 These are the numbers we hold ourselves to. Every one is reproducible from the
 harness in [`benchmarks/`](https://github.com/PureStorage-OpenConnect/sqlite-predict/tree/main/benchmarks);
-lower is better for error metrics unless noted. This is pre-alpha, so treat them
+lower is better for error metrics unless noted. This is pre-1.0 software, so treat them
 as a spike baseline, not a leaderboard claim.
 
 ## Forecasting (MASE, lower is better)

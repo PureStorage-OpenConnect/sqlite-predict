@@ -66,8 +66,11 @@ a toy series.
 All of it runs on CPU, in-process, with no network and no GPU.
 
 > [!WARNING]
-> **Pre-alpha.** The API and the SQL surface are
-> unstable and may change without notice. Not yet recommended for production.
+> **Pre-1.0.** The SQL surface and option keys may change between minor
+> versions; the [changelog](CHANGELOG.md) documents every break. What
+> survives upgrades: your stored students and the model registry. The
+> on-disk formats are versioned and stay servable, and migrations are
+> idempotent.
 
 ## Distill a model into your database
 

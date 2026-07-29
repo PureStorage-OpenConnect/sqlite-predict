@@ -30,6 +30,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A stated stability contract, replacing the blanket pre-alpha warning:
+  the SQL surface may change between pre-1.0 minors (every break is
+  changelogged), while stored students and the model registry stay
+  servable across upgrades via versioned on-disk formats.
 - Benchmark campaigns for the permissively licensed tabular teachers:
   TabPFN-2 and the latest TabPFN-3 (zero-shot only, per its license),
   TabICL v2, and Mitra, with distillation retention measured for every
