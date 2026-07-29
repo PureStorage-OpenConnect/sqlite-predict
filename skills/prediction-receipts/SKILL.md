@@ -40,7 +40,24 @@ CREATE TABLE IF NOT EXISTS _predict_receipts (
 );
 ```
 
-## Writing a receipt
+## The reference script
+
+Prefer the bundled implementation over hand-rolling the steps below, so
+receipts stay interoperable across agents:
+
+```
+scripts/receipt.py record  DB "SELECT forecast(ts, value, 24) FROM t"
+scripts/receipt.py verify  DB RECEIPT_ID   # exit 0 match, 2 mismatch
+scripts/receipt.py list    DB
+```
+
+It creates the table, canonicalizes the result (the aggregate document
+verbatim; rows as compact JSON with shortest round-trip floats), hashes
+it, resolves the model's registry pin, and on verify reports what
+changed (data, extension version, or model hash). Python stdlib only;
+pass the loadable with --extension or SQLITE_PREDICT_EXTENSION.
+
+## Writing a receipt by hand
 
 1. Run the prediction and keep the raw result document text (the JSON the
    aggregate returned, or the concatenated rows for a TVF, in a fixed
