@@ -228,4 +228,4 @@ def test_receipt_adversarial_paths(receipt_db):
     db.close()
     evil = run_receipt("verify", receipt_db, "1")
     assert evil.returncode != 0
-    assert "not authorized" in (evil.stderr + evil.stdout).lower() or         "no receipt" not in evil.stderr
+    assert "not authorized" in (evil.stderr + evil.stdout).lower()
