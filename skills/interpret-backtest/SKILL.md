@@ -36,19 +36,25 @@ SELECT * FROM backtest('SELECT ts, value FROM readings', 24,
 
 ## Interval judgment
 
-The default Gaussian band is overconfident on smooth series (measured as
-low as 0.57 coverage at a nominal 0.90 on our benchmarks). When interval
-truth matters:
+The default Gaussian band can be overconfident on smooth series: the
+sqlite-predict benchmarks measured 0.57 coverage at a nominal 0.90 for
+theta-class models on smooth gluonts series (`benchmarks/results/` in
+the repo). When interval truth matters, request conformal intervals in
+the same call:
 
 ```sql
-'{"interval_method":"conformal"}'
+SELECT * FROM backtest('SELECT ts, value FROM readings', 24,
+                       '{"model":"theta-classic",
+                         "interval_method":"conformal"}');
 ```
 
-Conformal intervals calibrate to measured residuals and land at the
-nominal level, at the cost of needing enough folds to calibrate
-(statistical models only; a short series can make it refuse). Always
-verify the choice with `backtest` coverage on your own series rather
-than trusting either method's reputation.
+Conformal intervals calibrate to measured out-of-sample residuals and
+substantially improve empirical coverage (they reached the nominal level
+in our benchmarks, but finite folds carry no guarantee). They need
+enough history to calibrate and apply to the statistical models only; a
+short series makes the call refuse rather than fabricate. Always verify
+with `backtest` coverage on your own series rather than trusting either
+method's reputation, ours included.
 
 ## Auto-selection judgment
 

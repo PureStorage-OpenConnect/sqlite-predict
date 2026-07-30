@@ -56,13 +56,26 @@ def connect(db_path, extension):
         db.load_extension(extension)
     except sqlite3.OperationalError as e:
         fail(f"cannot load extension '{extension}': {e}")
+    finally:
+        # verify() replays stored SQL; with loading left enabled, a
+        # tampered receipt could call load_extension() on an arbitrary
+        # local library. One load, then locked.
+        db.enable_load_extension(False)
     return db
 
 
-def canonical_document(cur):
+AGGREGATE_OPS = ("forecast", "detect_anomalies")
+
+
+def canonical_document(cur, operation):
+    """Aggregate operations hash their single JSON document verbatim;
+    row-shaped operations always hash the {"columns","rows"} form, even
+    when the result happens to be one text cell. Shape must follow the
+    operation or receipts stop being interoperable."""
     rows = cur.fetchall()
     cols = [d[0] for d in cur.description] if cur.description else []
-    if len(rows) == 1 and len(cols) == 1 and isinstance(rows[0][0], str):
+    if (operation in AGGREGATE_OPS and len(rows) == 1 and len(cols) == 1
+            and isinstance(rows[0][0], str)):
         return rows[0][0]
     return json.dumps({"columns": cols, "rows": [list(r) for r in rows]},
                       separators=(",", ":"), ensure_ascii=False)
@@ -114,7 +127,7 @@ def cmd_record(args):
         fail("cannot infer the operation from the SQL; pass --operation "
              f"one of {', '.join(OPERATIONS)}")
     cur = db.execute(args.sql)
-    document = canonical_document(cur)
+    document = canonical_document(cur, operation)
     model_id, content_hash = model_fields(db, document, args.model_id)
     db.execute(DDL)
     cur = db.execute(
@@ -133,12 +146,13 @@ def cmd_record(args):
 def cmd_verify(args):
     db = connect(args.db, args.extension)
     row = db.execute(
-        "SELECT input_sql, model_id, content_hash, extension, result_sha256"
-        " FROM _predict_receipts WHERE id = ?", (args.receipt_id,)).fetchone()
+        "SELECT operation, input_sql, model_id, content_hash, extension,"
+        " result_sha256 FROM _predict_receipts WHERE id = ?",
+        (args.receipt_id,)).fetchone()
     if row is None:
         fail(f"no receipt with id {args.receipt_id}")
-    input_sql, model_id, rec_hash, rec_ext, rec_sha = row
-    document = canonical_document(db.execute(input_sql))
+    operation, input_sql, model_id, rec_hash, rec_ext, rec_sha = row
+    document = canonical_document(db.execute(input_sql), operation)
     now_sha = sha256_text(document)
     now_ext = extension_version(db)
     now_hash = None

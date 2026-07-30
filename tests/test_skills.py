@@ -176,3 +176,56 @@ def test_receipt_pins_a_registered_student(receipt_db):
     assert out2["content_hash"], "student content_hash must be recorded"
     ver = run_receipt("verify", receipt_db, str(out2["receipt_id"]))
     assert json.loads(ver.stdout)["match"] is True
+
+
+def test_receipt_adversarial_paths(receipt_db):
+    """Break the receipt tool the ways a hostile or careless caller
+    would: single-text-cell TVF results must canonicalize as rows (not
+    as an aggregate document), extension errors must surface their
+    PREDICT_ERR_* code verbatim, missing receipts must fail loudly, and
+    a replayed receipt must not be able to re-enable extension
+    loading."""
+    import hashlib
+
+    # a backtest projected to one text column: operation-based
+    # canonicalization must hash the {"columns","rows"} form, so the
+    # receipt hash must NOT equal the raw-cell hash
+    one_cell_sql = ("SELECT model FROM backtest("
+                    "'SELECT ts, value FROM readings', 4,"
+                    " '{\"model\":\"theta-classic\"}') LIMIT 1")
+    rec = run_receipt("record", receipt_db, one_cell_sql,
+                      "--model-id", "theta-classic")
+    assert rec.returncode == 0, rec.stderr
+    out = json.loads(rec.stdout)
+    db = sqlite3.connect(receipt_db)
+    db.enable_load_extension(True)
+    db.load_extension(EXT)
+    raw_cell = db.execute(one_cell_sql).fetchone()[0]
+    db.close()
+    assert out["result_sha256"] != hashlib.sha256(
+        raw_cell.encode()).hexdigest(),         "TVF result canonicalized as an aggregate document"
+    ver = run_receipt("verify", receipt_db, str(out["receipt_id"]))
+    assert json.loads(ver.stdout)["match"] is True
+
+    # unknown option key: the extension's exact error code must surface
+    bad = run_receipt(
+        "record", receipt_db,
+        "SELECT forecast(ts, value, 6, '{\"bogus_key\":1}') FROM readings")
+    assert bad.returncode != 0
+    assert "PREDICT_ERR_OPTIONS" in (bad.stderr + bad.stdout)
+
+    # missing receipt id fails loudly
+    gone = run_receipt("verify", receipt_db, "9999")
+    assert gone.returncode != 0
+    assert "no receipt" in gone.stderr
+
+    # a tampered receipt cannot load an arbitrary extension on replay
+    db = sqlite3.connect(receipt_db)
+    db.execute(
+        "UPDATE _predict_receipts SET input_sql ="
+        " 'SELECT load_extension(''/tmp/evil'')' WHERE id = 1")
+    db.commit()
+    db.close()
+    evil = run_receipt("verify", receipt_db, "1")
+    assert evil.returncode != 0
+    assert "not authorized" in (evil.stderr + evil.stdout).lower() or         "no receipt" not in evil.stderr

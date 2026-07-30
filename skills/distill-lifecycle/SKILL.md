@@ -14,9 +14,12 @@ metadata:
 # The distillation lifecycle
 
 Distillation compresses a teacher (your own labels, your existing model's
-predictions, or a licensed foundation model) into a student a few
-kilobytes big that serves in microseconds in the zero-dependency core.
-The fit takes seconds; the lifecycle judgment is yours.
+predictions, or a licensed foundation model) into a native student the
+serving core executes with no runtime. Measured on the repo's benchmark
+suite: student blobs run tens to hundreds of kilobytes, single-row
+serving is sub-millisecond on CPU, and fits complete in seconds at
+benchmark scale (see `benchmarks/results/` in the sqlite-predict repo).
+The lifecycle judgment is yours.
 
 ## Distill
 
@@ -51,8 +54,10 @@ Never serve a student on faith:
    against their teacher, but regression tails are worse. Check
    regression students more skeptically.
 4. Soft-label distillation (`proba`/`classes`) preserves the teacher's
-   calibration and rescues heavily imbalanced datasets, where hard labels
-   can collapse to one class (the distiller refuses loudly when they do).
+   calibration when the teacher emits probabilities, and usually rescues
+   imbalanced datasets where hard labels collapse to one class (the
+   distiller refuses loudly on collapse rather than fitting a
+   constant).
 
 ## Watch for drift, re-distill cheaply
 
@@ -67,10 +72,13 @@ quality decays silently, so schedule verification rather than assuming:
 
 ## Licensing is part of the lifecycle
 
-A student derives from its teacher, and the teacher's license travels
-with it. Your own labels and models carry no limits. Foundation-model
-teachers vary by vendor and version, and restrictively licensed ones
-require an explicit `accept_license` opt-in before they will run. Read
-the license of the exact weights you use before distilling for anything
-beyond evaluation; the project documentation's license notes are
+A student derives from its teacher, and the teacher's license may
+impose obligations on what you distill and distribute; what applies
+depends on the exact weights, license version, and how the student is
+used. Record the teacher's license alongside each student you register.
+Your own labels and models carry no such limits. Restrictively licensed
+teachers require an explicit `accept_license` opt-in before they will
+run, but that gate is an acknowledgment, not compliance: read the
+license of the exact weights you use before distilling for anything
+beyond evaluation. The project documentation's license notes are
 orientation, not legal advice.
