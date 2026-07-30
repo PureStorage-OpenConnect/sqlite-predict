@@ -100,11 +100,15 @@ further: it replays the stored `input_sql`, recomputes the result hash,
 re-derives the serving model from the replayed result and compares it
 to the recorded `model_id` (aggregate results carry a model; row-form
 results recorded via `--model-id` cannot be re-derived), and reports
-extension-version and registry-hash drift. Two limits it states rather
-than hides: the `options` column is informational (its authoritative
-copy is the options text inside `input_sql`, which the replay executes
-verbatim), and a receipt row is self-attested, so tamper-proofing the
-receipts table itself needs database-level controls. On a mismatch, compare the receipt's `extension` against
+extension-version and registry-hash drift. Replay treats the stored SQL
+as untrusted: verification runs on a read-only connection with an
+authorizer that permits only reads and function calls, so a tampered
+receipt cannot write, drop, attach, or change pragmas on the verifier's
+database. Two limits it states rather than hides: the `options` column
+is informational (its authoritative copy is the options text inside
+`input_sql`, which the replay executes verbatim), and a receipt row is
+self-attested, so trusting what a receipt claims about itself, as
+opposed to what replay proves, needs database-level access controls. On a mismatch, compare the receipt's `extension` against
 `predict_version()` and its `content_hash` against the registry.
 
 ## The reference script (optional)

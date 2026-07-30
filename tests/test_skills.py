@@ -271,3 +271,32 @@ def test_receipt_metadata_tampering(receipt_db):
     rep = json.loads(forged_opts.stdout)
     assert rep["match"] is True, "options is informational by design"
     assert rep["options_verified"] is False
+
+
+def test_receipt_replay_cannot_write(receipt_db):
+    """Replay input is untrusted: a tampered input_sql that writes,
+    drops, or attaches must be refused by the read-only replay
+    connection, and the verifier's data must be untouched."""
+    rec = run_receipt("record", receipt_db,
+                      "SELECT forecast(ts, value, 6) FROM readings")
+    rid = str(json.loads(rec.stdout)["receipt_id"])
+
+    for attack in ("DELETE FROM readings",
+                   "DROP TABLE readings",
+                   "ATTACH DATABASE '/tmp/exfil.db' AS x",
+                   "PRAGMA journal_mode = OFF"):
+        db = sqlite3.connect(receipt_db)
+        db.execute("UPDATE _predict_receipts SET input_sql = ?"
+                   " WHERE id = ?", (attack, rid))
+        db.commit()
+        db.close()
+        out = run_receipt("verify", receipt_db, rid)
+        assert out.returncode != 0, f"replay accepted: {attack}"
+        blob = (out.stderr + out.stdout).lower()
+        assert ("not authorized" in blob or "readonly" in blob
+                or "read-only" in blob or "prohibited" in blob), attack
+
+    db = sqlite3.connect(receipt_db)
+    (n,) = db.execute("SELECT count(*) FROM readings").fetchone()
+    db.close()
+    assert n == 48, "replay modified the verifier's data"

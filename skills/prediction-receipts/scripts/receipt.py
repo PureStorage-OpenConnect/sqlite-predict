@@ -51,18 +51,38 @@ def fail(code, msg):
     sys.exit(1)
 
 
-def connect(db_path, extension):
-    db = sqlite3.connect(db_path)
+#: authorizer allow-list for replaying untrusted SQL: reads and function
+#: calls only. Everything else (writes, DDL, ATTACH, PRAGMA) is denied.
+_REPLAY_ALLOWED = {
+    getattr(sqlite3, name, None) for name in
+    ("SQLITE_SELECT", "SQLITE_READ", "SQLITE_FUNCTION", "SQLITE_RECURSIVE")
+} - {None}
+
+
+def _replay_authorizer(action, *_):
+    return sqlite3.SQLITE_OK if action in _REPLAY_ALLOWED \
+        else sqlite3.SQLITE_DENY
+
+
+def connect(db_path, extension, untrusted=False):
+    """untrusted=True is the replay posture: the database opens
+    read-only at the file level and an authorizer denies everything but
+    reads and function calls, so a tampered receipt's input_sql cannot
+    write, drop, attach, or change pragmas on the verifier's database."""
+    if untrusted:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    else:
+        db = sqlite3.connect(db_path)
     db.enable_load_extension(True)
     try:
         db.load_extension(extension)
     except sqlite3.OperationalError as e:
         fail("RECEIPT_ERR_EXTENSION", f"cannot load '{extension}': {e}")
     finally:
-        # verify() replays stored SQL; with loading left enabled, a
-        # tampered receipt could call load_extension() on an arbitrary
-        # local library. One load, then locked.
+        # a tampered receipt must not be able to load a local library
         db.enable_load_extension(False)
+    if untrusted:
+        db.set_authorizer(_replay_authorizer)
     return db
 
 
@@ -148,7 +168,7 @@ def cmd_record(args):
 
 
 def cmd_verify(args):
-    db = connect(args.db, args.extension)
+    db = connect(args.db, args.extension, untrusted=True)
     row = db.execute(
         "SELECT operation, input_sql, model_id, content_hash, extension,"
         " result_sha256 FROM _predict_receipts WHERE id = ?",
@@ -201,7 +221,7 @@ def cmd_verify(args):
 
 
 def cmd_list(args):
-    db = connect(args.db, args.extension)
+    db = connect(args.db, args.extension, untrusted=True)
     try:
         rows = db.execute(
             "SELECT id, created_at, operation, model_id, result_sha256"
