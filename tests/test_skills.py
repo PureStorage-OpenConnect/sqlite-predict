@@ -214,10 +214,21 @@ def test_receipt_adversarial_paths(receipt_db):
     assert bad.returncode != 0
     assert "PREDICT_ERR_OPTIONS" in (bad.stderr + bad.stdout)
 
+    # numeric input to the hash primitive is rejected, never coerced
+    db = sqlite3.connect(receipt_db)
+    db.enable_load_extension(True)
+    db.load_extension(EXT)
+    import pytest as _pytest
+    for bad_val in ("1.5", "42"):
+        with _pytest.raises(sqlite3.OperationalError, match="PREDICT_ERR_SCHEMA"):
+            db.execute(f"SELECT predict_sha256({bad_val})").fetchone()
+    assert db.execute("SELECT predict_sha256(NULL)").fetchone()[0] is None
+    db.close()
+
     # missing receipt id fails loudly
     gone = run_receipt("verify", receipt_db, "9999")
     assert gone.returncode != 0
-    assert "no receipt" in gone.stderr
+    assert "RECEIPT_ERR_NOT_FOUND" in gone.stderr
 
     # a tampered receipt cannot load an arbitrary extension on replay
     db = sqlite3.connect(receipt_db)

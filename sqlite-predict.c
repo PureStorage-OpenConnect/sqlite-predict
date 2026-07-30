@@ -437,9 +437,18 @@ static void predict_sha256_fn(sqlite3_context *context, int argc,
   if (vt == SQLITE_BLOB) {
     data = sqlite3_value_blob(argv[0]);
     n = sqlite3_value_bytes(argv[0]);
-  } else { /* TEXT and numeric values hash their text form */
+  } else if (vt == SQLITE_TEXT) {
     data = sqlite3_value_text(argv[0]);
     n = sqlite3_value_bytes(argv[0]);
+  } else {
+    /* numbers are rejected, not coerced: SQLite's REAL->TEXT keeps 15
+     * significant digits, so distinct doubles could collapse to one
+     * hash. A provenance primitive must not do that silently. */
+    sqlite3_result_error(context,
+                         PREDICT_ERR_SCHEMA
+                         ": predict_sha256 takes TEXT or BLOB",
+                         -1);
+    return;
   }
   predict0_hasher h;
   predict0_hash_init(&h);

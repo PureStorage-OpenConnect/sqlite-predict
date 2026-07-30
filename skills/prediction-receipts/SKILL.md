@@ -44,8 +44,11 @@ CREATE TABLE IF NOT EXISTS _predict_receipts (
 
 ## Recording in pure SQL
 
-The extension exposes `predict_sha256()` (the same hash that pins model
-weights), so the whole workflow runs in SQL with no host language:
+The extension exposes `predict_sha256()`, a plain SHA-256 over TEXT or
+BLOB. Two different provenance values use it: `result_sha256` hashes the
+result document (computed here), while `content_hash` pins the model's
+weights (computed by the registry at registration; you only copy it).
+Never conflate the two. The whole workflow runs in SQL:
 
 ```sql
 INSERT INTO _predict_receipts (operation, input_sql, options, model_id,
@@ -62,9 +65,24 @@ FROM (SELECT (SELECT forecast(ts, value, 24) FROM readings) AS doc);
 ```
 
 The inner `input_sql` string and the query that computes `doc` must be
-the same SQL, verbatim; that is what makes the receipt replayable. If
-nothing has been distilled or registered, `_predict_models` does not
-exist yet: record `NULL` for `content_hash` instead of the subquery.
+the same SQL, verbatim; that is what makes the receipt replayable.
+
+If nothing has been distilled or registered, `_predict_models` does not
+exist and the statement above fails on the subquery. Use this variant,
+which records `NULL` for `content_hash`:
+
+```sql
+INSERT INTO _predict_receipts (operation, input_sql, options, model_id,
+                               content_hash, extension, result_sha256)
+SELECT 'forecast',
+       'SELECT forecast(ts, value, 24) FROM readings',
+       NULL,
+       json_extract(doc, '$.model'),
+       NULL,
+       json_extract(predict_version(), '$.extension'),
+       predict_sha256(doc)
+FROM (SELECT (SELECT forecast(ts, value, 24) FROM readings) AS doc);
+```
 
 ## Verifying in pure SQL
 
@@ -75,10 +93,14 @@ SELECT id,
 FROM _predict_receipts WHERE id = 1;
 ```
 
-`match` is 1 when the replay reproduces the recorded result. On 0,
-compare the receipt's `extension` against `predict_version()` and its
-`content_hash` against the registry to find what moved; unchanged data
-with an unchanged model and extension should never mismatch.
+`match` is 1 when the replay reproduces the recorded result. This is a
+spot check of one known query's result hash, not full verification: it
+trusts the receipt row's own metadata, so tampered `input_sql`,
+`options`, or `model_id` fields are not detected here. For full replay
+that re-derives everything from the stored fields and diagnoses what
+moved (data, extension version, or model hash), use the reference
+script below. On a mismatch, compare the receipt's `extension` against
+`predict_version()` and its `content_hash` against the registry.
 
 ## The reference script (optional)
 
@@ -87,7 +109,7 @@ canonical serialization, and pure SQL float formatting is not
 round-trip safe. Use the bundled script for those, or when you want
 mismatch diagnostics computed for you:
 
-```
+```text
 scripts/receipt.py record  DB "SELECT forecast(ts, value, 24) FROM t"
 scripts/receipt.py verify  DB RECEIPT_ID   # exit 0 match, 2 mismatch
 scripts/receipt.py list    DB

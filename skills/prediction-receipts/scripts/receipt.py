@@ -44,8 +44,10 @@ DDL = """CREATE TABLE IF NOT EXISTS _predict_receipts (
 OPERATIONS = ("forecast", "detect_anomalies", "predict", "backtest")
 
 
-def fail(msg):
-    print(f"receipt.py: {msg}", file=sys.stderr)
+def fail(code, msg):
+    """Stable, grep-able failure codes so agents can branch on outcomes
+    the way they branch on the extension's PREDICT_ERR_* codes."""
+    print(f"receipt.py: {code}: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -55,7 +57,7 @@ def connect(db_path, extension):
     try:
         db.load_extension(extension)
     except sqlite3.OperationalError as e:
-        fail(f"cannot load extension '{extension}': {e}")
+        fail("RECEIPT_ERR_EXTENSION", f"cannot load '{extension}': {e}")
     finally:
         # verify() replays stored SQL; with loading left enabled, a
         # tampered receipt could call load_extension() on an arbitrary
@@ -107,8 +109,9 @@ def model_fields(db, document, model_flag):
         except (json.JSONDecodeError, AttributeError):
             model_id = None
     if not model_id:
-        fail("cannot determine the serving model: the result is not a "
-             "document with a \"model\" field; pass --model-id explicitly")
+        fail("RECEIPT_ERR_MODEL_UNKNOWN",
+             "the result is not a document with a \"model\" field;"
+             " pass --model-id explicitly")
     content_hash = None
     try:
         row = db.execute(
@@ -124,8 +127,9 @@ def cmd_record(args):
     db = connect(args.db, args.extension)
     operation = args.operation or infer_operation(args.sql)
     if operation is None:
-        fail("cannot infer the operation from the SQL; pass --operation "
-             f"one of {', '.join(OPERATIONS)}")
+        fail("RECEIPT_ERR_OPERATION_UNKNOWN",
+             f"cannot infer the operation; pass --operation one of"
+             f" {', '.join(OPERATIONS)}")
     cur = db.execute(args.sql)
     document = canonical_document(cur, operation)
     model_id, content_hash = model_fields(db, document, args.model_id)
@@ -150,7 +154,7 @@ def cmd_verify(args):
         " result_sha256 FROM _predict_receipts WHERE id = ?",
         (args.receipt_id,)).fetchone()
     if row is None:
-        fail(f"no receipt with id {args.receipt_id}")
+        fail("RECEIPT_ERR_NOT_FOUND", f"no receipt with id {args.receipt_id}")
     operation, input_sql, model_id, rec_hash, rec_ext, rec_sha = row
     document = canonical_document(db.execute(input_sql), operation)
     now_sha = sha256_text(document)
