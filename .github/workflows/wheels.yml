@@ -28,7 +28,7 @@ jobs:
       - name: Stage amalgamation into the package
         run: make python-src
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v4.1
         with:
           package-dir: bindings/python
         env:
@@ -37,7 +37,7 @@ jobs:
           CIBW_BUILD: "cp312-*"
           CIBW_SKIP: "*-musllinux*"
           CIBW_BUILD_VERBOSITY: "1"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
@@ -51,7 +51,7 @@ jobs:
         run: make python-src
       - name: Build sdist
         run: pipx run build --sdist --outdir wheelhouse bindings/python
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: wheelhouse/*.tar.gz
