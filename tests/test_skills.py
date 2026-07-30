@@ -240,3 +240,34 @@ def test_receipt_adversarial_paths(receipt_db):
     evil = run_receipt("verify", receipt_db, "1")
     assert evil.returncode != 0
     assert "not authorized" in (evil.stderr + evil.stdout).lower()
+
+
+def test_receipt_metadata_tampering(receipt_db):
+    """A tampered model_id must fail verification via re-derivation; a
+    tampered options column is documented as informational (the
+    authoritative options live inside input_sql), so this test pins that
+    stated limit rather than pretending it is detection."""
+    rec = run_receipt("record", receipt_db,
+                      "SELECT forecast(ts, value, 6) FROM readings")
+    rid = str(json.loads(rec.stdout)["receipt_id"])
+
+    db = sqlite3.connect(receipt_db)
+    db.execute("UPDATE _predict_receipts SET model_id = 'impostor'"
+               " WHERE id = ?", (rid,))
+    db.commit()
+    db.close()
+    forged = run_receipt("verify", receipt_db, rid)
+    assert forged.returncode == 2
+    rep = json.loads(forged.stdout)
+    assert rep["match"] is False
+    assert rep["model"]["id_matches"] is False
+
+    db = sqlite3.connect(receipt_db)
+    db.execute("UPDATE _predict_receipts SET model_id = 'theta-classic',"
+               " options = '{\"forged\":true}' WHERE id = ?", (rid,))
+    db.commit()
+    db.close()
+    forged_opts = run_receipt("verify", receipt_db, rid)
+    rep = json.loads(forged_opts.stdout)
+    assert rep["match"] is True, "options is informational by design"
+    assert rep["options_verified"] is False

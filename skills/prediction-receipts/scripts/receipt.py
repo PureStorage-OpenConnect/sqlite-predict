@@ -159,6 +159,16 @@ def cmd_verify(args):
     document = canonical_document(db.execute(input_sql), operation)
     now_sha = sha256_text(document)
     now_ext = extension_version(db)
+    # re-derive the serving model from the replayed result where the
+    # result carries one (aggregate documents do; row-form results were
+    # recorded via --model-id and cannot be re-derived)
+    replayed_model = None
+    try:
+        replayed_model = json.loads(document).get("model")
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    id_matches = None if replayed_model is None \
+        else replayed_model == model_id
     now_hash = None
     try:
         r = db.execute(
@@ -167,16 +177,23 @@ def cmd_verify(args):
         now_hash = r[0] if r else None
     except sqlite3.OperationalError:
         pass
+    hash_match = now_sha == rec_sha
     report = {
         "receipt_id": args.receipt_id,
-        "match": now_sha == rec_sha,
-        "result_sha256": {"recorded": rec_sha, "replayed": now_sha},
-        "extension": {"recorded": rec_ext, "current": now_ext,
-                      "changed": rec_ext != now_ext},
-        "model": {"id": model_id,
+        "match": hash_match and id_matches is not False,
+        "result_sha256": {"recorded": rec_sha, "replayed": now_sha,
+                          "match": hash_match},
+        "model": {"recorded_id": model_id,
+                  "replayed_id": replayed_model,
+                  "id_matches": id_matches,
                   "content_hash_recorded": rec_hash,
                   "content_hash_current": now_hash,
                   "changed": rec_hash != now_hash},
+        "extension": {"recorded": rec_ext, "current": now_ext,
+                      "changed": rec_ext != now_ext},
+        # options is informational: its authoritative copy is the options
+        # text embedded in input_sql, which the replay executes verbatim
+        "options_verified": False,
     }
     print(json.dumps(report, indent=2))
     db.close()

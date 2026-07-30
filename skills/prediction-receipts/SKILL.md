@@ -95,11 +95,16 @@ FROM _predict_receipts WHERE id = 1;
 
 `match` is 1 when the replay reproduces the recorded result. This is a
 spot check of one known query's result hash, not full verification: it
-trusts the receipt row's own metadata, so tampered `input_sql`,
-`options`, or `model_id` fields are not detected here. For full replay
-that re-derives everything from the stored fields and diagnoses what
-moved (data, extension version, or model hash), use the reference
-script below. On a mismatch, compare the receipt's `extension` against
+trusts the receipt row's own metadata. The reference script goes
+further: it replays the stored `input_sql`, recomputes the result hash,
+re-derives the serving model from the replayed result and compares it
+to the recorded `model_id` (aggregate results carry a model; row-form
+results recorded via `--model-id` cannot be re-derived), and reports
+extension-version and registry-hash drift. Two limits it states rather
+than hides: the `options` column is informational (its authoritative
+copy is the options text inside `input_sql`, which the replay executes
+verbatim), and a receipt row is self-attested, so tamper-proofing the
+receipts table itself needs database-level controls. On a mismatch, compare the receipt's `extension` against
 `predict_version()` and its `content_hash` against the registry.
 
 ## The reference script (optional)
