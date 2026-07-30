@@ -4,13 +4,13 @@ import starlight from "@astrojs/starlight";
 
 // GitHub Pages serves this project at different URLs depending on visibility: a
 // random *.pages.github.io ROOT while the repo is internal (private Pages), and
-// purestorage-openconnect.github.io/sqlite-predict once it is public. The deploy
+// code.purestorage.com/sqlite-predict once it is public. The deploy
 // workflow reads the live Pages config (actions/configure-pages) and passes the
 // correct origin + base in via env, so one build works for either URL. Locally
 // we default to root. Internal doc links are path-relative, so only asset and
 // nav paths depend on `base`.
 const base = process.env.PAGES_BASE_PATH || "/";
-const site = process.env.PAGES_ORIGIN || "https://purestorage-openconnect.github.io";
+const site = process.env.PAGES_ORIGIN || "https://code.purestorage.com";
 
 export default defineConfig({
   site,

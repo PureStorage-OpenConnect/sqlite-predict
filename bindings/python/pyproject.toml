@@ -22,6 +22,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/PureStorage-OpenConnect/sqlite-predict"
 Source = "https://github.com/PureStorage-OpenConnect/sqlite-predict"
+Documentation = "https://code.purestorage.com/sqlite-predict/"
 
 [tool.setuptools]
 packages = ["sqlite_predict"]

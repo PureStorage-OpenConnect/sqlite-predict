@@ -122,7 +122,7 @@ reaches **0.89 MASE** where the teacher sits at ~0.80 and every classical
 method is above 1.0, and the distilled `gbt` student **matches or beats tuned
 XGBoost** on most TabArena tasks. The [Models](#models) section covers the
 student architectures and soft-label distillation; the
-[distillation guide](https://purestorage-openconnect.github.io/sqlite-predict/guides/distillation/)
+[distillation guide](https://code.purestorage.com/sqlite-predict/guides/distillation/)
 walks the whole flow.
 
 ## Why
@@ -171,7 +171,7 @@ parameters, and `GROUP BY` all compose naturally, from the CLI or from an ORM
 written, so they run on read-only databases and inside views. Each group
 returns one JSON document; expand it with `forecast_rows()` /
 `anomaly_rows()`, or `JSON.parse` it in your app. Each language's
-[getting-started guide](https://purestorage-openconnect.github.io/sqlite-predict/getting-started/python/)
+[getting-started guide](https://code.purestorage.com/sqlite-predict/getting-started/python/)
 shows the pattern through its native ORM (SQLAlchemy, Drizzle, Diesel).
 
 `backtest`, `predict`, and the `distill_*` operations take read-only SELECT

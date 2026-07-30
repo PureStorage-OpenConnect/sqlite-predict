@@ -29,5 +29,6 @@
     "sqlite-predict-linux-x64": "0.0.1-alpha.6",
     "sqlite-predict-linux-arm64": "0.0.1-alpha.6",
     "sqlite-predict-windows-x64": "0.0.1-alpha.6"
-  }
+  },
+  "homepage": "https://code.purestorage.com/sqlite-predict/"
 }
