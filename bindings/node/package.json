@@ -1,6 +1,6 @@
 {
   "name": "sqlite-predict",
-  "version": "0.0.1-alpha.6",
+  "version": "0.1.0",
   "description": "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, and predict, in a zero-dependency loadable extension.",
   "main": "index.cjs",
   "types": "index.d.ts",
@@ -24,11 +24,11 @@
     "directory": "bindings/node"
   },
   "optionalDependencies": {
-    "sqlite-predict-darwin-arm64": "0.0.1-alpha.6",
-    "sqlite-predict-darwin-x64": "0.0.1-alpha.6",
-    "sqlite-predict-linux-x64": "0.0.1-alpha.6",
-    "sqlite-predict-linux-arm64": "0.0.1-alpha.6",
-    "sqlite-predict-windows-x64": "0.0.1-alpha.6"
+    "sqlite-predict-darwin-arm64": "0.1.0",
+    "sqlite-predict-darwin-x64": "0.1.0",
+    "sqlite-predict-linux-x64": "0.1.0",
+    "sqlite-predict-linux-arm64": "0.1.0",
+    "sqlite-predict-windows-x64": "0.1.0"
   },
   "homepage": "https://code.purestorage.com/sqlite-predict/"
 }

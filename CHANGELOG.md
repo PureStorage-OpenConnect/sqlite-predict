@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-30
+
 ### Changed
 
 - **Model weight integrity is now enforced, not just recorded.** A
@@ -30,6 +32,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `predict_sha256(x)`: a SHA-256 scalar function over TEXT and BLOB
+  values (numerics are rejected with `PREDICT_ERR_SCHEMA`, NULL passes
+  through), so provenance receipts can be built and verified in pure
+  SQL with no tooling beyond the extension.
+- Four agent skills under `skills/` in the
+  [agentskills.io](https://agentskills.io) format: core usage,
+  prediction receipts (with a hardened record/verify script),
+  the distillation lifecycle, and backtest interpretation.
 - A stated stability contract, replacing the blanket pre-alpha warning:
   the SQL surface may change between pre-1.0 minors (every break is
   changelogged), while stored students and the model registry stay
@@ -255,6 +265,7 @@ name-claim and release-pipeline shakedown pre-releases, superseded.)
   tag; and `examples/quickstart.sql`. CI regenerates and compiles the
   amalgamation on every push so it cannot drift.
 
-[Unreleased]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.0.1-alpha.6...HEAD
+[Unreleased]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.0.1-alpha.6...v0.1.0
 [0.0.1-alpha.6]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.0.1-alpha.5...v0.0.1-alpha.6
 [0.0.1-alpha.5]: https://github.com/PureStorage-OpenConnect/sqlite-predict/releases/tag/v0.0.1-alpha.5

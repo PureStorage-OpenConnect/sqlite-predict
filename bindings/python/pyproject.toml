@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sqlite-predict"
-version = "0.0.1a6"
+version = "0.1.0"
 description = "Prediction as a SQL primitive for SQLite: forecast, detect_anomalies, and predict, in a zero-dependency loadable extension."
 readme = "README.md"
 requires-python = ">=3.8"
