@@ -69,10 +69,13 @@ def connect(db_path, extension, untrusted=False):
     read-only at the file level and an authorizer denies everything but
     reads and function calls, so a tampered receipt's input_sql cannot
     write, drop, attach, or change pragmas on the verifier's database."""
-    if untrusted:
-        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    else:
-        db = sqlite3.connect(db_path)
+    try:
+        if untrusted:
+            db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        else:
+            db = sqlite3.connect(db_path)
+    except sqlite3.Error as e:
+        fail("RECEIPT_ERR_DB", f"cannot open '{db_path}': {e}")
     db.enable_load_extension(True)
     try:
         db.load_extension(extension)
@@ -83,6 +86,10 @@ def connect(db_path, extension, untrusted=False):
         db.enable_load_extension(False)
     if untrusted:
         db.set_authorizer(_replay_authorizer)
+        # a tampered receipt must not be able to hang the verifier
+        # either: abort replay after a generous VM-step budget
+        steps = int(os.environ.get("RECEIPT_MAX_STEPS", 50_000_000))
+        db.set_progress_handler(lambda: 1, steps)
     return db
 
 
@@ -99,7 +106,16 @@ def canonical_document(cur, operation):
     if (operation in AGGREGATE_OPS and len(rows) == 1 and len(cols) == 1
             and isinstance(rows[0][0], str)):
         return rows[0][0]
-    return json.dumps({"columns": cols, "rows": [list(r) for r in rows]},
+
+    def cell(v):
+        # BLOBs canonicalize as their hash: deterministic, bounded, and
+        # json.dumps cannot serialize bytes anyway
+        if isinstance(v, (bytes, memoryview)):
+            return {"blob_sha256":
+                    hashlib.sha256(bytes(v)).hexdigest()}
+        return v
+    return json.dumps({"columns": cols,
+                       "rows": [[cell(v) for v in r] for r in rows]},
                       separators=(",", ":"), ensure_ascii=False)
 
 
@@ -144,14 +160,22 @@ def model_fields(db, document, model_flag):
 
 
 def cmd_record(args):
+    if args.options is not None:
+        try:
+            json.loads(args.options)
+        except json.JSONDecodeError as e:
+            fail("RECEIPT_ERR_OPTIONS", f"--options is not valid JSON: {e}")
     db = connect(args.db, args.extension)
     operation = args.operation or infer_operation(args.sql)
     if operation is None:
         fail("RECEIPT_ERR_OPERATION_UNKNOWN",
              f"cannot infer the operation; pass --operation one of"
              f" {', '.join(OPERATIONS)}")
-    cur = db.execute(args.sql)
-    document = canonical_document(cur, operation)
+    try:
+        cur = db.execute(args.sql)
+        document = canonical_document(cur, operation)
+    except sqlite3.Error as e:
+        fail("RECEIPT_ERR_SQL", str(e))
     model_id, content_hash = model_fields(db, document, args.model_id)
     db.execute(DDL)
     cur = db.execute(
@@ -176,7 +200,10 @@ def cmd_verify(args):
     if row is None:
         fail("RECEIPT_ERR_NOT_FOUND", f"no receipt with id {args.receipt_id}")
     operation, input_sql, model_id, rec_hash, rec_ext, rec_sha = row
-    document = canonical_document(db.execute(input_sql), operation)
+    try:
+        document = canonical_document(db.execute(input_sql), operation)
+    except sqlite3.Error as e:
+        fail("RECEIPT_ERR_SQL", f"replay refused or failed: {e}")
     now_sha = sha256_text(document)
     now_ext = extension_version(db)
     # re-derive the serving model from the replayed result where the

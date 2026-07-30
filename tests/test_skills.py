@@ -300,3 +300,55 @@ def test_receipt_replay_cannot_write(receipt_db):
     (n,) = db.execute("SELECT count(*) FROM readings").fetchone()
     db.close()
     assert n == 48, "replay modified the verifier's data"
+
+
+def test_receipt_hardening_paths(receipt_db, tmp_path):
+    """The audit set: runaway replay is aborted by the step budget, BLOB
+    cells canonicalize deterministically instead of crashing, invalid
+    --options is rejected up front, and a missing database fails with a
+    clean code instead of a traceback."""
+    rec = run_receipt("record", receipt_db,
+                      "SELECT forecast(ts, value, 6) FROM readings")
+    rid = str(json.loads(rec.stdout)["receipt_id"])
+
+    # recursive CTE bomb: must abort via the step budget, not hang
+    db = sqlite3.connect(receipt_db)
+    db.execute("UPDATE _predict_receipts SET input_sql ="
+               " 'WITH RECURSIVE b(x) AS (SELECT 1 UNION ALL SELECT x+1"
+               "  FROM b) SELECT max(x) FROM b' WHERE id = ?", (rid,))
+    db.commit()
+    db.close()
+    import subprocess as sp
+    bomb = sp.run([sys.executable, RECEIPT, "--extension", EXT,
+                   "verify", receipt_db, rid],
+                  capture_output=True, text=True, timeout=60,
+                  env={**os.environ, "RECEIPT_MAX_STEPS": "100000"})
+    assert bomb.returncode != 0
+    assert "RECEIPT_ERR_SQL" in bomb.stderr
+
+    # BLOB cells canonicalize as their hash, deterministically
+    db = sqlite3.connect(receipt_db)
+    db.execute("CREATE TABLE blobs(b BLOB)")
+    db.execute("INSERT INTO blobs VALUES (x'00ff10')")
+    db.commit()
+    db.close()
+    b1 = run_receipt("record", receipt_db, "SELECT b FROM blobs",
+                     "--operation", "predict", "--model-id", "n/a")
+    b2 = run_receipt("record", receipt_db, "SELECT b FROM blobs",
+                     "--operation", "predict", "--model-id", "n/a")
+    assert b1.returncode == 0, b1.stderr
+    assert json.loads(b1.stdout)["result_sha256"] == \
+        json.loads(b2.stdout)["result_sha256"]
+
+    # invalid --options rejected before anything executes
+    badopt = run_receipt("record", receipt_db,
+                         "SELECT forecast(ts, value, 6) FROM readings",
+                         "--options", "{not json")
+    assert badopt.returncode != 0
+    assert "RECEIPT_ERR_OPTIONS" in badopt.stderr
+
+    # missing database file fails cleanly on the read-only path
+    gone_db = run_receipt("verify", str(tmp_path / "nope.db"), "1")
+    assert gone_db.returncode != 0
+    assert "RECEIPT_ERR" in gone_db.stderr
+    assert "Traceback" not in gone_db.stderr
