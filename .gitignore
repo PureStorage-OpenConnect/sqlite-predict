@@ -57,3 +57,6 @@ bindings/node/node_modules/
 bindings/rust/csrc/
 bindings/rust/target/
 bindings/rust/Cargo.lock
+
+# autogluon working dirs (Mitra benchmark runs dump model copies here)
+benchmarks/AutogluonModels/

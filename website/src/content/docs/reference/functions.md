@@ -123,6 +123,7 @@ window laid out by position as `context` input columns followed by the
 | --- | --- |
 | `predict_version()` | the extension version string |
 | `predict_ulid(ts)` | the smallest ULID for an ISO-8601 UTC timestamp: deterministic (the time component is set, the entropy bits are zero), useful as a range key |
+| `predict_sha256(x)` | lowercase hex SHA-256 of a TEXT or BLOB value. NULL passes through; numeric arguments are rejected with `PREDICT_ERR_SCHEMA` rather than hashed through SQLite's lossy number-to-text conversion. Used by provenance workflows like the prediction-receipts skill to hash result documents in pure SQL |
 | `predict_debug()` | build info: profile, compiled features, available runtimes |
 | `predict_register(model_id, config)` | registers an external model in `_predict_models` and returns its content hash; `config` is a bare weights path or a JSON object (`runtime`, `kind`, `license`, `weights_uri`, `io_spec`, `target`). Registration is metadata only: executing an `onnx` model still needs the ONNX build |
 
