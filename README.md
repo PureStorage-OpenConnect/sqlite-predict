@@ -416,10 +416,18 @@ without additional terms.
 
 Structure and spirit follow Alex Garcia's
 [`sqlite-vec`](https://github.com/asg017/sqlite-vec). Built on
-[SQLite](https://sqlite.org). Benchmarks distill and compare against Google's
-TabFM (tabular) and compare against
-[Chronos](https://github.com/amazon-science/chronos-forecasting) (time series);
-the [TabPFN](https://github.com/PriorLabs/TabPFN) line is the intellectual
-lineage for in-context tabular models.
+[SQLite](https://sqlite.org). Our recommended tabular teacher is
+[TabICL](https://github.com/soda-inria/tabicl) from the SODA team at
+Inria, the scikit-learn lineage carried into foundation models;
+[Chronos](https://github.com/amazon-science/chronos-forecasting) (Amazon)
+is the time-series teacher our forecast students distill from, and
+[Mitra](https://huggingface.co/autogluon/mitra-classifier) (Amazon) is the
+second permissively licensed tabular teacher we benchmark. The
+out-of-fold teacher-labeling technique in our benchmark harness comes
+from Lexsi Labs' ["Pocket Foundation
+Models"](https://arxiv.org/abs/2605.18654). The
+[TabPFN](https://github.com/PriorLabs/TabPFN) line is the intellectual
+lineage for in-context tabular models, and Google's TabFM is among the
+models our benchmarks evaluate.
 
 [tvf]: https://www.sqlite.org/vtab.html#tabfunc2
