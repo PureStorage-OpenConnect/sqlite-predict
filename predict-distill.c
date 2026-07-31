@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  * Copyright (c) 2026 Pure Storage, Inc.
  */
-/* distill_predict() and the native-student TRAINERS.
+/* distill_predict() / distill_forecast(): the distillation recipes.
  *
- * The training half of distillation: the CART / gradient-boosted / MLP
- * trainers and the distill_predict() table-valued function. distill_predict() fits a student
+ * Fits a native student via the trainers in predict-train.c. distill_predict() fits a student
  * on a training signal (the target column by default, or a named teacher
  * model's predictions), evaluates it on a held-out fraction, serializes it via
  * predict-student.c, and registers it in _predict_models. The student then
@@ -12,631 +11,12 @@
  * deserializers, and inference runtime all live in predict-student.c. */
 #include "predict-internal.h"
 #include "predict-student.h"
+#include "predict-train.h"
 
 #ifndef SQLITE_CORE
 SQLITE_EXTENSION_INIT3
 #endif
 
-#define TREE_MAX_DEPTH 8
-#define TREE_MIN_SPLIT 5
-#define DISTILL_MIN_ROWS 8
-
-#define GBT_ROUNDS 200
-#define GBT_DEPTH 3
-#define GBT_MIN_SPLIT 5
-#define GBT_LR 0.1f     /* shrinkage: many small steps generalize better than few big ones */
-#define GBT_LAMBDA 1.0f /* L2 leaf regularization (XGBoost reg_lambda default) */
-
-/* ---- MLP student trainer (deterministic full-batch Adam) ----
- * A smooth learner for boundaries an axis-aligned tree ensemble cannot render.
- * Seeded init and no shuffle, so the blob and its predictions replay exactly.
- * The blob format and inference runtime live in predict-student.c. */
-#define MLP_HIDDEN 48
-#define MLP_EPOCHS 400
-#define MLP_LR 0.02
-#define MLP_L2 1e-4
-#define MLP_BETA1 0.9
-#define MLP_BETA2 0.999
-/* FCST_RES_SCALE (the linear-skip hidden-path scale) is in predict-student.h,
- * shared with the serving forward. */
-
-/* deterministic xorshift32 -> f32 in [-1, 1) */
-static f32 mlp_rng(u32 *s) {
-  u32 x = *s ? *s : 1;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  *s = x;
-  return (f32)((f64)x / 2147483648.0 - 1.0);
-}
-
-/* One Adam step over a parameter array (with L2), then zero its gradient. */
-static void mlp_adam(f32 *p, f64 *g, f64 *mm, f64 *vv, int sz, f64 lr,
-                     f64 scale, f64 bc1, f64 bc2) {
-  for (int i = 0; i < sz; i++) {
-    f64 gg = g[i] * scale + MLP_L2 * p[i];
-    mm[i] = MLP_BETA1 * mm[i] + (1 - MLP_BETA1) * gg;
-    vv[i] = MLP_BETA2 * vv[i] + (1 - MLP_BETA2) * gg * gg;
-    p[i] -= (f32)(lr * (mm[i] / bc1) / (sqrt(vv[i] / bc2) + 1e-8));
-    g[i] = 0;
-  }
-}
-
-/* Train an MLP with a configurable width and task.
- * task 0 (classify): softmax head over `nout` classes; the target is `soft`
- * (a row-major [n, nout] teacher-probability matrix) when non-NULL, else the
- * hard class yc. task 1 (regress): linear head, MSE against the [n, nout]
- * target matrix `soft` (yc unused) -- this is how the multi-output forecast
- * student is fit. `use_skip` adds a direct linear map Wskip*x to the output (a
- * DLinear/TiDE skip: the linear part carries seasonal-naive + trend, the hidden
- * path a scaled nonlinear correction); with nhid=0 the model is purely linear.
- * Deterministic full-batch Adam; the caller sets any feat_names/labels. */
-static int train_mlp(const f32 *X, int n, int nfeat, int nout, const i32 *yc,
-                     const f32 *soft, int task, int nhid, int epochs, f32 lr,
-                     int use_skip, MLP *m, char **errmsg) {
-  memset(m, 0, sizeof(*m));
-  int nW1 = nhid * nfeat, nW2 = nout * nhid, nWs = use_skip ? nout * nfeat : 0;
-  f64 rs = use_skip ? FCST_RES_SCALE : 1.0; /* hidden-path scale (see #define) */
-  m->task = task;
-  m->nfeat = nfeat;
-  m->nhid = nhid;
-  m->nout = nout;
-  m->nclass = task == 0 ? nout : 0;
-
-  int rc = SQLITE_OK;
-  m->mean = sqlite3_malloc(sizeof(f32) * nfeat);
-  m->sd = sqlite3_malloc(sizeof(f32) * nfeat);
-  m->b2 = sqlite3_malloc(sizeof(f32) * nout);
-  /* hidden-layer blocks exist only when nhid>0; skip block only when use_skip */
-  if (nhid > 0) {
-    m->W1 = sqlite3_malloc(sizeof(f32) * nW1);
-    m->b1 = sqlite3_malloc(sizeof(f32) * nhid);
-    m->W2 = sqlite3_malloc(sizeof(f32) * nW2);
-  }
-  if (use_skip)
-    m->Wskip = sqlite3_malloc(sizeof(f32) * nWs);
-  f64 *mW1 = nhid ? sqlite3_malloc(sizeof(f64) * nW1) : NULL,
-      *vW1 = nhid ? sqlite3_malloc(sizeof(f64) * nW1) : NULL,
-      *gW1 = nhid ? sqlite3_malloc(sizeof(f64) * nW1) : NULL;
-  f64 *mW2 = nhid ? sqlite3_malloc(sizeof(f64) * nW2) : NULL,
-      *vW2 = nhid ? sqlite3_malloc(sizeof(f64) * nW2) : NULL,
-      *gW2 = nhid ? sqlite3_malloc(sizeof(f64) * nW2) : NULL;
-  f64 *mb1 = nhid ? sqlite3_malloc(sizeof(f64) * nhid) : NULL,
-      *vb1 = nhid ? sqlite3_malloc(sizeof(f64) * nhid) : NULL,
-      *gb1 = nhid ? sqlite3_malloc(sizeof(f64) * nhid) : NULL;
-  f64 *mWs = use_skip ? sqlite3_malloc(sizeof(f64) * nWs) : NULL,
-      *vWs = use_skip ? sqlite3_malloc(sizeof(f64) * nWs) : NULL,
-      *gWs = use_skip ? sqlite3_malloc(sizeof(f64) * nWs) : NULL;
-  f64 *mb2 = sqlite3_malloc(sizeof(f64) * nout),
-      *vb2 = sqlite3_malloc(sizeof(f64) * nout),
-      *gb2 = sqlite3_malloc(sizeof(f64) * nout);
-  f32 *hid = nhid ? sqlite3_malloc(sizeof(f32) * nhid) : NULL,
-      *out = sqlite3_malloc(sizeof(f32) * nout),
-      *xs = sqlite3_malloc(sizeof(f32) * nfeat);
-  f64 *dout = sqlite3_malloc(sizeof(f64) * nout);
-  int hid_ok = nhid == 0 || (m->W1 && m->b1 && m->W2 && mW1 && vW1 && gW1 &&
-                             mW2 && vW2 && gW2 && mb1 && vb1 && gb1 && hid);
-  int skip_ok = !use_skip || (m->Wskip && mWs && vWs && gWs);
-  if (!m->mean || !m->sd || !m->b2 || !mb2 || !vb2 || !gb2 || !out || !xs ||
-      !dout || !hid_ok || !skip_ok) {
-    rc = SQLITE_NOMEM;
-    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-    goto done;
-  }
-  for (int i = 0; i < nW1; i++)
-    mW1[i] = vW1[i] = gW1[i] = 0;
-  for (int i = 0; i < nW2; i++)
-    mW2[i] = vW2[i] = gW2[i] = 0;
-  for (int i = 0; i < nhid; i++)
-    mb1[i] = vb1[i] = gb1[i] = 0;
-  for (int i = 0; i < nWs; i++)
-    mWs[i] = vWs[i] = gWs[i] = 0;
-  for (int i = 0; i < nout; i++)
-    mb2[i] = vb2[i] = gb2[i] = 0;
-
-  for (int i = 0; i < nfeat; i++) { /* standardize features */
-    f64 mu = 0;
-    for (int r = 0; r < n; r++)
-      mu += X[(size_t)r * nfeat + i];
-    mu /= n;
-    f64 var = 0;
-    for (int r = 0; r < n; r++) {
-      f64 d = X[(size_t)r * nfeat + i] - mu;
-      var += d * d;
-    }
-    var /= n;
-    f64 s = sqrt(var);
-    m->mean[i] = (f32)mu;
-    m->sd[i] = (f32)(s > 1e-6 ? s : 1e-6);
-  }
-
-  u32 seed = 0x243f6a88u; /* Xavier-uniform init, deterministic */
-  f32 a1 = (f32)sqrt(6.0 / (nfeat + (nhid ? nhid : 1)));
-  for (int i = 0; i < nW1; i++)
-    m->W1[i] = a1 * mlp_rng(&seed);
-  for (int j = 0; j < nhid; j++)
-    m->b1[j] = 0;
-  f32 a2 = (f32)sqrt(6.0 / ((nhid ? nhid : 1) + nout));
-  for (int i = 0; i < nW2; i++)
-    m->W2[i] = a2 * mlp_rng(&seed);
-  f32 as = (f32)sqrt(6.0 / (nfeat + nout));
-  for (int i = 0; i < nWs; i++)
-    m->Wskip[i] = as * mlp_rng(&seed);
-  for (int k = 0; k < nout; k++)
-    m->b2[k] = 0;
-
-  f64 b1p = 1, b2p = 1;
-  for (int ep = 0; ep < epochs; ep++) {
-    b1p *= MLP_BETA1;
-    b2p *= MLP_BETA2;
-    for (int row = 0; row < n; row++) {
-      const f32 *x = &X[(size_t)row * nfeat];
-      for (int i = 0; i < nfeat; i++)
-        xs[i] = (x[i] - m->mean[i]) / m->sd[i];
-      for (int j = 0; j < nhid; j++) {
-        f64 s = m->b1[j];
-        for (int i = 0; i < nfeat; i++)
-          s += (f64)m->W1[j * nfeat + i] * xs[i];
-        hid[j] = (f32)tanh(s);
-      }
-      for (int k = 0; k < nout; k++) {
-        f64 s = m->b2[k];
-        for (int j = 0; j < nhid; j++)
-          s += rs * (f64)m->W2[k * nhid + j] * hid[j];
-        if (use_skip)
-          for (int i = 0; i < nfeat; i++)
-            s += (f64)m->Wskip[k * nfeat + i] * xs[i];
-        out[k] = (f32)s;
-      }
-      if (task == 0) { /* softmax cross-entropy: dL/dlogit = softmax - target */
-        f64 mx = out[0];
-        for (int k = 1; k < nout; k++)
-          if (out[k] > mx)
-            mx = out[k];
-        f64 sm = 0;
-        for (int k = 0; k < nout; k++) {
-          dout[k] = exp((f64)out[k] - mx);
-          sm += dout[k];
-        }
-        for (int k = 0; k < nout; k++) {
-          f64 tgt = soft ? soft[(size_t)row * nout + k] : (yc[row] == k ? 1.0 : 0.0);
-          dout[k] = dout[k] / sm - tgt;
-        }
-      } else { /* regression MSE on the linear head: dL/dout = out - target */
-        for (int k = 0; k < nout; k++)
-          dout[k] = (f64)out[k] - soft[(size_t)row * nout + k];
-      }
-      for (int k = 0; k < nout; k++) {
-        gb2[k] += dout[k];
-        for (int j = 0; j < nhid; j++)
-          gW2[k * nhid + j] += dout[k] * rs * hid[j];
-        if (use_skip)
-          for (int i = 0; i < nfeat; i++)
-            gWs[k * nfeat + i] += dout[k] * xs[i];
-      }
-      for (int j = 0; j < nhid; j++) {
-        f64 dh = 0;
-        for (int k = 0; k < nout; k++)
-          dh += dout[k] * rs * m->W2[k * nhid + j];
-        dh *= 1.0 - (f64)hid[j] * hid[j]; /* tanh' */
-        gb1[j] += dh;
-        for (int i = 0; i < nfeat; i++)
-          gW1[j * nfeat + i] += dh * xs[i];
-      }
-    }
-    f64 scale = 1.0 / n, bc1 = 1 - b1p, bc2 = 1 - b2p;
-    if (nhid > 0) {
-      mlp_adam(m->W1, gW1, mW1, vW1, nW1, lr, scale, bc1, bc2);
-      mlp_adam(m->b1, gb1, mb1, vb1, nhid, lr, scale, bc1, bc2);
-      mlp_adam(m->W2, gW2, mW2, vW2, nW2, lr, scale, bc1, bc2);
-    }
-    if (use_skip)
-      mlp_adam(m->Wskip, gWs, mWs, vWs, nWs, lr, scale, bc1, bc2);
-    mlp_adam(m->b2, gb2, mb2, vb2, nout, lr, scale, bc1, bc2);
-  }
-
-done:
-  sqlite3_free(mWs);
-  sqlite3_free(vWs);
-  sqlite3_free(gWs);
-  sqlite3_free(mW1);
-  sqlite3_free(vW1);
-  sqlite3_free(gW1);
-  sqlite3_free(mW2);
-  sqlite3_free(vW2);
-  sqlite3_free(gW2);
-  sqlite3_free(mb1);
-  sqlite3_free(vb1);
-  sqlite3_free(gb1);
-  sqlite3_free(mb2);
-  sqlite3_free(vb2);
-  sqlite3_free(gb2);
-  sqlite3_free(hid);
-  sqlite3_free(out);
-  sqlite3_free(xs);
-  sqlite3_free(dout);
-  if (rc != SQLITE_OK)
-    predict0_mlp_free(m);
-  return rc;
-}
-
-/* ---- CART training ---- */
-
-typedef struct {
-  TreeNode *nodes;
-  int n, cap;
-  const f32 *X; /* [nrow, nfeat] */
-  int nfeat;
-  const i32 *yc; /* classify targets (teacher class index) */
-  const f32 *yr; /* regress targets */
-  int nclass;
-  int task;
-  int max_depth; /* 0 => TREE_MAX_DEPTH; shallow for GBT weak learners */
-  int min_split; /* 0 => TREE_MIN_SPLIT */
-  const f32 *hess; /* GBT only: per-row Hessian; NULL => mean-value leaves */
-  f32 lambda;      /* GBT only: L2 leaf regularization */
-} Builder;
-
-static int bld_new_node(Builder *b) {
-  if (b->n == b->cap) {
-    int nc = b->cap ? b->cap * 2 : 64;
-    TreeNode *g = sqlite3_realloc(b->nodes, sizeof(TreeNode) * nc);
-    if (!g)
-      return -1;
-    b->nodes = g;
-    b->cap = nc;
-  }
-  memset(&b->nodes[b->n], 0, sizeof(TreeNode));
-  return b->n++;
-}
-
-/* Fill node `ni` as a leaf over rows idx[0..n). */
-static void bld_leaf(Builder *b, int ni, const int *idx, int n) {
-  TreeNode *nd = &b->nodes[ni];
-  nd->feature = -1;
-  nd->left = nd->right = -1;
-  if (b->task == 0) {
-    int *cnt = sqlite3_malloc(sizeof(int) * b->nclass);
-    int best = 0, bestc = -1;
-    if (cnt) {
-      memset(cnt, 0, sizeof(int) * b->nclass);
-      for (int i = 0; i < n; i++)
-        cnt[b->yc[idx[i]]]++;
-      for (int c = 0; c < b->nclass; c++)
-        if (cnt[c] > bestc) {
-          bestc = cnt[c];
-          best = c;
-        }
-      sqlite3_free(cnt);
-    }
-    nd->klass = best;
-    nd->conf = n ? (f32)bestc / (f32)n : 0.f;
-  } else if (b->hess) {
-    /* Newton leaf: the tree fits the gradient (b->yr), but the leaf value is
-     * the second-order step sum(grad) / (sum(hess) + lambda) -- what lifts a
-     * gradient booster to XGBoost-quality on non-squared losses. */
-    f64 g = 0, h = 0;
-    for (int i = 0; i < n; i++) {
-      g += b->yr[idx[i]];
-      h += b->hess[idx[i]];
-    }
-    nd->value = (f32)(g / (h + b->lambda));
-    nd->klass = -1;
-  } else {
-    f64 s = 0;
-    for (int i = 0; i < n; i++)
-      s += b->yr[idx[i]];
-    nd->value = n ? (f32)(s / n) : 0.f;
-    nd->klass = -1;
-  }
-}
-
-/* Best (feature, threshold) split minimizing impurity, or feature<0 if none
- * improves. cmp buffer of (value, target) sorted per feature. */
-typedef struct {
-  f32 v;
-  i32 yc;
-  f32 yr;
-} VY;
-static int vy_cmp(const void *a, const void *b) {
-  f32 x = ((const VY *)a)->v, y = ((const VY *)b)->v;
-  return x < y ? -1 : x > y ? 1 : 0;
-}
-
-static int bld_best_split(Builder *b, const int *idx, int n, int *feat_out,
-                          f32 *thr_out) {
-  *feat_out = -1;
-  VY *buf = sqlite3_malloc(sizeof(VY) * n);
-  if (!buf)
-    return SQLITE_NOMEM;
-  f64 best_score = 0; /* impurity decrease; want > 0 */
-
-  for (int f = 0; f < b->nfeat; f++) {
-    for (int i = 0; i < n; i++) {
-      buf[i].v = b->X[(size_t)idx[i] * b->nfeat + f];
-      if (b->task == 0)
-        buf[i].yc = b->yc[idx[i]];
-      else
-        buf[i].yr = b->yr[idx[i]];
-    }
-    qsort(buf, n, sizeof(VY), vy_cmp);
-    if (buf[0].v == buf[n - 1].v)
-      continue; /* constant feature */
-
-    if (b->task == 0) {
-      int *ltot = sqlite3_malloc(sizeof(int) * b->nclass * 2);
-      if (!ltot) {
-        sqlite3_free(buf);
-        return SQLITE_NOMEM;
-      }
-      int *rtot = ltot + b->nclass;
-      memset(ltot, 0, sizeof(int) * b->nclass * 2);
-      for (int i = 0; i < n; i++)
-        rtot[buf[i].yc]++;
-      int nl = 0;
-      for (int i = 0; i < n - 1; i++) {
-        ltot[buf[i].yc]++;
-        rtot[buf[i].yc]--;
-        nl++;
-        if (buf[i].v == buf[i + 1].v)
-          continue; /* can't split between equal values */
-        int nr = n - nl;
-        f64 gl = 1, gr = 1;
-        for (int c = 0; c < b->nclass; c++) {
-          f64 pl = (f64)ltot[c] / nl, pr = (f64)rtot[c] / nr;
-          gl -= pl * pl;
-          gr -= pr * pr;
-        }
-        f64 score = -((f64)nl * gl + (f64)nr * gr) / n; /* maximize */
-        if (*feat_out < 0 || score > best_score) {
-          best_score = score;
-          *feat_out = f;
-          *thr_out = (buf[i].v + buf[i + 1].v) / 2.f;
-        }
-      }
-      sqlite3_free(ltot);
-    } else {
-      f64 tot = 0, totsq = 0;
-      for (int i = 0; i < n; i++) {
-        tot += buf[i].yr;
-        totsq += (f64)buf[i].yr * buf[i].yr;
-      }
-      f64 lsum = 0, lsq = 0;
-      int nl = 0;
-      for (int i = 0; i < n - 1; i++) {
-        lsum += buf[i].yr;
-        lsq += (f64)buf[i].yr * buf[i].yr;
-        nl++;
-        if (buf[i].v == buf[i + 1].v)
-          continue;
-        int nr = n - nl;
-        f64 rsum = tot - lsum, rsq = totsq - lsq;
-        f64 lvar = lsq - lsum * lsum / nl;   /* SSE left */
-        f64 rvar = rsq - rsum * rsum / nr;   /* SSE right */
-        f64 score = -(lvar + rvar);          /* maximize (minimize SSE) */
-        if (*feat_out < 0 || score > best_score) {
-          best_score = score;
-          *feat_out = f;
-          *thr_out = (buf[i].v + buf[i + 1].v) / 2.f;
-        }
-      }
-    }
-  }
-  sqlite3_free(buf);
-  return SQLITE_OK;
-}
-
-/* Recursively build; returns the node index, or -1 on OOM. */
-static int bld_build(Builder *b, int *idx, int n, int depth) {
-  int ni = bld_new_node(b);
-  if (ni < 0)
-    return -1;
-
-  int pure = 1;
-  if (b->task == 0) {
-    for (int i = 1; i < n; i++)
-      if (b->yc[idx[i]] != b->yc[idx[0]]) {
-        pure = 0;
-        break;
-      }
-  } else {
-    pure = 0; /* regression leaves split on impurity, not purity */
-  }
-  int maxd = b->max_depth ? b->max_depth : TREE_MAX_DEPTH;
-  int mins = b->min_split ? b->min_split : TREE_MIN_SPLIT;
-  if (depth >= maxd || n < mins || pure) {
-    bld_leaf(b, ni, idx, n);
-    return ni;
-  }
-  int feat;
-  f32 thr;
-  if (bld_best_split(b, idx, n, &feat, &thr) != SQLITE_OK)
-    return -1;
-  if (feat < 0) {
-    bld_leaf(b, ni, idx, n);
-    return ni;
-  }
-  /* partition idx: rows with X[.,feat] < thr to the front */
-  int lo = 0, hi = n - 1;
-  while (lo <= hi) {
-    if (b->X[(size_t)idx[lo] * b->nfeat + feat] < thr) {
-      lo++;
-    } else {
-      int tmp = idx[lo];
-      idx[lo] = idx[hi];
-      idx[hi] = tmp;
-      hi--;
-    }
-  }
-  int nl = lo;
-  if (nl == 0 || nl == n) { /* degenerate split; make a leaf */
-    bld_leaf(b, ni, idx, n);
-    return ni;
-  }
-  int L = bld_build(b, idx, nl, depth + 1);
-  if (L < 0)
-    return -1;
-  int R = bld_build(b, idx + nl, n - nl, depth + 1);
-  if (R < 0)
-    return -1;
-  /* node index ni is stable across the reallocs above; set it now */
-  b->nodes[ni].feature = feat;
-  b->nodes[ni].threshold = thr;
-  b->nodes[ni].left = L;
-  b->nodes[ni].right = R;
-  b->nodes[ni].klass = -1;
-  return ni;
-}
-
-
-/* Train a GBT on the teacher targets. Fills the numeric parts of *fo; the
- * caller sets feat_names and labels (as for the single-tree path). For
- * classification, `soft` (when
- * non-NULL) is a row-major [n, nclass] matrix of teacher class probabilities
- * that replaces the hard one-hot label: the student then matches the teacher's
- * whole distribution (soft-label distillation), transferring the calibrated
- * probabilities a hard argmax throws away. NULL `soft` keeps the hard-label
- * path. Regression ignores `soft`. */
-static int train_gbt(const f32 *X, int n, int nfeat, int task, int nclass,
-                     const i32 *yc, const f32 *yr, const f32 *soft, Forest *fo,
-                     char **errmsg) {
-  memset(fo, 0, sizeof(*fo));
-  int rounds = GBT_ROUNDS, nscore = task == 0 ? nclass : 1;
-  fo->task = task;
-  fo->nfeat = nfeat;
-  fo->nclass = nclass;
-  fo->n_score = nscore;
-  fo->n_rounds = rounds;
-  fo->lr = GBT_LR;
-
-  int rc = SQLITE_OK;
-  fo->init = sqlite3_malloc(sizeof(f32) * nscore);
-  fo->tree_off = sqlite3_malloc(sizeof(int) * (rounds * nscore + 1));
-  f64 *F = sqlite3_malloc(sizeof(f64) * (size_t)n * nscore);
-  f64 *p = task == 0 ? sqlite3_malloc(sizeof(f64) * (size_t)n * nscore) : NULL;
-  int *idx = sqlite3_malloc(sizeof(int) * n); /* scratch for bld_build */
-  f32 *grad = sqlite3_malloc(sizeof(f32) * n);
-  f32 *hess = task == 0 ? sqlite3_malloc(sizeof(f32) * n) : NULL;
-  if (!fo->init || !fo->tree_off || !F || !idx || !grad ||
-      (task == 0 && (!p || !hess))) {
-    rc = SQLITE_NOMEM;
-    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-    goto done;
-  }
-
-  if (task == 0) {
-    for (int c = 0; c < nscore; c++) {
-      f64 pri;
-      if (soft) { /* mean teacher probability for the class */
-        f64 sum = 0;
-        for (int i = 0; i < n; i++)
-          sum += soft[(size_t)i * nscore + c];
-        pri = sum / n;
-        if (pri < 1e-6)
-          pri = 1e-6;
-      } else {
-        int cnt = 0;
-        for (int i = 0; i < n; i++)
-          cnt += yc[i] == c;
-        pri = (cnt + 1.0) / (n + nscore); /* smoothed */
-      }
-      fo->init[c] = (f32)log(pri);
-    }
-    for (int i = 0; i < n; i++)
-      for (int c = 0; c < nscore; c++)
-        F[(size_t)i * nscore + c] = fo->init[c];
-  } else {
-    f64 m = 0;
-    for (int i = 0; i < n; i++)
-      m += yr[i];
-    m /= n;
-    fo->init[0] = (f32)m;
-    for (int i = 0; i < n; i++)
-      F[i] = m;
-  }
-
-  fo->tree_off[0] = 0;
-  int nt = 0, pool_cap = 0;
-  for (int r = 0; r < rounds; r++) {
-    if (task == 0) { /* round-start softmax for every row */
-      for (int i = 0; i < n; i++) {
-        f64 *Fi = &F[(size_t)i * nscore], mx = Fi[0];
-        for (int c = 1; c < nscore; c++)
-          if (Fi[c] > mx)
-            mx = Fi[c];
-        f64 sum = 0;
-        for (int c = 0; c < nscore; c++)
-          sum += (p[(size_t)i * nscore + c] = exp(Fi[c] - mx));
-        for (int c = 0; c < nscore; c++)
-          p[(size_t)i * nscore + c] /= sum;
-      }
-    }
-    for (int s = 0; s < nscore; s++) {
-      if (task == 0)
-        for (int i = 0; i < n; i++) {
-          f64 pi = p[(size_t)i * nscore + s];
-          f32 tgt =
-              soft ? soft[(size_t)i * nscore + s] : (yc[i] == s ? 1.f : 0.f);
-          grad[i] = tgt - (f32)pi;
-          hess[i] = (f32)(pi * (1.0 - pi)); /* softmax curvature */
-        }
-      else
-        for (int i = 0; i < n; i++)
-          grad[i] = (f32)(yr[i] - F[i]);
-
-      Builder b;
-      memset(&b, 0, sizeof(b));
-      b.X = X;
-      b.nfeat = nfeat;
-      b.yr = grad;
-      b.task = 1;
-      b.max_depth = GBT_DEPTH;
-      b.min_split = GBT_MIN_SPLIT;
-      b.hess = hess; /* NULL for regression => mean leaves (Newton for MSE) */
-      b.lambda = GBT_LAMBDA;
-      for (int i = 0; i < n; i++)
-        idx[i] = i;
-      int root = bld_build(&b, idx, n, 0);
-      if (root < 0) {
-        sqlite3_free(b.nodes);
-        rc = SQLITE_NOMEM;
-        *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-        goto done;
-      }
-      for (int i = 0; i < n; i++)
-        F[(size_t)i * nscore + s] +=
-            fo->lr * predict0_reg_tree_value(b.nodes, b.n, &X[(size_t)i * nfeat]);
-
-      int need = fo->tree_off[nt] + b.n;
-      if (need > pool_cap) {
-        pool_cap = need > pool_cap * 2 ? need : pool_cap * 2;
-        TreeNode *g = sqlite3_realloc(fo->nodes, sizeof(TreeNode) * pool_cap);
-        if (!g) {
-          sqlite3_free(b.nodes);
-          rc = SQLITE_NOMEM;
-          *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
-          goto done;
-        }
-        fo->nodes = g;
-      }
-      memcpy(&fo->nodes[fo->tree_off[nt]], b.nodes, sizeof(TreeNode) * b.n);
-      fo->tree_off[nt + 1] = need;
-      nt++;
-      sqlite3_free(b.nodes);
-    }
-  }
-  fo->n_trees = nt;
-
-done:
-  sqlite3_free(F);
-  sqlite3_free(p);
-  sqlite3_free(idx);
-  sqlite3_free(grad);
-  sqlite3_free(hess);
-  if (rc != SQLITE_OK)
-    predict0_forest_free(fo);
-  return rc;
-}
 
 /* ---- the distill_predict() operation ---- */
 
@@ -659,28 +39,6 @@ static void dist_opts_free(DistOpts *o) {
 /* Return the class index for `s`, interning it into *labels (growing *cap and
  * *nclass on first sight). Returns -1 and sets *rc = SQLITE_NOMEM on OOM; a
  * valid index is always >= 0. */
-static int intern_label(char ***labels, int *nclass, int *cap, const char *s,
-                        int *rc) {
-  for (int k = 0; k < *nclass; k++)
-    if (strcmp((*labels)[k], s) == 0)
-      return k;
-  if (*nclass == *cap) {
-    int nc = *cap ? *cap * 2 : 8;
-    char **g = sqlite3_realloc(*labels, sizeof(char *) * nc);
-    if (!g) {
-      *rc = SQLITE_NOMEM;
-      return -1;
-    }
-    *labels = g;
-    *cap = nc;
-  }
-  (*labels)[*nclass] = sqlite3_mprintf("%s", s);
-  if (!(*labels)[*nclass]) {
-    *rc = SQLITE_NOMEM;
-    return -1;
-  }
-  return (*nclass)++;
-}
 
 static int dist_opt_cb(void *ctx, const char *key, sqlite3_value *value,
                        char **errmsg) {
@@ -738,43 +96,6 @@ static void append_ident(sqlite3_str *s, const char *nm) {
  * in-core runtime" as opposed to onnx). hash_out receives the
  * content_hash hex. Returns SQLITE_OK, or SQLITE_ERROR with *errmsg set
  * (STUDENT_EXISTS on an id collision). */
-static int register_student(sqlite3 *db, const char *student_id,
-                            const void *blob, int blob_len,
-                            char hash_out[PREDICT_HEX_BUFSIZE],
-                            char **errmsg) {
-  predict0_hasher h;
-  predict0_hash_init(&h);
-  sha256_update(&h.sha, (const u8 *)blob, (usize)blob_len);
-  predict0_hash_hex(&h, hash_out);
-
-  sqlite3_stmt *ins = NULL;
-  if (sqlite3_prepare_v2(
-          db,
-          "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
-          " io_spec, content_hash, license) VALUES (?1,'student','tree',?2,"
-          " NULL,?3,'unspecified')",
-          -1, &ins, NULL) != SQLITE_OK) {
-    *errmsg = sqlite3_mprintf("%s: cannot prepare student insert",
-                              PREDICT_ERR_RESOURCE);
-    return SQLITE_ERROR;
-  }
-  sqlite3_bind_text(ins, 1, student_id, -1, SQLITE_STATIC);
-  sqlite3_bind_blob(ins, 2, blob, blob_len, SQLITE_STATIC);
-  sqlite3_bind_text(ins, 3, hash_out, -1, SQLITE_STATIC);
-  int irc = sqlite3_step(ins);
-  sqlite3_finalize(ins);
-  if (irc == SQLITE_CONSTRAINT) {
-    *errmsg = sqlite3_mprintf("%s: student '%s' already exists",
-                              PREDICT_ERR_STUDENT_EXISTS, student_id);
-    return SQLITE_ERROR;
-  }
-  if (irc != SQLITE_DONE) {
-    *errmsg = sqlite3_mprintf("%s: student insert failed: %s",
-                              PREDICT_ERR_RESOURCE, sqlite3_errmsg(db));
-    return SQLITE_ERROR;
-  }
-  return SQLITE_OK;
-}
 
 /* The training pipeline. Fills *res on success. */
 static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
@@ -885,20 +206,27 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
                                 PREDICT_ERR_OPTIONS);
       goto done;
     }
-    if (predict0_json_str_array(db, o->proba, NULL, &proba_names,
-                                &nproba, errmsg) !=
-            SQLITE_OK ||
-        predict0_json_str_array(db, o->classes, NULL, &soft_labels,
-                                &nsoft, errmsg) !=
-            SQLITE_OK) {
-      rc = SQLITE_ERROR;
+    rc = predict0_json_str_array(db, o->proba, NULL, &proba_names, &nproba,
+                                 PREDICT0_MAX_CLASS, errmsg);
+    if (rc != SQLITE_OK)
       goto done;
-    }
+    rc = predict0_json_str_array(db, o->classes, NULL, &soft_labels, &nsoft,
+                                 PREDICT0_MAX_CLASS, errmsg);
+    if (rc != SQLITE_OK)
+      goto done;
     if (nproba < 2 || nproba != nsoft) {
       rc = SQLITE_ERROR;
       *errmsg = sqlite3_mprintf(
           "%s: 'proba' and 'classes' must be equal-length arrays of >= 2",
           PREDICT_ERR_OPTIONS);
+      goto done;
+    }
+    /* Defensive invariant: predict0_json_str_array already caps proba/classes
+     * at PREDICT0_MAX_CLASS during parsing; kept in case that changes. */
+    if (nproba > PREDICT0_MAX_CLASS) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: too many classes (%d); the maximum is %d",
+                                PREDICT_ERR_SCHEMA, nproba, PREDICT0_MAX_CLASS);
       goto done;
     }
     proba_col = sqlite3_malloc(sizeof(int) * nproba);
@@ -950,7 +278,8 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
                               PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
     goto done;
   }
-  while (sqlite3_step(rq) == SQLITE_ROW) {
+  int sr;
+  while ((sr = sqlite3_step(rq)) == SQLITE_ROW) {
     if (n == cap) {
       cap = cap ? cap * 2 : 256;
       f32 *gx = sqlite3_realloc(X, sizeof(f32) * (size_t)cap * nfeat);
@@ -1011,8 +340,18 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     }
     n++;
   }
+  /* A terminal step code other than DONE is a read failure, not end-of-data:
+   * surface it rather than train on the partial rows collected so far. Capture
+   * the message before finalize clears it. */
+  if (rc == SQLITE_OK && sr != SQLITE_DONE) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: could not read train_query: %s",
+                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
+  }
   sqlite3_finalize(rq);
   rq = NULL;
+  if (rc != SQLITE_OK)
+    goto done;
   if (n < DISTILL_MIN_ROWS) {
     rc = SQLITE_ERROR;
     *errmsg = sqlite3_mprintf("%s: need at least %d train rows, got %d",
@@ -1079,7 +418,9 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
   } else if (!teacher) {
     for (int i = 0; i < n; i++) {
       if (classify) {
-        int cl = intern_label(&labels, &nclass, &nlab_cap, y_true_c[i], &rc);
+        int cl = predict0_intern_label(&labels, &nclass, &nlab_cap,
+                                       y_true_c[i], PREDICT0_MAX_CLASS, &rc,
+                                       errmsg);
         if (cl < 0)
           goto done;
         y_teach[i] = cl;
@@ -1092,7 +433,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
         "SELECT (row_number() OVER ()) AS _rid, %s FROM (%s) ORDER BY _rid",
         feat_list, tq);
     teacher_sql = sqlite3_mprintf(
-        "SELECT prediction FROM predict(%Q, %Q, json_object('target',%Q,'task',"
+        "SELECT prediction FROM predict_batch(%Q, %Q, json_object('target',%Q,'task',"
         "%Q,'model',%Q))",
         tq, apply_sql, o->target, task, teacher);
     if (!apply_sql || !teacher_sql) {
@@ -1112,8 +453,9 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     while ((tstep = sqlite3_step(tqs)) == SQLITE_ROW && ti < n) {
       if (classify) {
         const char *pred = (const char *)sqlite3_column_text(tqs, 0);
-        int cl =
-            intern_label(&labels, &nclass, &nlab_cap, pred ? pred : "", &rc);
+        int cl = predict0_intern_label(&labels, &nclass, &nlab_cap,
+                                       pred ? pred : "", PREDICT0_MAX_CLASS, &rc,
+                                       errmsg);
         if (cl < 0)
           goto done;
         y_teach[ti] = cl;
@@ -1122,15 +464,20 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       }
       ti++;
     }
-    int tdone = tstep == SQLITE_DONE || ti == n;
+    /* Require exactly n teacher labels: DONE with ti == n. If the loop stopped
+     * because ti hit n while the query still had rows (tstep == SQLITE_ROW), the
+     * teacher over-produced; fail rather than silently drop the extra. */
+    int tdone = tstep == SQLITE_DONE && ti == n;
     char *terr = tdone ? NULL : sqlite3_mprintf("%s", sqlite3_errmsg(db));
     sqlite3_finalize(tqs);
     tqs = NULL;
-    if (!tdone || ti != n) {
+    if (!tdone) {
+      int too_many = tstep == SQLITE_ROW;
       rc = SQLITE_ERROR;
       *errmsg = sqlite3_mprintf(
-          "%s: teacher produced %d labels for %d rows (%s)",
-          PREDICT_ERR_RESOURCE, ti, n, terr ? terr : "short read");
+          "%s: teacher produced %s labels for %d train rows (%s)",
+          PREDICT_ERR_SCHEMA, too_many ? "too many" : "too few", n,
+          terr ? terr : (too_many ? "extra rows" : "short read"));
       sqlite3_free(terr);
       goto done;
     }
@@ -1141,6 +488,15 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     *errmsg = sqlite3_mprintf(
         "%s: %s produced a single class; nothing to distill", PREDICT_ERR_SCHEMA,
         teacher ? "teacher" : "target column");
+    goto done;
+  }
+  /* Defensive invariant: predict0_intern_label and the soft-label nproba check
+   * already cap this before any allocation; kept so the bound holds even if
+   * those paths change. */
+  if (classify && nclass > PREDICT0_MAX_CLASS) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: too many classes (%d); the maximum is %d",
+                              PREDICT_ERR_SCHEMA, nclass, PREDICT0_MAX_CLASS);
     goto done;
   }
 
@@ -1162,7 +518,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
                                 PREDICT_ERR_OPTIONS);
       goto done;
     }
-    rc = train_mlp(X, n_fit, nfeat, nclass, y_teach, soft ? soft_P : NULL,
+    rc = predict0_train_mlp(X, n_fit, nfeat, nclass, y_teach, soft ? soft_P : NULL,
                    0 /* classify */, MLP_HIDDEN, MLP_EPOCHS, MLP_LR,
                    0 /* no skip */, &mlp, errmsg);
     if (rc != SQLITE_OK)
@@ -1213,7 +569,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       goto done;
     }
   } else if (is_gbt) {
-    rc = train_gbt(X, n_fit, nfeat, classify ? 0 : 1, nclass, y_teach,
+    rc = predict0_train_gbt(X, n_fit, nfeat, classify ? 0 : 1, nclass, y_teach,
                    y_teach_r, soft ? soft_P : NULL, &forest, errmsg);
     if (rc != SQLITE_OK)
       goto done;
@@ -1279,7 +635,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
     b.yr = y_teach_r;
     b.nclass = nclass;
     b.task = classify ? 0 : 1;
-    int root = bld_build(&b, idx, n_fit, 0);
+    int root = predict0_bld_build(&b, idx, n_fit, 0);
     if (root < 0) {
       sqlite3_free(b.nodes);
       rc = SQLITE_NOMEM;
@@ -1326,7 +682,7 @@ static int distill_train(sqlite3 *db, const char *tq, DistOpts *o,
       goto done;
     }
   }
-  rc = register_student(db, o->student_id, blob, blob_len, res->content_hash,
+  rc = predict0_register_student(db, o->student_id, blob, blob_len, res->content_hash,
                         errmsg);
   if (rc != SQLITE_OK)
     goto done;
@@ -1657,7 +1013,7 @@ static int fdistill_fit(sqlite3 *db, const f32 *X, const f32 *Y, int n, int L,
   if (n_hold < 1)
     n_hold = 1;
   int n_fit = n - n_hold;
-  rc = train_mlp(X, n_fit, L, nout, NULL, Y, 1 /* regress */, nhid, epochs, lr,
+  rc = predict0_train_mlp(X, n_fit, L, nout, NULL, Y, 1 /* regress */, nhid, epochs, lr,
                  1 /* linear skip */, &mlp, errmsg);
   if (rc != SQLITE_OK)
     goto done;
@@ -1692,7 +1048,7 @@ static int fdistill_fit(sqlite3 *db, const f32 *X, const f32 *Y, int n, int L,
         sqlite3_mprintf("%s: student serialize failed", PREDICT_ERR_RESOURCE);
     goto done;
   }
-  rc = register_student(db, student_id, blob, blob_len, res->content_hash,
+  rc = predict0_register_student(db, student_id, blob, blob_len, res->content_hash,
                         errmsg);
   if (rc != SQLITE_OK)
     goto done;
@@ -1730,9 +1086,28 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H, int Q,
     rc = SQLITE_NOMEM;
     goto done;
   }
-  while (sqlite3_step(q) == SQLITE_ROW) {
-    for (int c = 0; c < ncol; c++)
+  int sr;
+  while ((sr = sqlite3_step(q)) == SQLITE_ROW) {
+    for (int c = 0; c < ncol; c++) {
+      /* sqlite3_column_double coerces NULL/text to 0.0, which would silently
+       * skew the normalized windows; require a real, finite number instead. */
+      int ct = sqlite3_column_type(q, c);
+      if (ct != SQLITE_INTEGER && ct != SQLITE_FLOAT) {
+        *errmsg = sqlite3_mprintf(
+            "%s: train_query cell at column %d is not numeric",
+            PREDICT_ERR_SCHEMA, c);
+        rc = SQLITE_ERROR;
+        goto done;
+      }
       wrow[c] = sqlite3_column_double(q, c);
+      if (!isfinite(wrow[c])) {
+        *errmsg = sqlite3_mprintf(
+            "%s: train_query cell at column %d is not finite",
+            PREDICT_ERR_SCHEMA, c);
+        rc = SQLITE_ERROR;
+        goto done;
+      }
+    }
     f64 mu = 0;
     for (int i = 0; i < L; i++)
       mu += wrow[i];
@@ -1747,8 +1122,8 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H, int Q,
       sd = 1e-9;
     if (n == cap) {
       int nc = cap ? cap * 2 : 256;
-      f32 *nX = sqlite3_realloc(X, (int)(sizeof(f32) * (size_t)nc * L));
-      f32 *nY = sqlite3_realloc(Y, (int)(sizeof(f32) * (size_t)nc * nout));
+      f32 *nX = sqlite3_realloc64(X, sizeof(f32) * (size_t)nc * L);
+      f32 *nY = sqlite3_realloc64(Y, sizeof(f32) * (size_t)nc * nout);
       if (nX)
         X = nX;
       if (nY)
@@ -1764,6 +1139,12 @@ static int fdistill_train(sqlite3 *db, const char *tq, int L, int H, int Q,
     for (int k = 0; k < nout; k++)
       Y[(size_t)n * nout + k] = (f32)((wrow[L + k] - mu) / sd);
     n++;
+  }
+  /* A terminal step code other than DONE is a read failure, not end-of-data. */
+  if (rc == SQLITE_OK && sr != SQLITE_DONE) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: could not read teacher rows: %s",
+                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
   }
   if (rc == SQLITE_OK)
     rc = fdistill_fit(db, X, Y, n, L, H, Q, levels, student_id, nhid, epochs,
@@ -1818,8 +1199,8 @@ static int fcst_teacher_flush(sqlite3 *db, const predict0_model_row *trow,
     int nout = H * *Q;
     if (*n == *cap) {
       int nc = *cap ? *cap * 2 : 256;
-      f32 *nX = sqlite3_realloc(*X, (int)(sizeof(f32) * (size_t)nc * L));
-      f32 *nY = sqlite3_realloc(*Y, (int)(sizeof(f32) * (size_t)nc * nout));
+      f32 *nX = sqlite3_realloc64(*X, sizeof(f32) * (size_t)nc * L);
+      f32 *nY = sqlite3_realloc64(*Y, sizeof(f32) * (size_t)nc * nout);
       if (nX)
         *X = nX;
       if (nY)
@@ -1876,8 +1257,17 @@ static int fdistill_train_teacher(sqlite3 *db, const char *tq,
   }
   int qcol = sqlite3_column_count(q), has_key = qcol >= 2;
 
+  /* A single-key series never trips the n < FCST_TEACHER_MAX_WIN flush guard, so
+   * bound the raw rows kept per series. The window budget consumes at most this
+   * many rows; beyond it a series yields no further windows and would only grow
+   * memory. Computed in 64-bit and clamped so the bound itself cannot overflow. */
+  int win_stride = H >= 8 ? H / 4 : 1;
+  sqlite3_int64 budget_rows =
+      (sqlite3_int64)L + (sqlite3_int64)FCST_TEACHER_MAX_WIN * win_stride + H;
+  int max_series = budget_rows > (1 << 23) ? (1 << 23) : (int)budget_rows;
 
-  while (sqlite3_step(q) == SQLITE_ROW && n < FCST_TEACHER_MAX_WIN) {
+  int sr;
+  while ((sr = sqlite3_step(q)) == SQLITE_ROW && n < FCST_TEACHER_MAX_WIN) {
     const char *key = has_key ? (const char *)sqlite3_column_text(q, 0) : "";
     if (!key)
       key = "";
@@ -1894,17 +1284,45 @@ static int fdistill_train_teacher(sqlite3 *db, const char *tq,
     } else if (!curkey) {
       curkey = sqlite3_mprintf("%s", key);
     }
-    if (sn == scap) {
-      int nc = scap ? scap * 2 : 512;
-      f64 *ns = sqlite3_realloc(series, (int)(sizeof(f64) * nc));
-      if (!ns) {
-        rc = SQLITE_NOMEM;
+    if (sn < max_series) {
+      if (sn == scap) {
+        int nc = scap ? scap * 2 : 512;
+        if (nc > max_series)
+          nc = max_series;
+        /* 64-bit sizing so the byte product can't narrow to int and overrun */
+        f64 *ns = sqlite3_realloc64(series, sizeof(f64) * (size_t)nc);
+        if (!ns) {
+          rc = SQLITE_NOMEM;
+          goto done;
+        }
+        series = ns;
+        scap = nc;
+      }
+      /* sqlite3_column_double coerces NULL/text to 0.0 and lets NaN/Inf through,
+       * which would train on corrupted rows; require a real, finite number. */
+      int ct = sqlite3_column_type(q, qcol - 1);
+      if (ct != SQLITE_INTEGER && ct != SQLITE_FLOAT) {
+        *errmsg = sqlite3_mprintf("%s: teacher series value is not numeric",
+                                  PREDICT_ERR_SCHEMA);
+        rc = SQLITE_ERROR;
         goto done;
       }
-      series = ns;
-      scap = nc;
+      f64 v = sqlite3_column_double(q, qcol - 1);
+      if (!isfinite(v)) {
+        *errmsg = sqlite3_mprintf("%s: teacher series value is not finite",
+                                  PREDICT_ERR_SCHEMA);
+        rc = SQLITE_ERROR;
+        goto done;
+      }
+      series[sn++] = v;
     }
-    series[sn++] = sqlite3_column_double(q, qcol - 1);
+  }
+  /* sr == ROW means the FCST_TEACHER_MAX_WIN cap stopped us (not an error); any
+   * terminal code other than ROW or DONE is a read failure, not end-of-data. */
+  if (rc == SQLITE_OK && sr != SQLITE_ROW && sr != SQLITE_DONE) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: could not read teacher rows: %s",
+                              PREDICT_ERR_SCHEMA, sqlite3_errmsg(db));
   }
   if (rc == SQLITE_OK && sn >= L) {
     rc = fcst_teacher_flush(db, &trow, &bopts, series, sn, L, H, &X, &Y, &n,
@@ -2130,10 +1548,11 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
     if (sqlite3_prepare_v2(db, "SELECT value FROM json_each(?1,'$.quantiles')",
                            -1, &qs, NULL) == SQLITE_OK) {
       sqlite3_bind_text(qs, 1, options, -1, SQLITE_STATIC);
-      while (sqlite3_step(qs) == SQLITE_ROW) {
+      int sr;
+      while ((sr = sqlite3_step(qs)) == SQLITE_ROW) {
         if (cnt == cap) {
           int nc = cap ? cap * 2 : 8;
-          f32 *nl = sqlite3_realloc(levels, (int)(sizeof(f32) * nc));
+          f32 *nl = sqlite3_realloc64(levels, sizeof(f32) * (size_t)nc);
           if (!nl) {
             sqlite3_finalize(qs);
             FD_FAIL("%s: out of memory", PREDICT_ERR_RESOURCE);
@@ -2143,7 +1562,27 @@ static int fd_filter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
         }
         levels[cnt++] = (f32)sqlite3_column_double(qs, 0);
       }
+      /* A terminal step code other than DONE is a read failure. Build the
+       * message from db before finalize clears it, then take FD_FAIL's cleanup
+       * path (free student_id/levels/teacher, return). */
+      if (sr != SQLITE_DONE) {
+        sqlite3_free(vtab->base.zErrMsg);
+        vtab->base.zErrMsg = sqlite3_mprintf(
+            "%s: could not read quantile levels: %s", PREDICT_ERR_OPTIONS,
+            sqlite3_errmsg(db));
+        sqlite3_finalize(qs);
+        sqlite3_free(student_id);
+        sqlite3_free(levels);
+        sqlite3_free(teacher);
+        return SQLITE_ERROR;
+      }
       sqlite3_finalize(qs);
+    } else {
+      /* Prepare failure is a real error, not "no quantiles": an absent
+       * $.quantiles key prepares fine and yields zero rows (the median-only
+       * path below). Fail loudly rather than silently train the wrong model. */
+      FD_FAIL("%s: could not parse quantiles: %s", PREDICT_ERR_OPTIONS,
+              sqlite3_errmsg(db));
     }
     if (cnt > 0)
       Q = cnt;

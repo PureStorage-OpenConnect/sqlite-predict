@@ -19,11 +19,16 @@ SQLITE_EXTENSION_INIT3
 void predict0_tree_free(Tree *t) {
   if (!t)
     return;
-  for (int i = 0; i < t->nfeat; i++)
-    sqlite3_free(t->feat_names[i]);
+  /* A deserializer can fail after setting nfeat/nclass but before allocating
+   * these arrays, so guard the loops: a malformed blob must free cleanly, not
+   * walk a NULL array by a header-supplied count. */
+  if (t->feat_names)
+    for (int i = 0; i < t->nfeat; i++)
+      sqlite3_free(t->feat_names[i]);
   sqlite3_free(t->feat_names);
-  for (int i = 0; i < t->nclass; i++)
-    sqlite3_free(t->labels[i]);
+  if (t->labels)
+    for (int i = 0; i < t->nclass; i++)
+      sqlite3_free(t->labels[i]);
   sqlite3_free(t->labels);
   sqlite3_free(t->nodes);
   memset(t, 0, sizeof(*t));
@@ -72,6 +77,12 @@ static f32 rd_f32(Reader *r) {
   u32 u = rd_u32(r);
   f32 v;
   memcpy(&v, &u, 4);
+  /* A hand-crafted blob can encode NaN/Inf, which would flow into predictions
+   * and proba output. Reject via the same err path as an overrun. */
+  if (!isfinite(v)) {
+    r->err = 1;
+    return 0;
+  }
   return v;
 }
 static char *rd_str(Reader *r) {
@@ -144,8 +155,8 @@ static int tree_deserialize(const void *blob, int len, Tree *t, char **errmsg) {
   t->nclass = (int)rd_u32(&r);
   t->n_nodes = (int)rd_u32(&r);
   if (r.err || t->task < 0 || t->task > 1 || t->nfeat <= 0 ||
-      t->nfeat > TREE_MAX_FEAT || t->nclass < 0 || t->n_nodes <= 0 ||
-      t->n_nodes > (1 << 24))
+      t->nfeat > TREE_MAX_FEAT || t->nclass < 0 || t->nclass > PREDICT0_MAX_CLASS ||
+      t->n_nodes <= 0 || t->n_nodes > (1 << 24))
     goto bad;
 
   t->feat_names = sqlite3_malloc(sizeof(char *) * t->nfeat);
@@ -224,11 +235,16 @@ static const char GBT_MAGIC[8] = {'P', 'S', 'G', 'B', 'T', '0', '1', '\0'};
 void predict0_forest_free(Forest *f) {
   if (!f)
     return;
-  for (int i = 0; i < f->nfeat; i++)
-    sqlite3_free(f->feat_names[i]);
+  /* Guard the loops: a deserializer can fail after reading nfeat/nclass but
+   * before allocating these arrays, and a malformed blob must free cleanly
+   * rather than walk a NULL array by a header-supplied count. */
+  if (f->feat_names)
+    for (int i = 0; i < f->nfeat; i++)
+      sqlite3_free(f->feat_names[i]);
   sqlite3_free(f->feat_names);
-  for (int i = 0; i < f->nclass; i++)
-    sqlite3_free(f->labels[i]);
+  if (f->labels)
+    for (int i = 0; i < f->nclass; i++)
+      sqlite3_free(f->labels[i]);
   sqlite3_free(f->labels);
   sqlite3_free(f->init);
   sqlite3_free(f->tree_off);
@@ -350,8 +366,9 @@ static int forest_deserialize(const void *blob, int len, Forest *f,
   f->lr = rd_f32(&r);
   int want_score = f->task == 0 ? f->nclass : 1;
   if (r.err || f->task < 0 || f->task > 1 || f->nfeat <= 0 ||
-      f->nfeat > TREE_MAX_FEAT || f->nclass < 0 || f->n_rounds <= 0 ||
-      f->n_rounds > (1 << 20) || f->n_score != want_score || f->n_score <= 0)
+      f->nfeat > TREE_MAX_FEAT || f->nclass < 0 || f->nclass > PREDICT0_MAX_CLASS ||
+      f->n_rounds <= 0 || f->n_rounds > (1 << 20) || f->n_score != want_score ||
+      f->n_score <= 0)
     goto bad;
 
   f->init = sqlite3_malloc(sizeof(f32) * f->n_score);
@@ -376,7 +393,8 @@ static int forest_deserialize(const void *blob, int len, Forest *f,
         goto bad;
   }
   f->n_trees = (int)rd_u32(&r);
-  if (r.err || f->n_trees != f->n_rounds * f->n_score)
+  if (r.err || f->n_trees <= 0 || f->n_trees > (1 << 24) ||
+      (i64)f->n_trees != (i64)f->n_rounds * f->n_score)
     goto bad;
   f->tree_off = sqlite3_malloc(sizeof(int) * (f->n_trees + 1));
   if (!f->tree_off)
@@ -450,7 +468,8 @@ void predict0_mlp_free(MLP *m) {
 
 /* forward on RAW features x; writes hidden[nhid] and out[nout] logits. With a
  * linear skip (Wskip, forecast student) the hidden path is scaled down and the
- * skip term added; nhid=0 makes it a pure linear map. Must match train_mlp. */
+ * skip term added; nhid=0 makes it a pure linear map. Must match
+ * predict0_train_mlp. */
 void predict0_mlp_forward(const MLP *m, const f32 *x, f32 *hid, f32 *out) {
   f64 rs = m->Wskip ? FCST_RES_SCALE : 1.0;
   for (int j = 0; j < m->nhid; j++) {
@@ -551,7 +570,8 @@ static int mlp_deserialize(const void *blob, int len, MLP *m, char **errmsg) {
   m->nclass = (int)rd_u32(&r);
   if (r.err || m->task < 0 || m->task > 1 || m->nfeat <= 0 ||
       m->nfeat > TREE_MAX_FEAT || m->nhid <= 0 || m->nhid > 2048 ||
-      m->nout <= 0 || m->nout > 2048 || m->nclass < 0 || m->nclass > 2048 ||
+      m->nout <= 0 || m->nout > 2048 || m->nclass < 0 ||
+      m->nclass > PREDICT0_MAX_CLASS ||
       (m->task == 0 && m->nout != m->nclass) || (m->task == 1 && m->nout != 1))
     goto bad;
   m->mean = sqlite3_malloc(sizeof(f32) * m->nfeat);
@@ -966,4 +986,122 @@ done:
     predict0_results_free(rows, nrows);
   }
   return rc;
+}
+
+/* ---- load once, serve per row (the scalar predict() path) ----
+ * predict0_tree_run above deserializes per apply-query; the scalar predict()
+ * instead loads a student once, caches it on its model argument
+ * (sqlite3_set_auxdata), and serves one feature vector per call. */
+
+struct predict0_loaded_student {
+  int kind; /* 0 tree, 1 forest, 2 mlp */
+  Tree tree;
+  Forest forest;
+  MLP mlp;
+  f64 *scbuf;       /* forest classify scratch [n_score] */
+  f32 *mhid, *mout; /* mlp scratch [nhid], [nout] */
+};
+
+int predict0_student_load(const void *blob, int len,
+                          predict0_loaded_student **out, char **errmsg) {
+  *out = NULL;
+  if (!blob || len <= 0) {
+    *errmsg = sqlite3_mprintf("%s: empty student blob", PREDICT_ERR_SCHEMA);
+    return SQLITE_ERROR;
+  }
+  predict0_loaded_student *s = sqlite3_malloc(sizeof(*s));
+  if (!s) {
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+    return SQLITE_NOMEM;
+  }
+  memset(s, 0, sizeof(*s));
+  int is_forest = len >= (int)sizeof(GBT_MAGIC) &&
+                  memcmp(blob, GBT_MAGIC, sizeof(GBT_MAGIC)) == 0;
+  int is_mlp = len >= (int)sizeof(MLP_MAGIC) &&
+               memcmp(blob, MLP_MAGIC, sizeof(MLP_MAGIC)) == 0;
+  int rc;
+  if (is_mlp) {
+    s->kind = 2;
+    rc = mlp_deserialize(blob, len, &s->mlp, errmsg);
+  } else if (is_forest) {
+    s->kind = 1;
+    rc = forest_deserialize(blob, len, &s->forest, errmsg);
+  } else {
+    s->kind = 0;
+    rc = tree_deserialize(blob, len, &s->tree, errmsg);
+  }
+  if (rc != SQLITE_OK) {
+    sqlite3_free(s);
+    return rc;
+  }
+  if (s->kind == 1 && s->forest.task == 0) {
+    s->scbuf = sqlite3_malloc(sizeof(f64) * s->forest.n_score);
+    if (!s->scbuf)
+      goto oom;
+  } else if (s->kind == 2) {
+    s->mhid = sqlite3_malloc(sizeof(f32) * s->mlp.nhid);
+    s->mout = sqlite3_malloc(sizeof(f32) * s->mlp.nout);
+    if (!s->mhid || !s->mout)
+      goto oom;
+  }
+  *out = s;
+  return SQLITE_OK;
+oom:
+  predict0_student_free(s);
+  *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+  return SQLITE_NOMEM;
+}
+
+int predict0_student_nfeat(const predict0_loaded_student *s) {
+  return s->kind == 2   ? s->mlp.nfeat
+         : s->kind == 1 ? s->forest.nfeat
+                        : s->tree.nfeat;
+}
+
+int predict0_student_predict(const predict0_loaded_student *s, const f32 *x,
+                             char **pred, f64 *conf, int *has_conf,
+                             char **errmsg) {
+  int rc;
+  if (s->kind == 2)
+    rc = predict0_mlp_predict_row(&s->mlp, x, s->mhid, s->mout, pred, conf,
+                                  has_conf);
+  else if (s->kind == 1)
+    rc = predict0_forest_predict_row(&s->forest, x, s->scbuf, pred, conf,
+                                     has_conf);
+  else {
+    int leaf = predict0_tree_walk(&s->tree, x);
+    if (leaf < 0) {
+      *errmsg =
+          sqlite3_mprintf("%s: malformed tree traversal", PREDICT_ERR_SCHEMA);
+      return SQLITE_ERROR;
+    }
+    const TreeNode *ln = &s->tree.nodes[leaf];
+    if (s->tree.task == 0) {
+      *pred = sqlite3_mprintf("%s", s->tree.labels[ln->klass]);
+      *conf = ln->conf;
+      *has_conf = 1;
+    } else {
+      *pred = sqlite3_mprintf("%.17g", (f64)ln->value);
+      *has_conf = 0;
+    }
+    rc = *pred ? SQLITE_OK : SQLITE_NOMEM;
+  }
+  if (rc == SQLITE_NOMEM)
+    *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+  return rc;
+}
+
+void predict0_student_free(predict0_loaded_student *s) {
+  if (!s)
+    return;
+  if (s->kind == 2)
+    predict0_mlp_free(&s->mlp);
+  else if (s->kind == 1)
+    predict0_forest_free(&s->forest);
+  else
+    predict0_tree_free(&s->tree);
+  sqlite3_free(s->scbuf);
+  sqlite3_free(s->mhid);
+  sqlite3_free(s->mout);
+  sqlite3_free(s);
 }

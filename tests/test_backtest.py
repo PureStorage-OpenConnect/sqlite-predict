@@ -20,12 +20,14 @@ def rows(db, sql, *params):
 
 def bt(db, horizon, **options):
     return rows(db, "SELECT fold, model, n, mae, rmse, mase, smape, coverage,"
-                    " mean_interval_width, status FROM backtest(?, ?, ?)",
-                FC, horizon, json.dumps(options))
+                    " mean_interval_width, status FROM backtest_rows("
+                    "(SELECT backtest(ts, value, ?, ?) FROM series))",
+                horizon, json.dumps(options))
 
 
 def avg_mase(db, model, horizon=12, folds=10):
-    return rows(db, "SELECT avg(mase) FROM backtest(?, ?, ?)", FC, horizon,
+    return rows(db, "SELECT avg(mase) FROM backtest_rows("
+                    "(SELECT backtest(ts, value, ?, ?) FROM series))", horizon,
                 json.dumps({"model": model, "folds": folds}))[0][0]
 
 
@@ -63,8 +65,9 @@ def test_conformal_beats_residual_coverage_on_smooth_data(db):
         opts = {"folds": 25, "confidence_level": 0.9}
         if conformal:
             opts["interval_method"] = "conformal"
-        return rows(db, "SELECT avg(coverage) FROM backtest(?, 6, ?)",
-                    FC, json.dumps(opts))[0][0]
+        return rows(db, "SELECT avg(coverage) FROM backtest_rows("
+                        "(SELECT backtest(ts, value, 6, ?) FROM series))",
+                    json.dumps(opts))[0][0]
 
     conf = coverage(True)
     resid = coverage(False)
@@ -98,7 +101,10 @@ def test_backtest_constant_series_is_exact(db):
     assert len(out) == 5
     for _fold, _m, _n, mae, rmse, mase, _sm, cov, width, _st in out:
         assert mae == 0.0 and rmse == 0.0
-        assert mase == 0.0            # naive scale is 0 on a flat series
+        # MASE = mae / naive_scale is 0/0 on a flat series: the naive scale is 0,
+        # so MASE is undefined and reported as null (not 0, which would read as a
+        # perfect model). mae == 0 already carries the "exact forecast" signal.
+        assert mase is None
         assert cov == 1.0            # zero-width band on an exact forecast
         assert width == 0.0
 
@@ -129,18 +135,81 @@ def test_backtest_grouped_series(db):
     b, _ = syn.trend_season(n=120, noise=1.0, seed=2)
     syn.load_into(db, a, group="a")
     syn.load_into(db, b, group="b")
-    out = rows(db, "SELECT DISTINCT series_key FROM backtest("
-                   "'SELECT ts, value, grp FROM series', 6, ?)",
-               json.dumps({"group_cols": ["grp"], "folds": 5}))
+    out = rows(db, "SELECT g.grp, r.fold, r.mae FROM"
+                   " (SELECT grp, backtest(ts, value, 6, ?) AS d FROM series"
+                   " GROUP BY grp) g, backtest_rows(g.d) r",
+               json.dumps({"folds": 5}))
     assert {r[0] for r in out} == {"a", "b"}
+    assert len(out) == 10  # 2 groups x 5 folds; catches truncated grouped output
+    # each group produced real folds with populated metrics, not a synthesized
+    # blank row from an empty $.rows
+    for grp in ("a", "b"):
+        maes = [r[2] for r in out if r[0] == grp]
+        assert len(maes) == 5 and all(m is not None for m in maes)
 
 
 def test_backtest_rejects_unknown_model(db):
     series, _ = syn.trend_season(n=100, noise=1.0, seed=1)
     syn.load_into(db, series)
-    with pytest.raises(sqlite3.OperationalError):
-        rows(db, "SELECT * FROM backtest(?, 6, ?)", FC,
+    with pytest.raises(sqlite3.OperationalError) as e:
+        rows(db, "SELECT * FROM backtest_rows("
+                 "(SELECT backtest(ts, value, 6, ?) FROM series))",
              json.dumps({"model": "no-such-model"}))
+    assert "PREDICT_ERR_MODEL_NOT_FOUND" in str(e.value)
+
+
+def test_backtest_rejects_unknown_option(db):
+    series, _ = syn.trend_season(n=80, noise=1.0, seed=3)
+    syn.load_into(db, series)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        rows(db, "SELECT * FROM backtest_rows("
+                 "(SELECT backtest(ts, value, 6, ?) FROM series))",
+             json.dumps({"no_such_option": 1}))
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
+def test_backtest_query_string_misuse_fails_loud(db):
+    """backtest is an aggregate over rows, not a TVF over a query string; the
+    old-TVF-syntax misuse must self-correct rather than silently do nothing."""
+    series, _ = syn.trend_season(n=60, noise=1.0, seed=4)
+    syn.load_into(db, series)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT backtest('SELECT ts, value FROM series', 6)").fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "doc", ["not a document", "42", '{"rows": 5}', '["a", "b"]'])
+def test_backtest_rows_rejects_hostile_document(db, doc):
+    """backtest_rows() takes a backtest() result document; a non-conforming
+    document is rejected cleanly (PREDICT_ERR_SCHEMA), never a crash."""
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT * FROM backtest_rows(?)", (doc,)).fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
+def test_backtest_rows_null_document_is_empty(db):
+    """NULL in, empty out: intentional and consistent with forecast_rows and
+    SQLite's own json_each(NULL), which also yield zero rows. This is not a
+    swallowed failure. A failed backtest() raises (the error propagates through
+    the subquery); NULL only arises from an empty series, i.e. genuinely nothing
+    to expand. A hostile *non-NULL* document still fails loud (see
+    test_backtest_rows_rejects_hostile_document)."""
+    assert db.execute("SELECT * FROM backtest_rows(NULL)").fetchall() == []
+
+
+def test_backtest_rejects_candidates_option(db):
+    """backtest()'s auto path searches only the bundled TS models, so it must not
+    silently accept a candidates list it would ignore. The key is rejected as
+    unknown (PREDICT_ERR_OPTIONS) rather than parsed and dropped."""
+    series, _ = syn.trend_season(n=80, noise=1.0, seed=5)
+    syn.load_into(db, series)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        rows(db, "SELECT * FROM backtest_rows("
+                 "(SELECT backtest(ts, value, 6, ?) FROM series))",
+             json.dumps({"candidates": ["theta-classic", "tsb"]}))
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
 
 
 # ------------------------------------------- tsb (intermittent) via backtest

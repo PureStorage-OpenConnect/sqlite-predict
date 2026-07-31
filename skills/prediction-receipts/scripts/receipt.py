@@ -41,7 +41,17 @@ DDL = """CREATE TABLE IF NOT EXISTS _predict_receipts (
   result_sha256 TEXT NOT NULL
 )"""
 
-OPERATIONS = ("forecast", "detect_anomalies", "predict", "backtest")
+# Aggregate operations return one JSON document, hashed verbatim. Row-shaped
+# operations (per-row predict, and the *_rows TVFs that expand an aggregate
+# document into typed rows) hash the {"columns","rows"} form. A *_rows TVF nests
+# its base aggregate in its argument, so it — not the nested aggregate — is the
+# operation of record.
+AGGREGATE_OPS = ("forecast", "detect_anomalies", "backtest")
+ROW_OPS = ("predict", "predict_batch", "backtest_rows", "forecast_rows",
+           "anomaly_rows")
+OPERATIONS = AGGREGATE_OPS + ROW_OPS
+_ROWS_WRAPS = {"backtest_rows": "backtest", "forecast_rows": "forecast",
+               "anomaly_rows": "detect_anomalies"}
 
 
 def fail(code, msg):
@@ -93,9 +103,6 @@ def connect(db_path, extension, untrusted=False):
     return db
 
 
-AGGREGATE_OPS = ("forecast", "detect_anomalies")
-
-
 def canonical_document(cur, operation):
     """Aggregate operations hash their single JSON document verbatim;
     row-shaped operations always hash the {"columns","rows"} form, even
@@ -125,7 +132,13 @@ def sha256_text(text):
 
 def infer_operation(sql):
     found = {op for op in OPERATIONS
-             if re.search(r"\b" + op + r"\s*\(", sql)}
+             if re.search(r"\b" + re.escape(op) + r"\s*\(", sql)}
+    # A *_rows TVF nests its base aggregate in its argument (e.g.
+    # backtest_rows((SELECT backtest(...)))). The outer TVF is the operation, so
+    # drop the base aggregate when its _rows wrapper is present.
+    for wrapper, base in _ROWS_WRAPS.items():
+        if wrapper in found:
+            found.discard(base)
     if len(found) == 1:
         return found.pop()
     return None

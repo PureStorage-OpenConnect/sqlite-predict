@@ -18,6 +18,7 @@
 #define TREE_MAX_FEAT PREDICT_MAX_FEAT /* alias; see predict-internal.h */
 #define FCST_MAX_CONTEXT 4096 /* forecast student: max context length (nfeat) */
 #define FCST_MAX_QUANT 64 /* forecast student: max quantile levels */
+#define PREDICT0_MAX_CLASS 2048 /* tree/gbt/mlp classifier: max distinct classes */
 /* Forecast student with a linear skip: the hidden path is a small correction on
  * the dominant linear map, so its output is scaled by this. Shared by the
  * trainer (train_mlp) and the serving forward (predict0_mlp_forward). */

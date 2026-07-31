@@ -93,9 +93,18 @@ int predict0_prepare_ro(sqlite3 *db, const char *sql, const char *what,
 
 /* Parse a JSON array of strings; path selects an array inside a larger
  * document, NULL means json itself is the array. out/n: sqlite3_malloc'd
- * (caller frees elements + array). SQLITE_OK, or SQLITE_ code + *errmsg. */
+ * (caller frees elements + array). max is the element-count cap and MUST be > 0
+ * (a nonpositive cap is rejected, never treated as unbounded — pass an explicit
+ * large cap if a large array is intended); the parse rejects before allocating
+ * past max. Returns SQLITE_OK, or an SQLITE_ code with *errmsg set to a closed
+ * "PREDICT_ERR_*: detail" string the caller owns. */
 int predict0_json_str_array(sqlite3 *db, const char *json, const char *path,
-                            char ***out, int *n, char **errmsg);
+                            char ***out, int *n, int max, char **errmsg);
+
+/* Append `t` to `s` as a JSON string literal (quoted, with " \ and control
+ * characters below 0x20 escaped). Shared by the aggregate result docs and the
+ * scalar predict() proba output. */
+void predict0_json_str(sqlite3_str *s, const char *t);
 
 /* Inverse standard-normal CDF (Acklam's rational approximation).
  * p in (0,1). Used for prediction-interval z values. */
@@ -195,6 +204,21 @@ int predict0_tree_run(sqlite3 *db, const char *model_id, const char *apply_sql,
                       const predict0_model_row *model,
                       const predict0_backend_opts *opts,
                       predict0_result **rows, int *n, char **errmsg);
+
+/* The tabular training core (predict0_train_student and the tree/gbt/mlp
+ * trainers) lives in predict-train.{c,h}. */
+
+/* ---- native student load/serve (predict-student.c) ----
+ * A deserialized student (tree/gbt/mlp), loaded once and served per row. The
+ * scalar predict() caches this on its model argument via sqlite3_set_auxdata. */
+typedef struct predict0_loaded_student predict0_loaded_student;
+int predict0_student_load(const void *blob, int len,
+                          predict0_loaded_student **out, char **errmsg);
+int predict0_student_nfeat(const predict0_loaded_student *s);
+int predict0_student_predict(const predict0_loaded_student *s, const f32 *x,
+                             char **pred, f64 *conf, int *has_conf,
+                             char **errmsg);
+void predict0_student_free(predict0_loaded_student *s);
 
 /* Interpolate the quantile at level p over ascending levels lev[Q] with the
  * (ascending) values val[Q], extrapolating the tails (e.g. deciles to a 95%

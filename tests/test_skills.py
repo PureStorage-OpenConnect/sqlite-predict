@@ -165,10 +165,10 @@ def test_receipt_pins_a_registered_student(receipt_db):
     assert out["model_id"] == "theta-classic"
     assert out["content_hash"], "registered models must record their pin"
 
-    # rows-shaped results canonicalize too: predict() through a student
+    # rows-shaped results canonicalize too: predict_batch() through a student
     rec2 = run_receipt(
         "record", receipt_db,
-        "SELECT rowid, prediction FROM predict(NULL,"
+        "SELECT rowid, prediction FROM predict_batch(NULL,"
         " 'SELECT rowid, f1, f2 FROM tab', '{\"model\":\"s1\"}')",
         "--model-id", "s1")
     assert rec2.returncode == 0, rec2.stderr
@@ -190,9 +190,9 @@ def test_receipt_adversarial_paths(receipt_db):
     # a backtest projected to one text column: operation-based
     # canonicalization must hash the {"columns","rows"} form, so the
     # receipt hash must NOT equal the raw-cell hash
-    one_cell_sql = ("SELECT model FROM backtest("
-                    "'SELECT ts, value FROM readings', 4,"
-                    " '{\"model\":\"theta-classic\"}') LIMIT 1")
+    one_cell_sql = ("SELECT model FROM backtest_rows((SELECT backtest("
+                    "ts, value, 4, '{\"model\":\"theta-classic\"}')"
+                    " FROM readings)) LIMIT 1")
     rec = run_receipt("record", receipt_db, one_cell_sql,
                       "--model-id", "theta-classic")
     assert rec.returncode == 0, rec.stderr

@@ -19,6 +19,7 @@
  * and fails loud — a request for a provider this build lacks errors rather
  * than silently dropping to CPU. */
 #include "predict-internal.h"
+#include "predict-student.h" /* PREDICT0_MAX_CLASS: caps io_spec output labels */
 
 #ifndef SQLITE_CORE
 SQLITE_EXTENSION_INIT3
@@ -328,15 +329,14 @@ static int json_flag(sqlite3 *db, const char *json, const char *path) {
   return on;
 }
 
-/* json array at path -> sqlite3_malloc'd char*[]; *n set. 0 on success.
- * Absent/invalid arrays yield an empty result: these fields are optional
- * in an io_spec, so the callers treat empty as "not declared". */
+/* json array at path -> sqlite3_malloc'd char*[]; *n set. SQLITE_OK on success.
+ * An absent array is not an error: it yields *n == 0, so optional fields read
+ * as "not declared". A present-but-malformed array is an error and is never
+ * swallowed: the return code and *errmsg (ownership transfers to the caller)
+ * always propagate. max caps the element count (0 = unbounded). */
 static int json_arr(sqlite3 *db, const char *json, const char *path,
-                    char ***out, int *n) {
-  char *e = NULL;
-  int rc = predict0_json_str_array(db, json, path, out, n, &e);
-  sqlite3_free(e);
-  return rc;
+                    char ***out, int *n, int max, char **errmsg) {
+  return predict0_json_str_array(db, json, path, out, n, max, errmsg);
 }
 
 static int onnx_io_parse(sqlite3 *db, const char *io_spec, onnx_io *io,
@@ -364,8 +364,23 @@ static int onnx_io_parse(sqlite3 *db, const char *io_spec, onnx_io *io,
    * nfeatures (if given) is the count to validate against. */
   io->output_name = json_str(db, io_spec, "$.output.name");
   io->output_kind = json_str(db, io_spec, "$.output.kind");
-  json_arr(db, io_spec, "$.features", &io->features, &io->nfeat);
-  json_arr(db, io_spec, "$.output.labels", &io->labels, &io->nlabels);
+  /* features[] is optional (absent -> nfeat 0, positional mapping), but a
+   * present-but-malformed array must fail loudly rather than read as absent. */
+  int rc_features = json_arr(db, io_spec, "$.features", &io->features,
+                             &io->nfeat, PREDICT_MAX_FEAT, errmsg);
+  if (rc_features != SQLITE_OK) {
+    onnx_io_free(io);
+    return rc_features;
+  }
+  /* Labels bound the class space; cap them and surface an oversized set instead
+   * of silently truncating. Features use PREDICT_MAX_FEAT and positional
+   * mapping. */
+  int rc_labels = json_arr(db, io_spec, "$.output.labels", &io->labels,
+                           &io->nlabels, PREDICT0_MAX_CLASS, errmsg);
+  if (rc_labels != SQLITE_OK) {
+    onnx_io_free(io);
+    return rc_labels;
+  }
   char *nf = json_str(db, io_spec, "$.nfeatures");
   io->nfeatures = nf ? atoi(nf) : io->nfeat; /* names imply their own count */
   sqlite3_free(nf);
@@ -987,7 +1002,6 @@ int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
   int fixed_context = json_flag(db, model->io_spec, "$.fixed_context");
   int two_head = point_name && quant_name;
   char **lvl_s = NULL;
-  json_arr(db, model->io_spec, "$.quantiles", &lvl_s, &nq);
   f32 *levels = NULL;
   f64 *fan = NULL;
   f32 *inbuf = NULL;
@@ -995,6 +1009,15 @@ int predict0_onnx_forecast_fan(sqlite3 *db, const predict0_model_row *model,
   OrtValue *input = NULL, *output = NULL;
   OrtTensorTypeAndShapeInfo *ti = NULL;
   OrtSession *session = NULL;
+
+  /* Parse quantiles only after every resource above is NULL-initialized, so the
+   * error path can goto done safely. Absent quantiles -> nq 0, caught by the
+   * nq <= 0 io_spec check below; a present-but-malformed array must fail loudly
+   * here, not read as absent. */
+  rc = json_arr(db, model->io_spec, "$.quantiles", &lvl_s, &nq, FCST_MAX_QUANT,
+                errmsg);
+  if (rc != SQLITE_OK)
+    goto done;
 
   int outputs_ok = two_head ? (point_name && quant_name) : (output_name != NULL);
   if (!layout || strcmp(layout, "sequence") != 0 || !input_name || !outputs_ok ||
