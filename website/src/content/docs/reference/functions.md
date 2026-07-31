@@ -5,10 +5,11 @@ description: Every SQL function sqlite-predict registers, with signatures.
 
 ## Aggregate functions
 
-`forecast` and `detect_anomalies` are **aggregate functions**, like `sum()`:
-your statement supplies the rows, so filtering, joins, bound parameters, and
-`GROUP BY` series-splitting are ordinary SQL. Both are pure functions: nothing
-is written, so they work on read-only databases and inside views.
+`forecast`, `detect_anomalies`, `backtest`, and `fit` are **aggregate
+functions**, like `sum()`: your statement supplies the rows, so filtering,
+joins, bound parameters, and `GROUP BY` splitting are ordinary SQL. The first
+three are pure (nothing is written, so they work on read-only databases and
+inside views); `fit` optionally registers a model.
 
 ### `forecast(ts, value, horizon [, options])`
 
@@ -37,9 +38,9 @@ SELECT city, forecast(ts, value, 24) FROM readings GROUP BY city;
 
 `model` is the resolved model id (useful with `'{"model":"auto"}'`); `status`
 is `ok`, `truncated`, `insufficient_history` (fewer than 8 points), or
-`non_numeric`. A degraded
-series returns a status document with empty `rows`; it does not fail the
-statement. An aggregate over zero rows returns `NULL` (like `sum()`).
+`non_numeric`. A degraded series returns a status document with empty `rows`;
+it does not fail the statement. An aggregate over zero rows returns `NULL`
+(like `sum()`).
 
 Passing a BigQuery-style query string, `forecast('SELECT …', 24)`, raises an
 error explaining that `forecast` is an aggregate over your rows.
@@ -47,16 +48,44 @@ error explaining that `forecast` is an aggregate over your rows.
 ### `detect_anomalies(ts, value [, options])`
 
 Same document pattern and the same accepted timestamp forms; each element of
-`rows` carries `ts`, `value`,
-`forecast`, `lower_bound`, `upper_bound`, `is_anomaly`,
-`anomaly_probability`. The interval fields are null during warmup and for
-model `sub-pca`.
+`rows` carries `ts`, `value`, `forecast`, `lower_bound`, `upper_bound`,
+`is_anomaly`, `anomaly_probability`. The interval fields are null during warmup
+and for model `sub-pca`.
 
-### `forecast_rows(doc)` / `anomaly_rows(doc)`
+### `backtest(ts, value, horizon [, options])`
 
-Table-valued expansion of a document back into typed rows (the row fields
-above plus `status`), for SQL-side consumption (app-side `JSON.parse` is the
-other, equally supported route):
+Rolling-origin evaluation of a forecast model over your rows: it repeatedly
+hides the tail, forecasts it, and scores against the held-out actuals. Returns
+one JSON document per group of per-fold results; expand with `backtest_rows()`.
+The row fields are `series_key`, `fold`, `cutoff_timestamp`, `model`, `n`,
+`mae`, `rmse`, `mase`, `smape`, `coverage`, `mean_interval_width`, `status`.
+
+```sql
+SELECT avg(mae) FROM backtest_rows(
+  (SELECT backtest(ts, value, 6, '{"folds":20}') FROM readings));
+```
+
+### `fit(f1, ..., fN, label [, options])`
+
+Trains a native tabular student over your rows. The features are the leading
+positional arguments and the **label is the last argument** (there is no
+`target` option). The optional trailing `options` is a TEXT JSON object, so a
+trailing `{...}` argument is always read as options: a class **label must not be
+a JSON-object string** (it would be consumed as options). Returns the model:
+with `'{"register":"churn-v1"}'` it registers into `_predict_models` and returns
+the id, otherwise it returns a model blob you can pass to `predict`. Options:
+`kind` (`gbt` default, or `tree`), `task` (`classify`/`regress`, inferred from
+the label), `register`.
+
+```sql
+SELECT fit(tenure, spend, churned, '{"kind":"gbt","register":"churn-v1"}') FROM history;
+```
+
+### `forecast_rows(doc)` / `anomaly_rows(doc)` / `backtest_rows(doc)`
+
+Table-valued expansion of a forecast, anomaly, or backtest document back into
+typed rows (the row fields above plus `status`), for SQL-side consumption
+(app-side `JSON.parse` is the other, equally supported route):
 
 ```sql
 SELECT r.* FROM forecast_rows(
@@ -66,39 +95,43 @@ SELECT r.* FROM forecast_rows(
 `forecast_rows(NULL)` yields zero rows; a document with empty `rows` yields a
 single status row.
 
+## Scalar prediction
+
+### `predict(model, f1, ..., fN [, options])`
+
+Serves a native student one prediction per row, so it drops into any `SELECT`
+beside your other columns and composes with `WHERE` and joins. `model` is a
+registered id (from `fit` or `distill_predict`) or a `fit()` blob. Features are
+positional and must match the model's feature count; a mismatch raises
+`PREDICT_ERR_SCHEMA`. Returns the prediction: a class label for a `classify`
+model, a numeric value for a `regress` model. For a classifier,
+`'{"proba":true}'` returns a `{"prediction": "1", "confidence": 0.98}` JSON
+document.
+
+```sql
+SELECT id, predict('churn-v1', tenure, spend) AS churn FROM active;
+
+-- one-shot train + apply, no registration and no query strings:
+WITH m(model) AS (SELECT fit(tenure, spend, churned) FROM history)
+SELECT a.id, predict((SELECT model FROM m), a.tenure, a.spend) FROM active a;
+```
+
+For in-context models (`knn5-incontext`) or batched ONNX serving, use
+`predict_batch`.
+
 ## Table-valued functions
 
-Evaluation and training stay query-shaped: they take a read-only `SELECT`
-string, because they need to re-run it across folds or split it into train and
-apply sets.
+Training and batched serving stay query-shaped: they take read-only `SELECT`
+strings, because they re-run across folds or split into train and apply sets.
 
-### `backtest(query, horizon [, options])`
+### `predict_batch(train_query, apply_query [, options])`
 
-Rolling-origin evaluation of a forecast model. `query` is a read-only `SELECT`
-of `(time, value)`, optionally with grouping columns. Columns: `series_key`,
-`fold`, `cutoff_timestamp`, `model`, `n`, `mae`, `rmse`, `mase`, `smape`,
-`coverage`, `mean_interval_width`, `status`.
-
-### `predict(train_query, apply_query [, options])`
-
-Learns from `train_query` (features plus a `target` column) and predicts the
-target for every row of `apply_query`. Columns: `row_ref`, `prediction`,
-`confidence`, `status`.
-
-The first column of `apply_query` is the row reference: it is echoed back as
-`row_ref` so you can join predictions to your rows, and it is **never a
-feature**. Every column after it is a feature and must match a `train_query`
-feature column **by name**; an apply column with no matching train column is
-an error. So `predict('SELECT f1, f2, label FROM t', 'SELECT id, f1, f2 FROM
-u', '{"target":"label"}')` trains on `f1, f2` and predicts one row per `u`
-row, keyed by `id`.
-
-To serve a distilled student, pass its id as the
-`model` option and `NULL` as `train_query` (the student already learned):
-`predict(NULL, 'SELECT id, f1, f2 FROM t', '{"model":"churn-v1"}')`.
-
-The default in-context model caps training at 100,000 rows and 64 feature
-columns; more raises `PREDICT_ERR_CONTEXT_TOO_LARGE` / `PREDICT_ERR_SCHEMA`.
+The batched serving and in-context path (the former `predict` TVF). With a
+`train_query` it runs the in-context `knn5-incontext` model zero-shot; with
+`NULL` and a `'{"model":…}'` option it serves a registered ONNX model over the
+`apply_query` rows in one batch. The first `apply_query` column is the
+`row_ref`, echoed back and never a feature; the rest are features. Columns:
+`row_ref`, `prediction`, `confidence`, `status`.
 
 ### `distill_predict(train_query [, options])`
 

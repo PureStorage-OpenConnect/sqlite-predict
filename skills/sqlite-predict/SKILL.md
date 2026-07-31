@@ -13,8 +13,11 @@ metadata:
 # Using sqlite-predict
 
 The extension turns prediction into SQL. Load `predict0` (pip/npm/cargo
-package `sqlite-predict`), then call functions over your own rows. Serving
-is pure: no writes, works on read-only databases and inside views.
+package `sqlite-predict`), then call functions over your own rows. Serving is
+pure: `forecast`, `detect_anomalies`, `backtest`, `predict`, and `fit` without
+`register` do not write, so they run on read-only databases and inside views.
+Registering a model (`fit` with `'{"register":"m"}'`, and the distillers)
+persists to `_predict_models` and needs a writable database.
 
 ## Which operation for which question
 
@@ -22,14 +25,17 @@ is pure: no writes, works on read-only databases and inside views.
 | --- | --- |
 | "What will this metric do next?" | `SELECT forecast(ts, value, horizon) FROM t` |
 | "Which points are anomalous?" | `SELECT detect_anomalies(ts, value) FROM t` |
-| "Predict a label/value for these rows" | `SELECT * FROM predict(train_sql, apply_sql, options)` |
-| "How accurate would this be on my data?" | `SELECT * FROM backtest(series_sql, horizon)` |
+| "Train a model on labeled rows" | `SELECT fit(f1, ..., fN, label, '{"register":"m"}') FROM t` |
+| "Predict a label/value per row" | `SELECT predict('m', f1, ..., fN) FROM t` |
+| "How accurate would this be on my data?" | `SELECT backtest(ts, value, horizon) FROM t` |
 | "Make serving instant and self-contained" | `distill_predict` / `distill_forecast` (see the distill-lifecycle skill) |
 
-`forecast` and `detect_anomalies` are aggregates: plain SQL supplies the
-rows, `GROUP BY` splits series, `WHERE` and joins compose, ORMs work
-unchanged. `predict`, `backtest`, and the distillers are table-valued
-functions that take a query string.
+`forecast`, `detect_anomalies`, `backtest`, and `fit` are aggregates:
+plain SQL supplies the rows, `GROUP BY` splits series or segments, `WHERE`
+and joins compose, ORMs work unchanged. `predict` is a scalar, one
+prediction per row, so it drops into any `SELECT` beside your other
+columns. The distillers and `predict_batch` are table-valued functions
+that take a query string.
 
 ## Reading results
 
@@ -39,6 +45,10 @@ Each aggregate group returns one JSON document: `{"model", "status",
 ```sql
 SELECT r.* FROM forecast_rows((SELECT forecast(ts, value, 24) FROM t)) AS r;
 ```
+
+`anomaly_rows(...)` and `backtest_rows(...)` expand anomaly and backtest
+documents the same way. `predict` returns its value directly, no
+expansion.
 
 - `model` reports the model that actually served. With no model named,
   `auto` selects the best available per series and reports the winner's
@@ -74,8 +84,16 @@ problem and often the fix.
   on smooth data; pass `'{"interval_method":"conformal"}'` for
   calibrated coverage (statistical models only) and verify with
   `backtest` (see the interpret-backtest skill).
-- `predict` with `NULL` train_query serves a distilled student; with a
-  train query it runs the in-context `knn5-incontext` model zero-shot.
+- `fit(f1, ..., fN, label)` trains over your rows; the label is the last
+  argument, there is no `target` option. `'{"register":"churn-v1"}'`
+  registers the model and returns its id; otherwise it returns a model
+  blob you can pass to `predict`. Default kind is `gbt`; `'{"kind":"tree"}'`
+  for a single tree.
+- `predict(model, f1, ..., fN)` serves a native student per row; the
+  model is a registered id or a `fit()` blob, and features are positional,
+  so a count mismatch fails loud. Pass `'{"proba":true}'` for a
+  `{"prediction": "1", "confidence": 0.98}` document. For in-context `knn5-incontext`
+  (a train query, no fit step) or ONNX serving, use `predict_batch`.
 
 ## Checking the environment
 

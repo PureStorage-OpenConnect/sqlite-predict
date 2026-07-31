@@ -96,7 +96,7 @@ def test_bare_path_registration_derives_io_spec(db):
     assert spec["output"]["kind"] == "probs"
     assert spec["output"]["labels"] == ["0", "1"]
     rows = db.execute(
-        "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+        "SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM apply',"
         " '{\"model\":\"clf\"}')").fetchall()
     exp = {c["id"]: c for c in cases}
     for rid, pred, *_ in rows:
@@ -113,7 +113,7 @@ def test_bare_path_regressor_derives_value_kind(db):
     db.executemany("INSERT INTO ra VALUES (?,?,?)",
                    [(c["id"], c["f1"], c["f2"]) for c in cases])
     rows = db.execute(
-        "SELECT row_ref, prediction FROM predict(NULL,'SELECT id, f1, f2 FROM"
+        "SELECT row_ref, prediction FROM predict_batch(NULL,'SELECT id, f1, f2 FROM"
         " ra', '{\"model\":\"reg\"}')").fetchall()
     exp = {c["id"]: c["value"] for c in cases}
     for rid, pred in rows:
@@ -139,7 +139,7 @@ def test_incontext_weights_plus_target(db):
     ).fetchone()[0])
     assert spec["layout"] == "in_context" and spec["target"] == "label"
     rows = db.execute(
-        "SELECT row_ref, prediction FROM predict('SELECT f1,f2,label FROM tr',"
+        "SELECT row_ref, prediction FROM predict_batch('SELECT f1,f2,label FROM tr',"
         " 'SELECT id,f1,f2 FROM ap', '{\"model\":\"knn1\"}')").fetchall()
     exp = {c["id"]: c["label"] for c in data["apply"]}
     for rid, pred in rows:
@@ -155,7 +155,7 @@ def test_default_license_is_unspecified_and_runs(db):
     assert lic == "unspecified"
     db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
     db.execute("INSERT INTO a VALUES (0, 0.5, 0.5)")
-    rows = db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+    rows = db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM a',"
                       " '{\"model\":\"clf\"}')").fetchall()
     assert len(rows) == 1
 
@@ -167,7 +167,7 @@ def test_positional_feature_count_mismatch_errors(db):
     db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL, f3 REAL)")
     db.execute("INSERT INTO a VALUES (0, 0.1, 0.2, 0.3)")
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2, f3 FROM a',"
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2, f3 FROM a',"
                    " '{\"model\":\"clf\"}')").fetchall()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
@@ -177,7 +177,7 @@ def test_classifier_matches_reference(db):
     cases = json.load(open(_abs("logreg_cases.json")))
     _load_apply(db, cases)
     rows = db.execute(
-        "SELECT * FROM predict(NULL, 'SELECT id, f1, f2 FROM apply',"
+        "SELECT * FROM predict_batch(NULL, 'SELECT id, f1, f2 FROM apply',"
         " json_object('model','clf'))").fetchall()
     assert len(rows) == len(cases)
     exp = {c["id"]: c for c in cases}
@@ -194,7 +194,7 @@ def test_regressor_matches_reference(db):
     cases = json.load(open(_abs("linreg_cases.json")))
     _load_apply(db, cases)
     rows = db.execute(
-        "SELECT row_ref, prediction, confidence, status FROM predict("
+        "SELECT row_ref, prediction, confidence, status FROM predict_batch("
         "NULL, 'SELECT id, f1, f2 FROM apply', json_object('model','reg'))"
     ).fetchall()
     exp = {c["id"]: c for c in cases}
@@ -209,7 +209,7 @@ def test_incontext_matches_reference(db):
     must match the pure-Python 1-NN reference the fixture was built from."""
     data = _load_incontext(db)
     rows = db.execute(
-        "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+        "SELECT * FROM predict_batch('SELECT f1, f2, label FROM tr',"
         " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
     ).fetchall()
     assert len(rows) == len(data["apply"])
@@ -224,7 +224,7 @@ def test_incontext_requires_train_query(db):
     _load_incontext(db)
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM predict(NULL, 'SELECT id, f1, f2 FROM ap',"
+            "SELECT * FROM predict_batch(NULL, 'SELECT id, f1, f2 FROM ap',"
             " json_object('model','knn1'))").fetchall()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
@@ -233,7 +233,7 @@ def test_incontext_train_missing_target_errors(db):
     _load_incontext(db)
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM predict('SELECT f1, f2 FROM tr',"
+            "SELECT * FROM predict_batch('SELECT f1, f2 FROM tr',"
             " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
         ).fetchall()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
@@ -244,7 +244,7 @@ def test_incontext_unknown_train_label_errors(db):
     db.execute("UPDATE tr SET label = 'purple' WHERE id = 0")
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+            "SELECT * FROM predict_batch('SELECT f1, f2, label FROM tr',"
             " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
         ).fetchall()
     assert "PREDICT_ERR_IO_SPEC" in str(e.value)
@@ -258,7 +258,7 @@ def test_incontext_nonnumeric_train_feature_errors(db):
     db.execute("INSERT INTO ap VALUES (0, 0.5, 0.5)")
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM predict('SELECT f1, f2, label FROM tr',"
+            "SELECT * FROM predict_batch('SELECT f1, f2, label FROM tr',"
             " 'SELECT id, f1, f2 FROM ap', json_object('model','knn1'))"
         ).fetchall()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
@@ -271,7 +271,7 @@ def test_incontext_nonnumeric_query_row_flagged(db):
     db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 ANY)")
     db.execute("INSERT INTO ap VALUES (0, 1.0, 1.0), (1, 0.0, 'oops')")
     rows = {r[0]: r for r in db.execute(
-        "SELECT row_ref, prediction, status FROM predict("
+        "SELECT row_ref, prediction, status FROM predict_batch("
         " 'SELECT f1, f2, label FROM tr', 'SELECT id, f1, f2 FROM ap',"
         " json_object('model','knn1'))").fetchall()}
     assert rows[0][2] == "ok"
@@ -288,7 +288,7 @@ def test_incontext_batch_boundary(db):
     pts = [(i, (i % 9) - 4.0, ((i * 3) % 7) - 3.0) for i in range(n)]
     db.executemany("INSERT INTO bigq VALUES (?,?,?)", pts)
     rows = db.execute(
-        "SELECT row_ref, prediction FROM predict("
+        "SELECT row_ref, prediction FROM predict_batch("
         " 'SELECT f1, f2, label FROM tr', 'SELECT id, f1, f2 FROM bigq"
         " ORDER BY id', json_object('model','knn1'))").fetchall()
     assert len(rows) == n
@@ -315,7 +315,7 @@ def test_batch_boundary_many_rows(db):
         "INSERT INTO big VALUES (?,?,?)",
         [(i, (i % 7) - 3.0, (i % 5) - 2.0) for i in range(n)])
     rows = db.execute(
-        "SELECT row_ref, prediction FROM predict(NULL,"
+        "SELECT row_ref, prediction FROM predict_batch(NULL,"
         " 'SELECT id, f1, f2 FROM big ORDER BY id',"
         " json_object('model','clf'))").fetchall()
     assert len(rows) == n
@@ -331,7 +331,7 @@ def test_non_numeric_feature_is_flagged_not_fed(db):
     db.execute("CREATE TABLE mixed(id INTEGER, f1 REAL, f2 ANY)")
     db.execute("INSERT INTO mixed VALUES (1, 0.5, 0.5), (2, 0.5, 'oops')")
     rows = {r[0]: r for r in db.execute(
-        "SELECT row_ref, prediction, status FROM predict(NULL,"
+        "SELECT row_ref, prediction, status FROM predict_batch(NULL,"
         " 'SELECT id, f1, f2 FROM mixed',"
         " json_object('model','clf'))").fetchall()}
     assert rows[1][2] == "ok"
@@ -344,12 +344,12 @@ def test_license_gate_blocks_then_accepts(db):
     _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+            "SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM apply',"
             " json_object('model','nc'))").fetchall()
     assert "PREDICT_ERR_LICENSE" in str(e.value)
     # naming the license unlocks it
     rows = db.execute(
-        "SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+        "SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM apply',"
         " json_object('model','nc','accept_license','CC-BY-NC-4.0'))"
     ).fetchall()
     assert len(rows) == 24
@@ -360,12 +360,12 @@ def test_unknown_device_and_gpu_fail_loud(db):
     _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
     # a bogus device name
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM apply',"
                    " json_object('model','clf','device','banana'))").fetchall()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
     # cuda is real but not in this CPU build: no silent fallback
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM apply',"
                    " json_object('model','clf','device','cuda'))").fetchall()
     assert "PREDICT_ERR_RUNTIME_UNAVAILABLE" in str(e.value)
 
@@ -374,7 +374,7 @@ def test_unsupported_precision_fails_loud(db):
     _register(db, "clf", "logreg.onnx", CLF_IO)
     _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM apply',"
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM apply',"
                    " json_object('model','clf','precision','fp16'))").fetchall()
     assert "PREDICT_ERR_RUNTIME_UNAVAILABLE" in str(e.value)
 
@@ -384,7 +384,7 @@ def test_feature_mismatch_errors(db):
     db.execute("CREATE TABLE w(id INTEGER, f1 REAL, f9 REAL)")
     db.execute("INSERT INTO w VALUES (1, 0.1, 0.2)")
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f9 FROM w',"
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f9 FROM w',"
                    " json_object('model','clf'))").fetchall()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
@@ -394,7 +394,7 @@ def test_wrong_feature_count_errors(db):
     db.execute("CREATE TABLE w(id INTEGER, f1 REAL)")
     db.execute("INSERT INTO w VALUES (1, 0.1)")
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1 FROM w',"
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1 FROM w',"
                    " json_object('model','clf'))").fetchall()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
@@ -402,7 +402,7 @@ def test_wrong_feature_count_errors(db):
 def test_unknown_model_errors(db):
     db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
     with pytest.raises(sqlite3.OperationalError) as e:
-        db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM a',"
                    " json_object('model','ghost'))").fetchall()
     assert "PREDICT_ERR_MODEL_NOT_FOUND" in str(e.value)
 
@@ -415,7 +415,7 @@ def test_onnx_options_rejected_on_stat_model(db):
     syt.load_tabular(db, X, y)
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM predict('SELECT f1, f2, label FROM tab WHERE id<100',"
+            "SELECT * FROM predict_batch('SELECT f1, f2, label FROM tab WHERE id<100',"
             " 'SELECT id, f1, f2 FROM tab WHERE id>=100',"
             " json_object('target','label','device','cpu'))").fetchall()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
@@ -428,7 +428,7 @@ def test_no_memory_growth_over_many_calls(db):
     import resource
     _register(db, "clf", "logreg.onnx", CLF_IO)
     _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
-    q = ("SELECT * FROM predict(NULL, 'SELECT id, f1, f2 FROM apply',"
+    q = ("SELECT * FROM predict_batch(NULL, 'SELECT id, f1, f2 FROM apply',"
          " json_object('model','clf'))")
 
     def batch(n):
@@ -448,7 +448,7 @@ def test_session_cache_reuse_is_fast(db):
     predictions (a coarse check that caching doesn't corrupt state)."""
     _register(db, "clf", "logreg.onnx", CLF_IO)
     _load_apply(db, json.load(open(_abs("logreg_cases.json"))))
-    q = ("SELECT row_ref, prediction FROM predict(NULL,"
+    q = ("SELECT row_ref, prediction FROM predict_batch(NULL,"
          " 'SELECT id, f1, f2 FROM apply', json_object('model','clf'))")
     first = db.execute(q).fetchall()
     second = db.execute(q).fetchall()

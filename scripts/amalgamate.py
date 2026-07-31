@@ -23,15 +23,15 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "dist", "sqlite-p
 # fixed order: public header, sha256 header, internal headers, then sources.
 # vendor/sha256 first among sources so its definitions precede any use.
 HEADERS = ["sqlite-predict.h", "vendor/sha256.h", "predict-internal.h",
-           "predict-student.h"]
+           "predict-student.h", "predict-train.h"]
 SOURCES = ["vendor/sha256.c", "sqlite-predict.c", "predict-forecast.c",
            "predict-registry.c", "predict-tabular.c", "predict-student.c",
-           "predict-distill.c"]
+           "predict-train.c", "predict-distill.c"]
 
 # internal includes to drop (their contents are inlined above)
 INTERNAL = re.compile(
     r'^\s*#\s*include\s*"(sqlite-predict\.h|sha256\.h|predict-internal\.h|'
-    r'predict-student\.h)"\s*$')
+    r'predict-student\.h|predict-train\.h)"\s*$')
 
 
 def strip_internal_includes(text):

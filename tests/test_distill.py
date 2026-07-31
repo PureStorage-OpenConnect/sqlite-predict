@@ -5,6 +5,8 @@ teacher's predictions, evaluates on a holdout, and registers the tree as an
 inline-BLOB student that runs in the zero-dependency core.
 """
 
+import hashlib
+import json
 import sqlite3
 
 import pytest
@@ -14,6 +16,21 @@ import synthetic_tabular as syt
 def _train_table(db, n=240, seed=3):
     X, y, _ = syt.two_moons(n=n, seed=seed)
     syt.load_tabular(db, X, y)  # table tab(id, f1, f2, label)
+
+
+def _write_bad_row(db, blob, content_hash=None):
+    """Write a raw student row into _predict_models as model 'bad'. The registry
+    content-addresses inline weights: it verifies content_hash BEFORE the
+    bounds-checked deserializer runs. content_hash defaults to the real sha256 of
+    the blob so that gate passes and the deserializer is what must reject the
+    malformed blob; pass a wrong hash to test the content-address check itself."""
+    if content_hash is None:
+        content_hash = hashlib.sha256(blob).hexdigest()
+    db.execute("DELETE FROM _predict_models WHERE model_id='bad'")
+    db.execute(
+        "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
+        " content_hash, license) VALUES ('bad','student','tree',?,?,"
+        "'unspecified')", (blob, content_hash))
 
 
 def test_distill_produces_a_student(db):
@@ -40,7 +57,7 @@ def test_student_predicts(db):
                " json_object('target','label','student_id','s1'))").fetchone()
     # the student runs with no train_query
     rows = db.execute(
-        "SELECT row_ref, prediction, confidence, status FROM predict(NULL,"
+        "SELECT row_ref, prediction, confidence, status FROM predict_batch(NULL,"
         " 'SELECT id, f1, f2 FROM tab', json_object('model','s1'))").fetchall()
     assert len(rows) == 240
     labels = {str(r[0]) for r in db.execute("SELECT DISTINCT label FROM tab")}
@@ -54,8 +71,9 @@ def test_student_is_deterministic(db):
     _train_table(db)
     db.execute("SELECT * FROM distill_predict('SELECT f1, f2, label FROM tab',"
                " json_object('target','label','student_id','s1'))").fetchone()
-    q = ("SELECT row_ref, prediction FROM predict(NULL,"
-         " 'SELECT id, f1, f2 FROM tab', json_object('model','s1'))")
+    q = ("SELECT row_ref, prediction FROM predict_batch(NULL,"
+         " 'SELECT id, f1, f2 FROM tab', json_object('model','s1'))"
+         " ORDER BY row_ref")  # compare a defined order, not the planner's
     assert db.execute(q).fetchall() == db.execute(q).fetchall()
 
 
@@ -98,7 +116,7 @@ def test_regress_distill(db):
                       ).fetchone()[0]
     assert kind == "tree"
     out = db.execute(
-        "SELECT prediction, status FROM predict(NULL,'SELECT id, f1, f2 FROM r',"
+        "SELECT prediction, status FROM predict_batch(NULL,'SELECT id, f1, f2 FROM r',"
         " json_object('model','rs'))").fetchall()
     assert all(s == "ok" and float(p) == float(p) for p, s in out)
 
@@ -117,6 +135,62 @@ def test_missing_student_id_errors(db):
         db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
                    " json_object('target','label'))").fetchone()
     assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
+def test_distill_rejects_too_many_classes(db):
+    """distill_predict must cap the class vocabulary at PREDICT0_MAX_CLASS (2048)
+    before fitting, the same limit the deserializer enforces on load, so it
+    never registers a student that cannot be reloaded."""
+    db.execute("CREATE TABLE many(f1 real, f2 real, c integer)")
+    db.execute(
+        "INSERT INTO many(f1, f2, c)"
+        " WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM s WHERE i < 2048)"
+        " SELECT i * 1.0, i * 2.0, i FROM s")  # 2049 distinct classes
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT model_id FROM distill_predict('SELECT f1, f2, c FROM many',"
+            " json_object('target','c','task','classify','student_id','big'))"
+        ).fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+    # a rejected fit must leave no partial registration behind
+    assert db.execute("SELECT COUNT(*) FROM _predict_models"
+                      " WHERE model_id='big'").fetchone()[0] == 0
+
+
+def test_distill_accepts_exactly_max_classes(db):
+    """Exactly PREDICT0_MAX_CLASS (2048) distinct classes must distill and
+    register, so an off-by-one in the cap (>= vs >) that rejected 2048 is caught.
+    A tree student keeps a 2048-way classifier cheap."""
+    db.execute("CREATE TABLE max2048(f1 real, f2 real, c integer)")
+    db.execute(
+        "INSERT INTO max2048(f1, f2, c)"
+        " WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM s WHERE i < 2047)"
+        " SELECT i * 1.0, i * 0.5, i FROM s")  # exactly 2048 distinct classes
+    mid = db.execute(
+        "SELECT model_id FROM distill_predict('SELECT f1, f2, c FROM max2048',"
+        " json_object('target','c','task','classify','student_kind','tree',"
+        "'student_id','ok2048'))").fetchone()[0]
+    assert mid == "ok2048"
+
+
+def test_distill_rejects_too_many_soft_classes(db):
+    """The soft-label path caps the class vocabulary at PREDICT0_MAX_CLASS too.
+    proba and classes are the SAME oversized length (2049), so the only reason to
+    fail is the vocabulary cap, not a proba/classes length mismatch: the array is
+    rejected while parsing the options (PREDICT_ERR_SCHEMA), before any column
+    validation, and registers no partial student."""
+    _soft_table(db)
+    over = 2049
+    opts = json.dumps({"target": "label",
+                       "proba": [f"p{i}" for i in range(over)],
+                       "classes": [str(i) for i in range(over)],
+                       "student_kind": "mlp", "student_id": "bigsoft"})
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT model_id FROM distill_predict("
+                   "'SELECT f1,f2,pA,pB,pC,label FROM st', ?)", (opts,)).fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+    assert db.execute("SELECT COUNT(*) FROM _predict_models"
+                      " WHERE model_id='bigsoft'").fetchone()[0] == 0
 
 
 def test_bad_task_errors(db):
@@ -141,7 +215,7 @@ def test_mlp_student(db):
                      " model_id='m'").fetchone()
     assert row[0] == "tree" and row[1] > 0  # inline student runtime
     labels = {str(x[0]) for x in db.execute("SELECT DISTINCT label FROM tab")}
-    q = ("SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM"
+    q = ("SELECT row_ref, prediction FROM predict_batch(NULL,'SELECT id,f1,f2 FROM"
          " tab', json_object('model','m'))")
     rows = db.execute(q).fetchall()
     assert len(rows) == 240 and {p for _, p in rows} <= labels
@@ -176,15 +250,11 @@ def test_corrupt_mlp_blob_rejected(db):
     db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
     db.execute("INSERT INTO a VALUES (0, 0.1, 0.2)")
     for blob in (b"PSMLP01\x00" + b"\xff" * 40, b"PSMLP01\x00" + b"\x00" * 20):
-        db.execute("DELETE FROM _predict_models WHERE model_id='bad'")
-        db.execute(
-            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
-            " content_hash, license) VALUES ('bad','student','tree',?,'x',"
-            "'unspecified')", (blob,))
+        _write_bad_row(db, blob)  # correct hash: the deserializer must reject it
         with pytest.raises(sqlite3.OperationalError) as e:
-            db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+            db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM a',"
                        " json_object('model','bad'))").fetchall()
-        assert "PREDICT_ERR" in str(e.value)
+        assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
 
 def test_too_few_rows_errors(db):
@@ -237,7 +307,7 @@ def test_gbt_student_predicts(db):
     assert runtime == "tree" and blob > 0
     db.execute("CREATE TABLE ap(id INTEGER, f1 REAL, f2 REAL)")
     db.execute("INSERT INTO ap VALUES (0,0.5,0.5),(1,-1.0,-1.0),(2,-1.0,1.0)")
-    q = ("SELECT row_ref, prediction, confidence, status FROM predict(NULL,"
+    q = ("SELECT row_ref, prediction, confidence, status FROM predict_batch(NULL,"
          " 'SELECT id,f1,f2 FROM ap', json_object('model','g'))")
     r1 = db.execute(q).fetchall()
     assert all(s == "ok" and p in ("0", "1", "2") and 0 <= c <= 1
@@ -257,7 +327,7 @@ def test_gbt_regression(db):
         "'student_kind','gbt'))").fetchone()[0]
     assert m >= 0
     out = db.execute(
-        "SELECT prediction, status FROM predict(NULL,'SELECT id,f1,f2 FROM r',"
+        "SELECT prediction, status FROM predict_batch(NULL,'SELECT id,f1,f2 FROM r',"
         " json_object('model','rg'))").fetchall()
     assert all(s == "ok" and float(p) == float(p) for p, s in out)
 
@@ -270,15 +340,11 @@ def test_corrupt_gbt_blob_rejected(db):
     db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
     db.execute("INSERT INTO a VALUES (0, 0.1, 0.2)")
     for blob in (b"PSGBT01\x00" + b"\xff" * 40, b"PSGBT01\x00" + b"\x00" * 20):
-        db.execute("DELETE FROM _predict_models WHERE model_id='bad'")
-        db.execute(
-            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
-            " content_hash, license) VALUES ('bad','student','tree',?,'x',"
-            "'unspecified')", (blob,))
+        _write_bad_row(db, blob)  # correct hash: the deserializer must reject it
         with pytest.raises(sqlite3.OperationalError) as e:
-            db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+            db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM a',"
                        " json_object('model','bad'))").fetchall()
-        assert "PREDICT_ERR" in str(e.value)
+        assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
 
 def test_default_trains_on_target_column(db):
@@ -293,7 +359,7 @@ def test_default_trains_on_target_column(db):
         "'student_kind','gbt'))").fetchone()[0]
     assert 0.7 <= metric <= 1.0  # learnable boundary, trained on the labels
     rows = db.execute(
-        "SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM"
+        "SELECT row_ref, prediction FROM predict_batch(NULL,'SELECT id,f1,f2 FROM"
         " tab', json_object('model','s'))").fetchall()
     assert len(rows) == 240
 
@@ -312,13 +378,13 @@ def test_default_learns_target_not_a_live_teacher(db):
         " json_object('target','teach','student_id','s',"
         "'student_kind','gbt'))").fetchone()
     preds = {r[0] for r in db.execute(
-        "SELECT DISTINCT prediction FROM predict(NULL,'SELECT id,f1,f2 FROM p',"
+        "SELECT DISTINCT prediction FROM predict_batch(NULL,'SELECT id,f1,f2 FROM p',"
         " json_object('model','s'))")}
     assert preds and preds <= {"ALPHA", "OMEGA"}
 
 
 def test_named_teacher_relabels_via_model(db):
-    """An explicit teacher names a registered predict() model, which distill
+    """An explicit teacher names a registered predict_batch() model, which distill
     re-runs over the rows to relabel them before fitting the student -- e.g.
     compressing the in-context knn5 into a standalone tree."""
     _train_table(db)
@@ -329,8 +395,9 @@ def test_named_teacher_relabels_via_model(db):
     assert 0.5 <= metric <= 1.0
     labels = {str(x[0]) for x in db.execute("SELECT DISTINCT label FROM tab")}
     preds = {x[0] for x in db.execute(
-        "SELECT DISTINCT prediction FROM predict(NULL,'SELECT id,f1,f2 FROM tab',"
+        "SELECT DISTINCT prediction FROM predict_batch(NULL,'SELECT id,f1,f2 FROM tab',"
         " json_object('model','s'))")}
+    assert preds  # non-empty: an empty set trivially satisfies the subset check
     assert preds <= labels
 
 
@@ -371,7 +438,7 @@ def test_soft_distillation_produces(db):
                      " WHERE model_id='s'").fetchone()
     assert row[0] == "tree" and row[1] > 0
     out = db.execute(
-        "SELECT row_ref, prediction FROM predict(NULL,'SELECT id,f1,f2 FROM st',"
+        "SELECT row_ref, prediction FROM predict_batch(NULL,'SELECT id,f1,f2 FROM st',"
         " json_object('model','s'))").fetchall()
     assert len(out) == 360 and {p for _, p in out} <= {"A", "B", "C"}
 
@@ -427,15 +494,34 @@ def test_corrupt_student_blob_errors_not_crashes(db):
                " json_object('target','label','student_id','good'))").fetchone()
     for blob in (b"", b"garbage", b"PSTREE01" + b"\xff" * 40,
                  b"PSTREE01" + b"\x00" * 4):
-        db.execute("DELETE FROM _predict_models WHERE model_id='bad'")
-        db.execute(
-            "INSERT INTO _predict_models (model_id, kind, runtime, weights,"
-            " content_hash, license) VALUES ('bad','student','tree',?,"
-            " 'x','unspecified')", (blob,))
+        _write_bad_row(db, blob)  # correct hash: the deserializer must reject it
         with pytest.raises(sqlite3.OperationalError) as e:
-            db.execute("SELECT * FROM predict(NULL,'SELECT id, f1, f2 FROM a',"
+            db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM a',"
                        " json_object('model','bad'))").fetchall()
-        assert "PREDICT_ERR" in str(e.value)
+        assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
+def test_corrupt_student_blob_hash_mismatch_rejected(db):
+    """The other gate: a row whose inline weights do NOT match its content_hash
+    is rejected at the content-address check (PREDICT_ERR_MODEL_HASH), before the
+    deserializer runs. A well-formed student blob under a wrong hash proves the
+    check fires on content integrity, not on malformed structure."""
+    db.execute("CREATE TABLE a(id INTEGER, f1 REAL, f2 REAL)")
+    db.execute("INSERT INTO a VALUES (0, 0.1, 0.2)")
+    _train_table(db)
+    db.execute("SELECT * FROM distill_predict('SELECT f1,f2,label FROM tab',"
+               " json_object('target','label','student_id','good'))").fetchone()
+    good_blob = db.execute("SELECT weights FROM _predict_models WHERE"
+                           " model_id='good'").fetchone()[0]
+    # a valid blob under a well-formed but wrong content_hash (flip one hex nibble
+    # of the real digest), so the check fails on content, not on hash format/length
+    actual = hashlib.sha256(good_blob).hexdigest()
+    wrong_hash = ("0" if actual[0] != "0" else "1") + actual[1:]
+    _write_bad_row(db, good_blob, content_hash=wrong_hash)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT * FROM predict_batch(NULL,'SELECT id, f1, f2 FROM a',"
+                   " json_object('model','bad'))").fetchall()
+    assert "PREDICT_ERR_MODEL_HASH" in str(e.value)
 
 
 def test_student_rejects_train_query(db):
@@ -446,7 +532,8 @@ def test_student_rejects_train_query(db):
                    [(i * 0.3, (i * 7) % 5, "c%d" % (i % 2)) for i in range(60)])
     db.execute("SELECT * FROM distill_predict('SELECT f1, f2, label FROM tt',"
                " '{\"target\":\"label\",\"student_id\":\"guard-s\"}')").fetchone()
-    with pytest.raises(sqlite3.OperationalError, match="no train_query"):
-        db.execute("SELECT * FROM predict('SELECT f1, f2, label FROM tt',"
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT * FROM predict_batch('SELECT f1, f2, label FROM tt',"
                    " 'SELECT rowid, f1, f2 FROM tt',"
                    " '{\"model\":\"guard-s\"}')").fetchall()
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)

@@ -18,7 +18,7 @@ def test_too_many_features_errors_loudly(db):
         db.execute("INSERT INTO t SELECT * FROM t LIMIT 1")
     with pytest.raises(sqlite3.OperationalError) as e:
         db.execute(
-            "SELECT * FROM predict(?, ?, '{\"target\":\"label\"}')",
+            "SELECT * FROM predict_batch(?, ?, '{\"target\":\"label\"}')",
             ("SELECT * FROM t", "SELECT 1, * FROM t"),
         ).fetchall()
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
@@ -26,21 +26,19 @@ def test_too_many_features_errors_loudly(db):
 
 
 def test_long_group_keys_stay_distinct(db):
-    """Audit bug 2: >512-byte keys truncated and silently merged. The
-    key builder lives in collect_series, now exercised via backtest."""
+    """>512-byte group keys must not be merged. Grouping is plain SQL
+    GROUP BY over the backtest aggregate now, so long keys stay distinct."""
     prefix = "x" * 600
     a, _ = syn.trend_season(n=60, level=10.0, seed=61)
     b, _ = syn.trend_season(n=60, level=90.0, seed=62)
     syn.load_into(db, a, group=prefix + "A")
     syn.load_into(db, b, group=prefix + "B")
     out = db.execute(
-        "SELECT * FROM backtest(?, 3, ?)",
-        ("SELECT ts, value, grp FROM series", '{"group_cols":["grp"]}'),
+        "SELECT g.grp FROM (SELECT grp, backtest(ts, value, 3) AS d"
+        " FROM series GROUP BY grp) g, backtest_rows(g.d) r GROUP BY g.grp"
     ).fetchall()
     keys = {r[0] for r in out}
     assert len(keys) == 2, "long keys were merged"
-    for k in keys:
-        assert sum(1 for r in out if r[0] == k) >= 1
 
 
 def test_epoch_milliseconds_not_mangled(db):
@@ -139,7 +137,7 @@ def test_no_memory_growth_over_many_calls(db):
             db.execute(
                 "SELECT detect_anomalies(ts, value) FROM series").fetchall()
             db.execute(
-                "SELECT * FROM predict(?, ?, ?)",
+                "SELECT * FROM predict_batch(?, ?, ?)",
                 ("SELECT f1, f2, label FROM tab WHERE id < 100",
                  "SELECT id, f1, f2 FROM tab WHERE id >= 100",
                  '{"target":"label"}')).fetchall()
@@ -175,6 +173,6 @@ def test_duplicate_option_keys_no_leak_predict(db):
     syt.load_tabular(db, X, y)
     dup = '{"target":"label","task":"classify","task":"classify"}'
     out = db.execute(
-        "SELECT * FROM predict('SELECT f1, f2, label FROM tab WHERE id<100',"
+        "SELECT * FROM predict_batch('SELECT f1, f2, label FROM tab WHERE id<100',"
         " 'SELECT id, f1, f2 FROM tab WHERE id>=100', ?)", (dup,)).fetchall()
     assert len(out) >= 1

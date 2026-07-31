@@ -37,7 +37,7 @@ prefix?=dist
 
 TARGET_LOADABLE=$(prefix)/predict0.$(LOADABLE_EXTENSION)
 
-OBJS=sqlite-predict.c predict-forecast.c predict-registry.c predict-tabular.c predict-student.c predict-distill.c vendor/sha256.c
+OBJS=sqlite-predict.c predict-forecast.c predict-registry.c predict-tabular.c predict-student.c predict-train.c predict-distill.c vendor/sha256.c
 ONNX_OBJS=$(OBJS) predict-onnx.c
 
 # onnxruntime is a build+runtime dependency of the loadable-onnx variant

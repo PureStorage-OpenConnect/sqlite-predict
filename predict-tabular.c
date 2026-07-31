@@ -8,6 +8,7 @@
  * and the opt-in ONNX build; the benchmarks showed raw in-context FMs
  * are teachers, not serving paths (30s+/call on CPU). */
 #include "predict-internal.h"
+#include "predict-train.h"
 
 #ifndef SQLITE_CORE
 SQLITE_EXTENSION_INIT3
@@ -16,6 +17,16 @@ SQLITE_EXTENSION_INIT3
 #define TAB_MAX_TRAIN 100000 /* knn5-incontext declared context capacity */
 #define TAB_MAX_FEAT PREDICT_MAX_FEAT
 #define TAB_K 5
+
+/* Compile-time guarantee (the codebase builds -std=c99, so no _Static_assert):
+ * every fixed feature buffer here is sized to TAB_MAX_FEAT, and predict() fills
+ * one with a loaded student's features. The student loader caps a student's
+ * nfeat at TREE_MAX_FEAT (predict-student.h), so TAB_MAX_FEAT MUST be at least
+ * that or a loaded student would overflow these buffers. Both currently alias
+ * PREDICT_MAX_FEAT; if they ever diverge this array size goes negative and the
+ * build fails here, instead of overflowing at runtime. */
+typedef char predict0_assert_tab_buf_holds_max_student
+    [(TREE_MAX_FEAT <= TAB_MAX_FEAT) ? 1 : -1];
 
 #define PR_COL_REF 0
 #define PR_COL_PRED 1
@@ -185,7 +196,7 @@ static int pr_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *pIdx) {
   }
   if (!seen_train || !seen_apply) {
     pVtab->zErrMsg = sqlite3_mprintf(
-        "%s: predict(train_query, apply_query) requires both arguments",
+        "%s: predict_batch(train_query, apply_query) requires both arguments",
         PREDICT_ERR_SCHEMA);
     return SQLITE_ERROR;
   }
@@ -642,9 +653,15 @@ static int pr_filter(sqlite3_vtab_cursor *pCur, int idxNum,
       out->ref.i = sqlite3_column_int64(as, 0);
     else if (out->ref.type == SQLITE_FLOAT)
       out->ref.f = sqlite3_column_double(as, 0);
-    else if (out->ref.type != SQLITE_NULL)
+    else if (out->ref.type != SQLITE_NULL) {
       out->ref.t =
           sqlite3_mprintf("%s", (const char *)sqlite3_column_text(as, 0));
+      if (!out->ref.t) {
+        sqlite3_finalize(as);
+        rc = SQLITE_NOMEM;
+        goto fail_train;
+      }
+    }
 
     f64 q[TAB_MAX_FEAT];
     int row_bad = 0;
@@ -836,6 +853,566 @@ static sqlite3_module predictModule = {
     /* xShadowName */ NULL,
     /* xIntegrity  */ NULL};
 
+/* ======================================================================
+ * fit() aggregate + predict() scalar: the guessable tabular pair.
+ * fit(f1, ..., fN, label [, options]) trains a native student over the rows of
+ * the statement (label is the last positional argument, no target option) and
+ * returns the plain registered id text when options request registration
+ * ({"register":"my-id"}), otherwise its serialized model blob. The optional
+ * trailing options is a TEXT JSON object; a trailing '{...}' is therefore always
+ * read as options, so a class label must not itself be a JSON-object string.
+ * predict(model, f1, ..., fN [, options]) serves that student per row, features
+ * positional, deserialized once and cached on the model argument.
+ * ====================================================================== */
+
+/* ---- fit() aggregate ---- */
+
+typedef struct {
+  char *kind; /* 'gbt' (default) | 'tree' */
+  char *task; /* 'classify' (default) | 'regress' */
+  char *reg;  /* register name, or NULL to return the blob */
+} FitOpts;
+
+static void fit_opts_free(FitOpts *o) {
+  sqlite3_free(o->kind);
+  sqlite3_free(o->task);
+  sqlite3_free(o->reg);
+}
+
+static int fit_opt_cb(void *ctx, const char *key, sqlite3_value *value,
+                      char **errmsg) {
+  FitOpts *o = ctx;
+  if (sqlite3_value_type(value) != SQLITE_TEXT) {
+    *errmsg = sqlite3_mprintf("%s: wrong type for option '%s'",
+                              PREDICT_ERR_OPTIONS, key);
+    return 1;
+  }
+  char **slot = (strcmp(key, "kind") == 0 || strcmp(key, "student_kind") == 0)
+                    ? &o->kind
+                : strcmp(key, "task") == 0     ? &o->task
+                : strcmp(key, "register") == 0 ? &o->reg
+                                               : NULL;
+  if (slot) {
+    char *copy = sqlite3_mprintf("%s", (const char *)sqlite3_value_text(value));
+    if (!copy) {
+      *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+      return 1;
+    }
+    sqlite3_free(*slot); /* free-before-assign: duplicate JSON key */
+    *slot = copy;
+  }
+  return 0;
+}
+
+static const char *const FIT_OPTION_KEYS[] = {"kind", "student_kind", "task",
+                                              "register", NULL};
+
+/* Per-aggregate accumulator. Lives in sqlite3_aggregate_context (SQLite owns
+ * the block); fit_ctx_free releases the pointers it holds. */
+typedef struct {
+  int configured;
+  int has_opts;
+  char *opts_raw; /* trailing options text of the first row (owned), or NULL */
+  int nfeat;
+  int classify;
+  char *kind;   /* borrowed by predict0_train_student; owned here */
+  char *reg_id; /* register name, or NULL */
+  f32 *X;       /* row-major [cap, nfeat] */
+  char **ylab;  /* [cap] classify labels */
+  f64 *yval;    /* [cap] regress values */
+  int n, cap;
+  int err;      /* SQLITE_ code, reported in fit_final */
+  char *errmsg;
+} FitCtx;
+
+static void fit_ctx_free(FitCtx *c) {
+  if (!c)
+    return;
+  sqlite3_free(c->X);
+  if (c->ylab) {
+    for (int i = 0; i < c->n; i++)
+      sqlite3_free(c->ylab[i]);
+    sqlite3_free(c->ylab);
+  }
+  sqlite3_free(c->yval);
+  sqlite3_free(c->kind);
+  sqlite3_free(c->reg_id);
+  sqlite3_free(c->opts_raw);
+  sqlite3_free(c->errmsg);
+  memset(c, 0, sizeof(*c));
+}
+
+static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  FitCtx *c = sqlite3_aggregate_context(ctx, sizeof(FitCtx));
+  if (!c) {
+    /* NULL means the context allocation failed; SQLite prescribes signalling
+     * NOMEM here rather than deferring to a misleading no-rows message. */
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+  if (c->err)
+    return;
+  /* Determine this row's trailing options: the last argument when it is TEXT
+   * beginning with '{'. Presence and content must be constant across the group,
+   * or the feature/label split and the model config would depend on the order
+   * SQLite happens to visit rows in. Consequence of this convention: the trailing
+   * '{...}' is ALWAYS the options object, so a class label must not be a JSON
+   * object string (it would be consumed as options). A malformed options object
+   * fails loudly at predict0_options_parse; the only quiet case is a label that
+   * is itself a well-formed, valid-key options object, which is why the label
+   * contract is documented rather than guessed. */
+  int has_opts = 0;
+  const char *opts_txt = NULL;
+  if (argc >= 3 && sqlite3_value_type(argv[argc - 1]) == SQLITE_TEXT) {
+    const char *t = (const char *)sqlite3_value_text(argv[argc - 1]);
+    if (t && t[0] == '{') {
+      has_opts = 1;
+      opts_txt = t;
+    }
+  }
+
+  if (!c->configured) {
+    int nfeat = argc - 1 - has_opts;
+    if (nfeat < 1) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: fit(feature, ..., label [, options])"
+                                  " needs at least one feature and a label",
+                                  PREDICT_ERR_SCHEMA);
+      return;
+    }
+    if (nfeat > TAB_MAX_FEAT) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: too many feature columns (max %d)",
+                                  PREDICT_ERR_SCHEMA, TAB_MAX_FEAT);
+      return;
+    }
+    FitOpts o;
+    memset(&o, 0, sizeof(o));
+    if (has_opts) {
+      char *emsg = NULL;
+      if (predict0_options_parse(sqlite3_context_db_handle(ctx), opts_txt,
+                                 FIT_OPTION_KEYS, fit_opt_cb, &o, &emsg)) {
+        c->err = SQLITE_ERROR;
+        c->errmsg = emsg;
+        fit_opts_free(&o);
+        return;
+      }
+    }
+    int classify = 1;
+    if (o.task) {
+      if (strcmp(o.task, "regress") == 0)
+        classify = 0;
+      else if (strcmp(o.task, "classify") != 0) {
+        c->err = SQLITE_ERROR;
+        c->errmsg = sqlite3_mprintf("%s: task must be classify|regress: %s",
+                                    PREDICT_ERR_TASK, o.task);
+        fit_opts_free(&o);
+        return;
+      }
+    }
+    c->nfeat = nfeat;
+    c->classify = classify;
+    c->kind = o.kind; /* transfer ownership */
+    o.kind = NULL;
+    c->reg_id = o.reg;
+    o.reg = NULL;
+    fit_opts_free(&o);
+    c->has_opts = has_opts;
+    if (has_opts) {
+      c->opts_raw = sqlite3_mprintf("%s", opts_txt);
+      if (!c->opts_raw) {
+        c->err = SQLITE_NOMEM;
+        return;
+      }
+    }
+    c->configured = 1;
+  } else if (has_opts != c->has_opts ||
+             (has_opts && (!c->opts_raw || strcmp(opts_txt, c->opts_raw) != 0))) {
+    c->err = SQLITE_ERROR;
+    c->errmsg = sqlite3_mprintf("%s: options must be constant within a group",
+                                PREDICT_ERR_OPTIONS);
+    return;
+  }
+
+  if (c->n == c->cap) {
+    /* Bound the training set: fit() buffers the whole matrix in memory, and an
+     * uncapped c->cap*2 (int) goes negative past INT_MAX/2, making the byte size
+     * a huge size_t (UB). Cap at TAB_MAX_TRAIN and fail loudly instead. */
+    if (c->n >= TAB_MAX_TRAIN) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: fit training set exceeds %d rows",
+                                  PREDICT_ERR_CONTEXT_TOO_LARGE, TAB_MAX_TRAIN);
+      return;
+    }
+    int nc = c->cap ? c->cap * 2 : 256;
+    if (nc > TAB_MAX_TRAIN)
+      nc = TAB_MAX_TRAIN;
+    f32 *gx = sqlite3_realloc(c->X, sizeof(f32) * (size_t)nc * c->nfeat);
+    if (!gx) {
+      c->err = SQLITE_NOMEM;
+      return;
+    }
+    c->X = gx;
+    if (c->classify) {
+      char **g = sqlite3_realloc(c->ylab, sizeof(char *) * nc);
+      if (!g) {
+        c->err = SQLITE_NOMEM;
+        return;
+      }
+      c->ylab = g;
+    } else {
+      f64 *g = sqlite3_realloc(c->yval, sizeof(f64) * nc);
+      if (!g) {
+        c->err = SQLITE_NOMEM;
+        return;
+      }
+      c->yval = g;
+    }
+    c->cap = nc;
+  }
+  f32 *row = &c->X[(size_t)c->n * c->nfeat];
+  for (int i = 0; i < c->nfeat; i++) {
+    int t = sqlite3_value_type(argv[i]);
+    if (t != SQLITE_INTEGER && t != SQLITE_FLOAT) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: fit feature %d must be numeric",
+                                  PREDICT_ERR_SCHEMA, i + 1);
+      return;
+    }
+    f64 fv = sqlite3_value_double(argv[i]);
+    if (!isfinite(fv)) { /* 1e999 -> +Inf as SQLITE_FLOAT; NaN poisons splits */
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: fit feature %d must be finite",
+                                  PREDICT_ERR_SCHEMA, i + 1);
+      return;
+    }
+    row[i] = (f32)fv;
+  }
+  sqlite3_value *lv = argv[c->nfeat];
+  if (c->classify) {
+    /* A NULL class label is not a real class; fail loudly rather than train a
+     * silent empty-string class. A NULL text under memory pressure is NOMEM. */
+    if (sqlite3_value_type(lv) == SQLITE_NULL) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: classify label must not be NULL",
+                                  PREDICT_ERR_TARGET);
+      return;
+    }
+    const char *s = (const char *)sqlite3_value_text(lv);
+    if (!s) {
+      c->err = SQLITE_NOMEM;
+      return;
+    }
+    c->ylab[c->n] = sqlite3_mprintf("%s", s);
+    if (!c->ylab[c->n]) {
+      c->err = SQLITE_NOMEM;
+      return;
+    }
+  } else {
+    int t = sqlite3_value_type(lv);
+    if (t != SQLITE_INTEGER && t != SQLITE_FLOAT) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: regress label must be numeric",
+                                  PREDICT_ERR_TARGET);
+      return;
+    }
+    f64 lval = sqlite3_value_double(lv);
+    if (!isfinite(lval)) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: regress label must be finite",
+                                  PREDICT_ERR_TARGET);
+      return;
+    }
+    c->yval[c->n] = lval;
+  }
+  c->n++;
+}
+
+static void fit_final(sqlite3_context *ctx) {
+  FitCtx *c = sqlite3_aggregate_context(ctx, 0);
+  if (!c) {
+    sqlite3_result_error(
+        ctx, PREDICT_ERR_SCHEMA ": fit received no training rows", -1);
+    return;
+  }
+  /* A first-row config error (bad task, bad arity, options parse failure) sets
+   * c->err but returns before c->configured, so surface the real diagnostic
+   * before the generic no-rows message, or it would mask every such failure. */
+  if (c->err) {
+    if (c->err == SQLITE_NOMEM && !c->errmsg)
+      sqlite3_result_error_nomem(ctx);
+    else
+      sqlite3_result_error(ctx, c->errmsg ? c->errmsg : "fit failed", -1);
+    fit_ctx_free(c);
+    return;
+  }
+  if (!c->configured) {
+    sqlite3_result_error(
+        ctx, PREDICT_ERR_SCHEMA ": fit received no training rows", -1);
+    fit_ctx_free(c);
+    return;
+  }
+  char **fn = sqlite3_malloc(sizeof(char *) * c->nfeat);
+  if (!fn) {
+    sqlite3_result_error_nomem(ctx);
+    fit_ctx_free(c);
+    return;
+  }
+  memset(fn, 0, sizeof(char *) * c->nfeat);
+  int ok = 1;
+  for (int i = 0; i < c->nfeat && ok; i++)
+    if (!(fn[i] = sqlite3_mprintf("f%d", i)))
+      ok = 0;
+  if (!ok) {
+    for (int i = 0; i < c->nfeat; i++)
+      sqlite3_free(fn[i]);
+    sqlite3_free(fn);
+    sqlite3_result_error_nomem(ctx);
+    fit_ctx_free(c);
+    return;
+  }
+  void *blob = NULL;
+  int blob_len = 0;
+  char *emsg = NULL;
+  int rc = predict0_train_student(
+      sqlite3_context_db_handle(ctx), c->X, c->n, c->nfeat, fn, c->classify,
+      c->classify ? c->ylab : NULL, c->classify ? NULL : c->yval, c->kind,
+      c->reg_id, &blob, &blob_len, &emsg);
+  for (int i = 0; i < c->nfeat; i++)
+    sqlite3_free(fn[i]);
+  sqlite3_free(fn);
+  if (rc != SQLITE_OK) {
+    sqlite3_result_error(ctx, emsg ? emsg : "fit training failed", -1);
+    sqlite3_free(emsg);
+    fit_ctx_free(c);
+    return;
+  }
+  if (c->reg_id)
+    sqlite3_result_text(ctx, c->reg_id, -1, SQLITE_TRANSIENT);
+  else
+    sqlite3_result_blob(ctx, blob, blob_len, SQLITE_TRANSIENT);
+  sqlite3_free(blob);
+  fit_ctx_free(c);
+}
+
+/* ---- predict() scalar ---- */
+
+typedef struct {
+  int proba;
+} PredScalarOpts;
+
+static int predict_scalar_opt_cb(void *ctx, const char *key,
+                                 sqlite3_value *value, char **errmsg) {
+  PredScalarOpts *o = ctx;
+  if (strcmp(key, "proba") == 0) {
+    int t = sqlite3_value_type(value);
+    if (t != SQLITE_INTEGER && t != SQLITE_FLOAT) {
+      *errmsg = sqlite3_mprintf("%s: wrong type for option '%s'",
+                                PREDICT_ERR_OPTIONS, key);
+      return 1;
+    }
+    o->proba = sqlite3_value_int(value) != 0;
+  }
+  return 0;
+}
+
+static const char *const PRED_SCALAR_OPTION_KEYS[] = {"proba", NULL};
+
+/* auxdata destructor with the exact void(*)(void*) type SQLite invokes it
+ * through. Casting predict0_student_free (which takes predict0_loaded_student*)
+ * to that pointer type and calling through it is undefined behavior that
+ * -fsanitize=function flags on Linux. */
+static void predict_scalar_free_aux(void *p) {
+  predict0_student_free((predict0_loaded_student *)p);
+}
+
+static void predict_scalar(sqlite3_context *ctx, int argc,
+                           sqlite3_value **argv) {
+  if (argc < 2) {
+    sqlite3_result_error(ctx,
+                         PREDICT_ERR_SCHEMA ": predict(model, feature, ...)"
+                                            " needs a model and >= 1 feature",
+                         -1);
+    return;
+  }
+  int has_opts = 0;
+  if (sqlite3_value_type(argv[argc - 1]) == SQLITE_TEXT) {
+    const char *t = (const char *)sqlite3_value_text(argv[argc - 1]);
+    if (t && t[0] == '{')
+      has_opts = 1;
+  }
+  int nfeat_in = argc - 1 - has_opts;
+  if (nfeat_in < 1) {
+    sqlite3_result_error(
+        ctx, PREDICT_ERR_SCHEMA ": predict needs >= 1 feature after the model",
+        -1);
+    return;
+  }
+  PredScalarOpts po;
+  memset(&po, 0, sizeof(po));
+  if (has_opts) {
+    char *emsg = NULL;
+    if (predict0_options_parse(sqlite3_context_db_handle(ctx),
+                               (const char *)sqlite3_value_text(argv[argc - 1]),
+                               PRED_SCALAR_OPTION_KEYS, predict_scalar_opt_cb,
+                               &po, &emsg)) {
+      sqlite3_result_error(
+          ctx, emsg ? emsg : PREDICT_ERR_OPTIONS ": cannot parse options", -1);
+      sqlite3_free(emsg);
+      return;
+    }
+  }
+
+  predict0_loaded_student *st = sqlite3_get_auxdata(ctx, 0);
+  if (!st) {
+    int mt = sqlite3_value_type(argv[0]);
+    const void *blob = NULL;
+    int blen = 0;
+    predict0_model_row mrow;
+    int owned = 0;
+    char *emsg = NULL;
+    if (mt == SQLITE_BLOB) {
+      blob = sqlite3_value_blob(argv[0]);
+      blen = sqlite3_value_bytes(argv[0]);
+    } else if (mt == SQLITE_TEXT) {
+      const char *id = (const char *)sqlite3_value_text(argv[0]);
+      int look =
+          predict0_registry_lookup(sqlite3_context_db_handle(ctx), id, &mrow);
+      if (look == 1) {
+        char *m = sqlite3_mprintf("%s: no such model: %s",
+                                  PREDICT_ERR_MODEL_NOT_FOUND, id);
+        sqlite3_result_error(ctx, m, -1);
+        sqlite3_free(m);
+        return;
+      }
+      if (look == 2) {
+        char *m = sqlite3_mprintf("%s: weights do not match content_hash: %s",
+                                  PREDICT_ERR_MODEL_HASH, id);
+        sqlite3_result_error(ctx, m, -1);
+        sqlite3_free(m);
+        return;
+      }
+      if (look != 0) {
+        sqlite3_result_error(
+            ctx, PREDICT_ERR_RESOURCE ": model registry unavailable", -1);
+        return;
+      }
+      owned = 1;
+      if (!mrow.runtime || strcmp(mrow.runtime, "tree") != 0) {
+        char *m = sqlite3_mprintf(
+            "%s: predict() serves native students; use predict_batch() for"
+            " runtime '%s'",
+            PREDICT_ERR_RUNTIME_UNAVAILABLE, mrow.runtime ? mrow.runtime : "?");
+        predict0_model_row_free(&mrow);
+        sqlite3_result_error(ctx, m, -1);
+        sqlite3_free(m);
+        return;
+      }
+      if (!mrow.weights) {
+        predict0_model_row_free(&mrow);
+        sqlite3_result_error(
+            ctx, PREDICT_ERR_SCHEMA ": model has no inline weights", -1);
+        return;
+      }
+      blob = mrow.weights;
+      blen = mrow.weights_len;
+    } else {
+      sqlite3_result_error(ctx,
+                           PREDICT_ERR_SCHEMA ": predict model must be a"
+                                              " registered id (text) or a"
+                                              " fit() blob",
+                           -1);
+      return;
+    }
+    int rc = predict0_student_load(blob, blen, &st, &emsg);
+    if (owned)
+      predict0_model_row_free(&mrow);
+    if (rc != SQLITE_OK) {
+      sqlite3_result_error(ctx, emsg ? emsg : "cannot load model", -1);
+      sqlite3_free(emsg);
+      return;
+    }
+    sqlite3_set_auxdata(ctx, 0, st, predict_scalar_free_aux);
+    /* SQLite may invoke the destructor immediately (before set_auxdata even
+     * returns) if it cannot store the value under memory pressure, so st must
+     * not be used afterward. Re-fetch it and bail if it was discarded. */
+    st = sqlite3_get_auxdata(ctx, 0);
+    if (!st) {
+      sqlite3_result_error_nomem(ctx);
+      return;
+    }
+  }
+
+  /* need <= TAB_MAX_FEAT holds by construction, so filling x[TAB_MAX_FEAT] below
+   * cannot overflow: the loader caps a student's nfeat at TREE_MAX_FEAT and the
+   * compile-time assert (predict0_assert_tab_buf_holds_max_student) guarantees
+   * TREE_MAX_FEAT <= TAB_MAX_FEAT. A feature-count mismatch is still reported. */
+  int need = predict0_student_nfeat(st);
+  if (nfeat_in != need) {
+    char *m = sqlite3_mprintf(
+        "%s: predict got %d features but the model expects %d",
+        PREDICT_ERR_SCHEMA, nfeat_in, need);
+    sqlite3_result_error(ctx, m, -1);
+    sqlite3_free(m);
+    return;
+  }
+  f32 x[TAB_MAX_FEAT];
+  for (int i = 0; i < nfeat_in; i++) {
+    int t = sqlite3_value_type(argv[1 + i]);
+    if (t != SQLITE_INTEGER && t != SQLITE_FLOAT) {
+      sqlite3_result_error(
+          ctx, PREDICT_ERR_SCHEMA ": predict features must be numeric", -1);
+      return;
+    }
+    f64 fv = sqlite3_value_double(argv[1 + i]);
+    if (!isfinite(fv)) { /* symmetry with fit(): a non-finite feature can't be
+                            trained on, so it must not be scored on either */
+      sqlite3_result_error(
+          ctx, PREDICT_ERR_SCHEMA ": predict features must be finite", -1);
+      return;
+    }
+    x[i] = (f32)fv;
+  }
+  char *pred = NULL;
+  f64 conf = 0;
+  int hc = 0;
+  char *emsg = NULL;
+  if (predict0_student_predict(st, x, &pred, &conf, &hc, &emsg) != SQLITE_OK) {
+    sqlite3_result_error(ctx, emsg ? emsg : "predict failed", -1);
+    sqlite3_free(emsg);
+    return;
+  }
+  if (po.proba) {
+    sqlite3_str *j = sqlite3_str_new(NULL);
+    sqlite3_str_appendall(j, "{\"prediction\":");
+    predict0_json_str(j, pred);
+    if (hc)
+      sqlite3_str_appendf(j, ",\"confidence\":%.17g", conf);
+    sqlite3_str_appendchar(j, 1, '}');
+    char *js = sqlite3_str_finish(j);
+    if (js)
+      sqlite3_result_text(ctx, js, -1, sqlite3_free);
+    else
+      sqlite3_result_error_nomem(ctx);
+  } else {
+    sqlite3_result_text(ctx, pred, -1, SQLITE_TRANSIENT);
+  }
+  sqlite3_free(pred);
+}
+
 int predict0_tabular_init(sqlite3 *db) {
-  return sqlite3_create_module(db, "predict", &predictModule, NULL);
+  /* predict_batch: the former predict() TVF, now the batched escape hatch
+   * (knn5-incontext, onnx, and registered-student batch serving over an apply
+   * query). The guessable per-row scalar predict() is registered below. It is
+   * NOT marked deterministic: a registered id resolves against _predict_models,
+   * so the result depends on external state, not on the SQL arguments alone. */
+  int rc = sqlite3_create_module(db, "predict_batch", &predictModule, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  rc = sqlite3_create_function(db, "predict", -1, SQLITE_UTF8, NULL,
+                               predict_scalar, NULL, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+  return sqlite3_create_function(db, "fit", -1, SQLITE_UTF8, NULL, NULL,
+                                 fit_step, fit_final);
 }

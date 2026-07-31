@@ -130,9 +130,12 @@ def test_predict_rejects_a_forecast_student(db):
     _train(db)
     db.execute("CREATE TABLE q(id INTEGER, f0 REAL)")
     db.execute("INSERT INTO q VALUES (1, 0.5)")
-    with pytest.raises(sqlite3.OperationalError):
-        db.execute("SELECT * FROM predict(NULL, 'SELECT id, f0 FROM q',"
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT * FROM predict_batch(NULL, 'SELECT id, f0 FROM q',"
                    " json_object('model','f'))").fetchall()
+    # predict_batch serves tabular students; a forecast student's weights are not
+    # a tree-student blob, so the deserializer rejects it loudly.
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
 
 def test_distill_forecast_requires_student_id(db):

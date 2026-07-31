@@ -6,7 +6,7 @@ import synthetic_tabular as syt
 
 def run_predict(db, train_q, apply_q, opts='{"target":"label"}'):
     return db.execute(
-        "SELECT * FROM predict(?, ?, ?)", (train_q, apply_q, opts)
+        "SELECT * FROM predict_batch(?, ?, ?)", (train_q, apply_q, opts)
     ).fetchall()
 
 
@@ -81,7 +81,7 @@ def test_errors(db):
 
     def expect(code, t, a, opts):
         with pytest.raises(sqlite3.OperationalError) as e:
-            db.execute("SELECT * FROM predict(?, ?, ?)",
+            db.execute("SELECT * FROM predict_batch(?, ?, ?)",
                        (t, a, opts)).fetchall()
         assert code in str(e.value), str(e.value)
 

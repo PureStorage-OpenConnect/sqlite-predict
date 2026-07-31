@@ -18,10 +18,12 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 ## Prediction as a SQL primitive
 
 `forecast()`, `detect_anomalies()`, and `predict()` become functions you call
-over your own rows. The serving functions are pure aggregates: they write
-nothing, so they work in views, on read-only databases, and from any ORM. The
-core is one small C99 file with no dependencies, so it runs in your app, on a
-phone, in the browser, or in the per-database state an AI agent keeps.
+over your own rows: `forecast` and `detect_anomalies` are aggregates that
+compose with `WHERE`, joins, and `GROUP BY`; `predict` is a scalar that composes
+with row-level `SELECT`, `WHERE`, and joins, so ORMs and query builders work
+unchanged. The core is one small C99 file with no
+dependencies, so it runs in your app, on a phone, in the browser, or in the
+per-database state an AI agent keeps.
 
 ```sql
 -- forecast a metric 24 steps ahead: plain SQL supplies the rows

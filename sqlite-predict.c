@@ -171,9 +171,16 @@ void predict0_format_timestamp(i64 ms, char *buf, usize bufsize) {
  * is the array (validated as one). Returns SQLITE_OK and sets out/n; on
  * failure returns an SQLITE_ code with *errmsg set. */
 int predict0_json_str_array(sqlite3 *db, const char *json, const char *path,
-                            char ***out, int *n, char **errmsg) {
+                            char ***out, int *n, int max, char **errmsg) {
   *out = NULL;
   *n = 0;
+  /* max is a hard cap; a nonpositive value is a caller bug, not "unbounded" —
+   * reject it rather than silently drop the allocation guard. */
+  if (max <= 0) {
+    *errmsg = sqlite3_mprintf("%s: json array cap must be positive (got %d)",
+                              PREDICT_ERR_SCHEMA, max);
+    return SQLITE_ERROR;
+  }
   int cap = 0;
   sqlite3_stmt *st = NULL;
   const char *sql = path ? "SELECT value FROM json_each(?1, ?2)"
@@ -187,8 +194,15 @@ int predict0_json_str_array(sqlite3 *db, const char *json, const char *path,
   sqlite3_bind_text(st, 1, json, -1, SQLITE_STATIC);
   if (path)
     sqlite3_bind_text(st, 2, path, -1, SQLITE_STATIC);
-  int rc = SQLITE_OK;
-  while (sqlite3_step(st) == SQLITE_ROW) {
+  int rc = SQLITE_OK, sr;
+  while ((sr = sqlite3_step(st)) == SQLITE_ROW) {
+    /* reject during the parse, before allocating the (max+1)th element */
+    if (*n >= max) {
+      rc = SQLITE_ERROR;
+      *errmsg = sqlite3_mprintf("%s: too many elements; the maximum is %d",
+                                PREDICT_ERR_SCHEMA, max);
+      break;
+    }
     if (*n == cap) {
       cap = cap ? cap * 2 : 8;
       char **g = sqlite3_realloc(*out, sizeof(char *) * cap);
@@ -206,9 +220,26 @@ int predict0_json_str_array(sqlite3 *db, const char *json, const char *path,
     }
     (*n)++;
   }
+  /* A step result other than DONE (e.g. malformed JSON in json_each) is a parse
+   * failure, not a successful empty read: surface it rather than return OK with
+   * partial output. Capture the message before finalize clears it. */
+  if (rc == SQLITE_OK && sr != SQLITE_DONE) {
+    rc = SQLITE_ERROR;
+    *errmsg = sqlite3_mprintf("%s: could not parse option array: %s",
+                              PREDICT_ERR_OPTIONS, sqlite3_errmsg(db));
+  }
   sqlite3_finalize(st);
   if (rc == SQLITE_NOMEM)
     *errmsg = sqlite3_mprintf("%s: out of memory", PREDICT_ERR_RESOURCE);
+  /* On any failure free the partial array and reset the out-params, so a caller
+   * never sees (or has to free) a partial result. */
+  if (rc != SQLITE_OK) {
+    for (int i = 0; i < *n; i++)
+      sqlite3_free((*out)[i]);
+    sqlite3_free(*out);
+    *out = NULL;
+    *n = 0;
+  }
   return rc;
 }
 
