@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-31
+
 ### Changed
 
 - **The tabular and evaluation surface is now the scikit-learn `fit`/`predict`
@@ -283,7 +285,8 @@ name-claim and release-pipeline shakedown pre-releases, superseded.)
   tag; and `examples/quickstart.sql`. CI regenerates and compiles the
   amalgamation on every push so it cannot drift.
 
-[Unreleased]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.0.1-alpha.6...v0.1.0
 [0.0.1-alpha.6]: https://github.com/PureStorage-OpenConnect/sqlite-predict/compare/v0.0.1-alpha.5...v0.0.1-alpha.6
 [0.0.1-alpha.5]: https://github.com/PureStorage-OpenConnect/sqlite-predict/releases/tag/v0.0.1-alpha.5
