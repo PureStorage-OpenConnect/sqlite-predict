@@ -109,8 +109,7 @@ SELECT model_id, holdout_metric FROM distill_predict(
   '{"target":"churned","student_id":"churn-v1","student_kind":"gbt"}');
 
 -- forever: serve the student per row, in microseconds, no runtime attached
-SELECT * FROM predict(NULL, 'SELECT id, tenure, spend FROM customers',
-                      '{"model":"churn-v1"}');
+SELECT id, predict('churn-v1', tenure, spend) FROM customers;
 
 -- the same move for time series: distill a Chronos-class teacher's forecasts
 -- into a DLinear/TiDE student, then serve it through forecast()
@@ -159,25 +158,32 @@ skills-capable agent, or read them as the condensed operator's manual.
 | --- | --- | --- |
 | `forecast(ts, value, horizon [, options])` | Where is this metric going? | an aggregate over your rows: forecast steps with prediction intervals, one JSON document per group |
 | `detect_anomalies(ts, value [, options])` | Which points are abnormal? | an aggregate over your rows: per-point anomaly probability and interval, one JSON document per group |
-| `predict(train_query, apply_query [, options])` | Classify/regress unseen rows | a prediction and confidence per row, zero-shot from in-context examples |
-| `distill_predict(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree or gradient-boosted forest), registered and ready for `predict()` |
-| `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native DLinear/TiDE forecast net (a linear skip plus a small residual), registered and ready for `forecast()` |
-| `backtest(query, horizon [, options])` | How accurate is the model here? | per-fold accuracy (MAE, RMSE, MASE, sMAPE) and interval coverage from a rolling-origin evaluation |
+| `backtest(ts, value, horizon [, options])` | How accurate is the model here? | an aggregate over your rows: per-fold MAE, RMSE, MASE, sMAPE and coverage from rolling-origin evaluation |
+| `fit(f1, ..., fN, label [, options])` | Train a model on labeled rows | an aggregate over your rows: a native tabular student, registered by id or returned as a blob |
+| `predict(model, f1, ..., fN [, options])` | Classify or regress a row | a scalar: one prediction per row from a fitted student |
+| `distill_predict(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree, gradient-boosted forest, or MLP), registered and served by `predict` |
+| `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native DLinear/TiDE forecast net (a linear skip plus a small residual), registered and served by `forecast` |
 
-One calling convention per operation. `forecast` and `detect_anomalies` are
-**aggregates**: your statement supplies the rows, so `WHERE`, joins, bound
-parameters, and `GROUP BY` all compose naturally, from the CLI or from an ORM
-(Drizzle, SQLAlchemy, Diesel). They are **pure functions**: nothing is ever
-written, so they run on read-only databases and inside views. Each group
-returns one JSON document; expand it with `forecast_rows()` /
-`anomaly_rows()`, or `JSON.parse` it in your app. Each language's
+One rule for the whole surface. `forecast`, `detect_anomalies`, `backtest`, and
+`fit` are **aggregates**: your statement supplies the rows, so `WHERE`, joins,
+bound parameters, and `GROUP BY` all compose naturally, from the CLI or from an
+ORM (Drizzle, SQLAlchemy, Diesel). The first three are **pure functions**:
+nothing is written, so they run on read-only databases and inside views. Each
+returns one JSON document; expand it with `forecast_rows()` / `anomaly_rows()` /
+`backtest_rows()`, or `JSON.parse` it in your app. `predict` is a **scalar**,
+one prediction per row, so it drops into any `SELECT` beside your other columns.
+Each language's
 [getting-started guide](https://code.purestorage.com/sqlite-predict/getting-started/python/)
 shows the pattern through its native ORM (SQLAlchemy, Drizzle, Diesel).
 
-`backtest`, `predict`, and the `distill_*` operations take read-only SELECT
-queries (training needs labeled or windowed row sets); their results are
-ordinary rows you can join, filter, and materialize. Options everywhere are a
-trailing JSON object (`'{"confidence_level":0.9}'`).
+`distill_predict`, `distill_forecast`, and `predict_batch` take read-only SELECT
+queries (training needs labeled or windowed row sets, batched serving re-runs a
+query); their results are ordinary rows you can join, filter, and materialize.
+`predict_batch(train_query, apply_query, ...)` scores the rows of `apply_query`,
+which is required; `train_query` is optional, used only by in-context models, and
+is `NULL` when serving a registered model: `predict_batch(NULL, apply_query,
+'{"model":"..."}')`.
+Options everywhere are a trailing JSON object (`'{"confidence_level":0.9}'`).
 
 ### Calibrated intervals, auto-selection, and backtesting
 
@@ -200,8 +206,8 @@ trailing JSON object (`'{"confidence_level":0.9}'`).
 
 ```sql
 -- confirm the conformal band actually covers at the nominal 90%
-SELECT avg(coverage) FROM backtest('SELECT ts, value FROM readings', 6,
-  '{"interval_method":"conformal","confidence_level":0.9,"folds":25}');
+SELECT avg(coverage) FROM backtest_rows((SELECT backtest(ts, value, 6,
+  '{"interval_method":"conformal","confidence_level":0.9,"folds":25}') FROM readings));
 ```
 
 ## Models
@@ -219,7 +225,7 @@ well-studied statistical models:
   subsequence-reconstruction detector (windowed PCA reconstruction error), the
   method family that leads the TSB-AD-U benchmark; ~2x the residual detector on
   the typical series there
-- `knn5-incontext` (z-scored 5-NN) for `predict()`
+- `knn5-incontext` (z-scored 5-NN) for `predict_batch()`
 
 Foundation models are treated as *teachers*, not serving paths: in
 benchmarking they were far too slow to call per query on CPU. The path to
@@ -298,8 +304,8 @@ count), so the common case is one line:
 
 ```sql
 SELECT predict_register('churn', '/models/churn.onnx');
-SELECT * FROM predict(NULL, 'SELECT id, tenure, spend FROM customers',
-                      '{"model":"churn"}');
+SELECT * FROM predict_batch(NULL, 'SELECT id, tenure, spend FROM customers',
+                            '{"model":"churn"}');
 ```
 
 Feature columns map by position (apply-query order); pass an explicit
@@ -384,10 +390,12 @@ build `make loadable-onnx-gpu`.
 
 ## How it works
 
-`forecast` and `detect_anomalies` are SQL aggregate functions; `backtest`,
-`predict`, and the `distill_*` operations are [eponymous table-valued
-functions][tvf] (virtual table modules) over the rows of an inner query.
-Statistical models run in-process on CPU and are deterministic. Registered
+`forecast`, `detect_anomalies`, `backtest`, and `fit` are SQL aggregate
+functions; `predict` is a scalar; `distill_predict`, `distill_forecast`, and
+`predict_batch` are [eponymous table-valued functions][tvf] (virtual table
+modules) over the rows of an inner query (`predict_batch` takes two: an optional
+`train_query` and the required `apply_query`). Statistical models run in-process on
+CPU and are deterministic. Registered
 models and distilled students live in one `_predict_models` table the
 extension manages, content-addressed so the exact bytes are pinned and
 verified before deserialization.

@@ -39,25 +39,43 @@ The same aggregate rules apply.
 
 ## backtest
 
-`confidence_level`, `interval_method`, `folds`, `gap`, and `context_limit` as
-for `forecast`. `model` differs: it must be a statistical model id or `auto`,
-and it defaults to `theta-classic`, not `auto`; a distilled student competes
-inside `auto` but cannot be pinned here. Plus the query-shape keys (backtest
-takes its data as a query, so columns must be resolvable):
+An aggregate over your rows, like `forecast`. `confidence_level`,
+`interval_method`, `folds`, `gap`, and `context_limit` as for `forecast`.
+`model` differs: it must be a statistical model id or `auto`, and it defaults
+to `theta-classic`, not `auto`; a distilled student competes inside `auto` but
+cannot be pinned here. There are no column-naming keys: the argument positions
+carry the columns and `GROUP BY` carries the series split.
+
+## fit
+
+Trains a native tabular student over your rows; the label is the last
+positional argument, so there is no `target` option.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `time_col` | string | inferred | Name of the time column. |
-| `value_col` | string | inferred | Name of the value column. |
-| `group_cols` | string[] | none | Split into series keyed by these columns. |
+| `kind` | `gbt` \| `tree` | `gbt` | Student architecture. |
+| `task` | `classify` \| `regress` | inferred | Inferred from the label: integer or text is classify, real is regress. |
+| `register` | string | none | Register the model under this id and return the id; without it, `fit` returns a model blob. |
 
 ## predict
 
+A scalar: `predict(model, f1, ..., fN [, options])`. `model` is a registered id
+or a `fit()` blob; features are positional.
+
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `target` | string | required for in-context models | Column in `train_query` to learn. A served student (`train_query` = `NULL`) needs no target. |
+| `proba` | 0 \| 1 | 0 | Return a `{"prediction": "1", "confidence": 0.98}` JSON document instead of the bare label. |
+
+## predict_batch
+
+The batched and in-context serving path,
+`predict_batch(train_query, apply_query [, options])`.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `target` | string | required for in-context models | Column in `train_query` to learn. A served model (`train_query` = `NULL`) needs no target. |
 | `task` | `classify` \| `regress` | inferred | Prediction task. |
-| `model` | string | `knn5-incontext` | Model or distilled student id. |
+| `model` | string | `knn5-incontext` | An in-context model, a registered native student id (trained by `distill_predict` or `fit`), or a registered onnx id. To serve an already-trained model (a native student or onnx), pass `train_query` = `NULL`; only in-context models take a `train_query`. |
 | `device` | `cpu` \| `gpu` | `cpu` | Inference device (onnx build). |
 | `precision` | string | model default | Inference precision (onnx build). |
 | `accept_license` | 0 \| 1 | 0 | Accept a license-tagged model. |

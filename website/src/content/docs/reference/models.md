@@ -27,8 +27,8 @@ bundled model ships in the zero-dependency core, no ONNX runtime required.
 
 | `model` | Kind | Notes |
 | --- | --- | --- |
-| `knn5-incontext` | statistical | In-context k-nearest-neighbors (k=5). Default zero-setup baseline for `predict()`. |
-| distilled students | native | Registered by `distill_predict` as `tree`, `gbt`, or `mlp`. Call by the `model_id` you gave them. |
+| native students | native | Trained by `fit` (`gbt` or `tree`) or `distill_predict` (`tree`, `gbt`, or `mlp`). `fit` returns a model blob by default, or registers under your id when you pass `'{"register":"..."}'`; either way the `predict` scalar serves it per row. |
+| `knn5-incontext` | statistical | In-context k-nearest-neighbors (k=5), a zero-setup baseline with no training step. Serve it through `predict_batch(train_sql, apply_sql)`. |
 
 ## Distilled forecast students
 
@@ -41,6 +41,6 @@ row to another database and it works there. See [Distillation](../../guides/dist
 
 The default build is pure C. `make loadable-onnx` adds a `runtime='onnx'` path so
 `distill_forecast`/`distill_predict` can distill *from* a live foundation-model
-teacher (Chronos for forecasting, a tabular FM for `predict()`). Serving the
+teacher (Chronos for forecasting, a tabular FM for the tabular path). Serving the
 distilled student never needs that build. License-tagged teachers enforce
 `PREDICT_ERR_LICENSE` unless you pass `accept_license`.

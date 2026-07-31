@@ -14,11 +14,13 @@ metadata:
 
 `backtest` answers "how would this model have done on my series" with
 rolling-origin evaluation: it repeatedly hides the tail of the series,
-forecasts it, and scores against what actually happened.
+forecasts it, and scores against what actually happened. It is an
+aggregate over your rows, like `forecast`, and returns one JSON document;
+expand it with `backtest_rows(...)`.
 
 ```sql
-SELECT * FROM backtest('SELECT ts, value FROM readings', 24,
-                       '{"model":"theta-classic","folds":5}');
+SELECT * FROM backtest_rows((SELECT backtest(ts, value, 24,
+       '{"model":"theta-classic","folds":5}') FROM readings));
 ```
 
 ## The metrics that matter
@@ -43,9 +45,9 @@ the repo). When interval truth matters, request conformal intervals in
 the same call:
 
 ```sql
-SELECT * FROM backtest('SELECT ts, value FROM readings', 24,
-                       '{"model":"theta-classic",
-                         "interval_method":"conformal"}');
+SELECT * FROM backtest_rows((SELECT backtest(ts, value, 24,
+       '{"model":"theta-classic","interval_method":"conformal"}')
+       FROM readings));
 ```
 
 Conformal intervals calibrate to measured out-of-sample residuals and

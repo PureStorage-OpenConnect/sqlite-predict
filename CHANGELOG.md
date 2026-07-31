@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The tabular and evaluation surface is now the scikit-learn `fit`/`predict`
+  shape.** `fit(f1, ..., fN, label [, options])` is a new aggregate that trains a
+  native student over your rows (the label is the last positional argument).
+  With the `'{"register":"name"}'` option it registers the trained model and
+  returns its id; without it, `fit()` returns the student as a serialized blob.
+  `predict(model, f1, ..., fN [, options])` is now a per-row **scalar** that
+  serves a student (a registered id or a `fit()` blob) and composes with
+  `WHERE`, joins, and ORMs. `backtest(ts, value, horizon [, options])` is now an
+  **aggregate** over your rows like `forecast`/`detect_anomalies`, one JSON
+  document per group, expanded with the new `backtest_rows()`. The former
+  `predict(train_query, apply_query)` table-valued function is renamed
+  **`predict_batch`** (the batched, in-context `knn5-incontext`, and ONNX serving
+  path); the old query-string `backtest(query, horizon)` TVF is removed. This is
+  a pre-1.0 break; `distill_predict`/`distill_forecast`, `forecast`, and
+  `detect_anomalies` are unchanged.
+
 ## [0.1.0] - 2026-07-30
 
 ### Changed

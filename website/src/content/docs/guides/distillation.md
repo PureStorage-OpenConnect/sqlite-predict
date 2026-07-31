@@ -22,17 +22,20 @@ SELECT model_id, holdout_metric FROM distill_predict(
   'SELECT f1, f2, label FROM training',
   '{"target":"label","student_id":"churn-v1","student_kind":"gbt"}');
 
--- forever: serve it. train_query is NULL because the student already
--- learned; only the rows to predict are needed.
-SELECT row_ref, prediction, confidence FROM predict(NULL,
-  'SELECT id, f1, f2 FROM customers',
-  '{"model":"churn-v1"}');
+-- forever: serve it per row with the predict scalar
+SELECT id, predict('churn-v1', f1, f2) AS prediction FROM customers;
 ```
 
-The `NULL` first argument is the signature of serving a student: `predict`
-normally takes a training query for in-context models, but a student carries
-its training inside its blob, so passing a query alongside a student is
-rejected (`PREDICT_ERR_OPTIONS`) rather than silently ignored.
+`predict('churn-v1', f1, f2)` serves the registered student one row at a
+time, so it drops into any `SELECT` beside your other columns and composes
+with `WHERE` and joins. Features are positional and must match what the
+student was trained on: a count mismatch fails loudly rather than guessing.
+Pass `'{"proba":true}'` for a `{"prediction": "1", "confidence": 0.98}` document.
+
+If the teacher is just your own labels, with no relabeling or soft targets,
+`fit(f1, f2, label, '{"register":"churn-v1"}')` trains and registers in one
+call; `distill_predict` is the fuller path that adds teacher relabeling and
+soft-label distillation.
 
 `student_kind` is `tree` (a single CART), `gbt` (a gradient-boosted forest
 with second-order leaves, which matches or beats tuned XGBoost on most

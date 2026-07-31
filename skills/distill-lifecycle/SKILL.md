@@ -34,10 +34,18 @@ SELECT model_id FROM distill_forecast('SELECT series_key, value FROM obs',
   '{"context":96,"horizon":24,"student_id":"traffic-v1"}');
 ```
 
+For your own hard labels, `fit(f1, f2, label, '{"register":"churn-v1"}')` is
+the one-call training path. `distill_predict` trains on hard labels too; on top
+of that it supports two optional inputs, either or both: teacher relabeling (a
+registered model relabels the rows before fitting) and soft-label distillation
+(pass `proba`/`classes` to fit probability targets). Omit both to train on the
+labels exactly as given, which is what the examples above do.
+
 Students register in `_predict_models` as content-hashed rows; they
-snapshot, fork, and sync with the database. Serve by name:
-`predict(NULL, apply_sql, '{"model":"churn-v1"}')` or
-`forecast(ts, value, 24, '{"model":"traffic-v1"}')`.
+snapshot, fork, and sync with the database. Serve a tabular student per
+row with the `predict` scalar, `SELECT id, predict('churn-v1', f1, f2)
+FROM rows`, and a forecast student through `forecast(ts, value, 24,
+'{"model":"traffic-v1"}')`.
 
 ## Verify before serving
 
