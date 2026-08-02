@@ -65,19 +65,27 @@ SELECT avg(mae) FROM backtest_rows(
   (SELECT backtest(ts, value, 6, '{"folds":20}') FROM readings));
 ```
 
-### `fit(f1, ..., fN, label [, options])`
+### `fit([name,] f1, ..., fN, label [, options])`
 
-Trains a native tabular student over your rows. The features are the leading
-positional arguments and the **label is the last argument** (there is no
-`target` option). The optional trailing `options` is a TEXT JSON object, so a
-trailing `{...}` argument is always read as options: a class **label must not be
-a JSON-object string** (it would be consumed as options). Returns the model:
-with `'{"register":"churn-v1"}'` it registers into `_predict_models` and returns
-the id, otherwise it returns a model blob you can pass to `predict`. Options:
-`kind` (`gbt` default, or `tree`), `task` (`classify`/`regress`, inferred from
-the label), `register`.
+Trains a native tabular student over your rows. The features are positional and
+the **label is the last positional argument** (there is no `target` option). An
+optional **leading TEXT argument names and registers the model**, mirroring
+`predict(model, ...)` so the train and serve calls read in parallel:
+`fit('churn', f..., label)` then `predict('churn', f...)`. The same name can
+instead be given as `'{"register":"churn"}'`, but supplying it both ways raises
+`PREDICT_ERR_OPTIONS`. With a name, `fit` registers into `_predict_models` and
+returns the id; with neither it returns a model blob you can pass to `predict`.
+The optional trailing `options` is a TEXT JSON object, so a trailing `{...}`
+argument is always read as options: a class **label must not be a JSON-object
+string** (it would be consumed as options). Options: `kind` (`gbt` default, or
+`tree`), `task` (`classify`/`regress`, inferred from the label), `register`.
 
 ```sql
+-- name the model with a leading id, and fit/predict read in parallel:
+SELECT fit('churn-v1', tenure, spend, churned) FROM history;
+SELECT id, predict('churn-v1', tenure, spend) AS churn FROM active;
+
+-- or name it in options, alongside the student kind:
 SELECT fit(tenure, spend, churned, '{"kind":"gbt","register":"churn-v1"}') FROM history;
 ```
 

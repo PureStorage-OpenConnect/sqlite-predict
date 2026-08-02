@@ -35,6 +35,65 @@ def test_fit_register_then_scalar_predict(db):
     assert preds == ["1", "1", "0", "0"]
 
 
+def test_fit_leading_name_rhymes_with_predict(db):
+    """The guessable mirror: a leading TEXT model name registers the model, so
+    fit('id', f..., label) reads parallel to predict('id', f...). Same churn
+    signal, no options object needed."""
+    _seed(db)
+    mid = db.execute(
+        "SELECT fit('churn-lead', tenure, spend, churned) FROM h").fetchone()[0]
+    assert mid == "churn-lead"
+    preds = [r[1] for r in db.execute(
+        "SELECT id, predict('churn-lead', tenure, spend) FROM a ORDER BY id")]
+    assert preds == ["1", "1", "0", "0"]
+
+
+def test_fit_leading_name_composes_with_options(db):
+    """A leading name and a trailing options object coexist: the name registers,
+    the options still select the student kind."""
+    _seed(db)
+    mid = db.execute(
+        "SELECT fit('lead-tree', tenure, spend, churned, '{\"kind\":\"tree\"}')"
+        " FROM h").fetchone()[0]
+    assert mid == "lead-tree"
+    assert db.execute("SELECT predict('lead-tree', 2, 20)").fetchone()[0] == "1"
+
+
+def test_fit_leading_name_equals_options_register(db):
+    """The two ways to name a model are equivalent: a model registered by a
+    leading name predicts identically to one registered via {"register":...} on
+    the same rows (same features, same training, deterministic)."""
+    _seed(db)
+    db.execute("SELECT fit('lead-eq', tenure, spend, churned) FROM h").fetchone()
+    db.execute("SELECT fit(tenure, spend, churned, '{\"register\":\"opt-eq\"}')"
+               " FROM h").fetchone()
+    lead = [r[0] for r in db.execute(
+        "SELECT predict('lead-eq', tenure, spend) FROM a ORDER BY id")]
+    opt = [r[0] for r in db.execute(
+        "SELECT predict('opt-eq', tenure, spend) FROM a ORDER BY id")]
+    assert lead == opt
+
+
+def test_fit_model_name_given_twice_fails_loud(db):
+    """A leading name and a {"register":...} option name the model twice. That is
+    a mistake, not a precedence to resolve silently: fail loudly
+    (PREDICT_ERR_OPTIONS)."""
+    _seed(db)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT fit('twice-a', tenure, spend, churned,"
+                   " '{\"register\":\"twice-b\"}') FROM h").fetchall()
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
+def test_fit_leading_name_still_needs_features_and_label(db):
+    """A leading name does not substitute for data: fit('id', label) has a name
+    and a label but no features, and must fail loudly (PREDICT_ERR_SCHEMA)."""
+    _seed(db)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT fit('nofeat', churned) FROM h").fetchall()
+    assert "PREDICT_ERR_SCHEMA" in str(e.value)
+
+
 def test_fit_blob_served_via_cte(db):
     """No registration: fit() returns a model blob, served in one statement."""
     _seed(db)

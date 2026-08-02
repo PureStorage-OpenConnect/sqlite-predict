@@ -855,12 +855,15 @@ static sqlite3_module predictModule = {
 
 /* ======================================================================
  * fit() aggregate + predict() scalar: the guessable tabular pair.
- * fit(f1, ..., fN, label [, options]) trains a native student over the rows of
- * the statement (label is the last positional argument, no target option) and
- * returns the plain registered id text when options request registration
- * ({"register":"my-id"}), otherwise its serialized model blob. The optional
- * trailing options is a TEXT JSON object; a trailing '{...}' is therefore always
- * read as options, so a class label must not itself be a JSON-object string.
+ * fit([name,] f1, ..., fN, label [, options]) trains a native student over the
+ * rows of the statement (features are numeric and positional, the label is the
+ * last positional argument, no target option). An optional leading TEXT argument
+ * names and registers the model, mirroring predict(model, ...); the same name may
+ * instead be given as {"register":"my-id"}, but supplying it both ways is an
+ * error. With a name fit() returns the registered id text; with neither it
+ * returns the serialized model blob. The optional trailing options is a TEXT JSON
+ * object; a trailing '{...}' is therefore always read as options, so a class label
+ * must not itself be a JSON-object string.
  * predict(model, f1, ..., fN [, options]) serves that student per row, features
  * positional, deserialized once and cached on the model argument.
  * ====================================================================== */
@@ -912,6 +915,7 @@ static const char *const FIT_OPTION_KEYS[] = {"kind", "student_kind", "task",
 typedef struct {
   int configured;
   int has_opts;
+  int has_name;   /* a leading TEXT model-name argument was present */
   char *opts_raw; /* trailing options text of the first row (owned), or NULL */
   int nfeat;
   int classify;
@@ -971,11 +975,26 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     }
   }
 
+  /* An optional leading model name: a TEXT first argument. Features are numeric,
+   * so a text argv[0] is unambiguously the register name — the guessable mirror of
+   * predict(model, ...). Like the options object it must be constant across the
+   * group, and it is reconciled against {"register":...} below (supplying the name
+   * both ways is an error, not a silent precedence). */
+  int has_name = (argc >= 1 && sqlite3_value_type(argv[0]) == SQLITE_TEXT);
+  const char *name_txt = NULL;
+  if (has_name) {
+    name_txt = (const char *)sqlite3_value_text(argv[0]);
+    if (!name_txt) { /* TEXT value but NULL text pointer means an allocation failed */
+      c->err = SQLITE_NOMEM;
+      return;
+    }
+  }
+
   if (!c->configured) {
-    int nfeat = argc - 1 - has_opts;
+    int nfeat = argc - has_name - 1 - has_opts;
     if (nfeat < 1) {
       c->err = SQLITE_ERROR;
-      c->errmsg = sqlite3_mprintf("%s: fit(feature, ..., label [, options])"
+      c->errmsg = sqlite3_mprintf("%s: fit([name,] feature, ..., label [, options])"
                                   " needs at least one feature and a label",
                                   PREDICT_ERR_SCHEMA);
       return;
@@ -998,6 +1017,16 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
         return;
       }
     }
+    /* The model name is given at most once: a leading argument OR {"register":...},
+     * never both — a conflicting pair is a mistake, not a precedence to resolve. */
+    if (has_name && o.reg) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf(
+          "%s: model name given twice (leading argument and \"register\" option)",
+          PREDICT_ERR_OPTIONS);
+      fit_opts_free(&o);
+      return;
+    }
     int classify = 1;
     if (o.task) {
       if (strcmp(o.task, "regress") == 0)
@@ -1014,10 +1043,20 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     c->classify = classify;
     c->kind = o.kind; /* transfer ownership */
     o.kind = NULL;
-    c->reg_id = o.reg;
-    o.reg = NULL;
+    if (has_name) {
+      c->reg_id = sqlite3_mprintf("%s", name_txt);
+      if (!c->reg_id) {
+        c->err = SQLITE_NOMEM;
+        fit_opts_free(&o);
+        return;
+      }
+    } else {
+      c->reg_id = o.reg; /* transfer ownership */
+      o.reg = NULL;
+    }
     fit_opts_free(&o);
     c->has_opts = has_opts;
+    c->has_name = has_name;
     if (has_opts) {
       c->opts_raw = sqlite3_mprintf("%s", opts_txt);
       if (!c->opts_raw) {
@@ -1026,11 +1065,13 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
       }
     }
     c->configured = 1;
-  } else if (has_opts != c->has_opts ||
-             (has_opts && (!c->opts_raw || strcmp(opts_txt, c->opts_raw) != 0))) {
+  } else if (has_opts != c->has_opts || has_name != c->has_name ||
+             (has_opts && (!c->opts_raw || strcmp(opts_txt, c->opts_raw) != 0)) ||
+             (has_name && (!c->reg_id || strcmp(name_txt, c->reg_id) != 0))) {
     c->err = SQLITE_ERROR;
-    c->errmsg = sqlite3_mprintf("%s: options must be constant within a group",
-                                PREDICT_ERR_OPTIONS);
+    c->errmsg = sqlite3_mprintf(
+        "%s: fit options and model name must be constant within a group",
+        PREDICT_ERR_OPTIONS);
     return;
   }
 
@@ -1072,14 +1113,15 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   }
   f32 *row = &c->X[(size_t)c->n * c->nfeat];
   for (int i = 0; i < c->nfeat; i++) {
-    int t = sqlite3_value_type(argv[i]);
+    /* features start after the optional leading name (argv[0]) */
+    int t = sqlite3_value_type(argv[has_name + i]);
     if (t != SQLITE_INTEGER && t != SQLITE_FLOAT) {
       c->err = SQLITE_ERROR;
       c->errmsg = sqlite3_mprintf("%s: fit feature %d must be numeric",
                                   PREDICT_ERR_SCHEMA, i + 1);
       return;
     }
-    f64 fv = sqlite3_value_double(argv[i]);
+    f64 fv = sqlite3_value_double(argv[has_name + i]);
     if (!isfinite(fv)) { /* 1e999 -> +Inf as SQLITE_FLOAT; NaN poisons splits */
       c->err = SQLITE_ERROR;
       c->errmsg = sqlite3_mprintf("%s: fit feature %d must be finite",
@@ -1088,7 +1130,7 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     }
     row[i] = (f32)fv;
   }
-  sqlite3_value *lv = argv[c->nfeat];
+  sqlite3_value *lv = argv[has_name + c->nfeat];
   if (c->classify) {
     /* A NULL class label is not a real class; fail loudly rather than train a
      * silent empty-string class. A NULL text under memory pressure is NOMEM. */
