@@ -276,7 +276,10 @@ int predict0_forest_predict_row(const Forest *f, const f32 *x, f64 *scbuf, char 
   if (f->task == 1) {
     f64 s = f->init[0];
     for (int j = 0; j < f->n_trees; j++)
-      s += f->lr * forest_tree_value(f, j, x);
+      /* (f64) before the multiply: keep the product in double, matching the
+       * trainer (predict-train.c), so a float*float never overflows or picks up
+       * platform-dependent excess precision before it reaches the accumulator. */
+      s += (f64)f->lr * forest_tree_value(f, j, x);
     *has_conf = 0;
     *pred = sqlite3_mprintf("%.17g", s);
     return *pred ? SQLITE_OK : SQLITE_NOMEM;
@@ -285,7 +288,8 @@ int predict0_forest_predict_row(const Forest *f, const f32 *x, f64 *scbuf, char 
     scbuf[c] = f->init[c];
   for (int r = 0; r < f->n_rounds; r++)
     for (int s = 0; s < f->n_score; s++)
-      scbuf[s] += f->lr * forest_tree_value(f, r * f->n_score + s, x);
+      /* (f64) before the multiply, as above and in the trainer */
+      scbuf[s] += (f64)f->lr * forest_tree_value(f, r * f->n_score + s, x);
   f64 mx = scbuf[0];
   int arg = 0;
   for (int c = 1; c < f->n_score; c++)
