@@ -94,6 +94,19 @@ def test_fit_leading_name_still_needs_features_and_label(db):
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
 
+def test_fit_leading_name_json_object_still_options(db):
+    """The leading name discounts the options arity, so a trailing JSON-object
+    argument is consumed as options with or without a name: fit('id', f1, f2, obj)
+    fails loudly (PREDICT_ERR_OPTIONS) just like fit(f1, f2, obj), rather than one
+    form treating the object as a class label and the other as options."""
+    db.execute("CREATE TABLE jl2(f1 REAL, f2 REAL, lbl TEXT)")
+    db.executemany("INSERT INTO jl2 VALUES (?, ?, ?)",
+                   [(i * 1.0, (i % 3) * 1.0, '{"category":"A"}') for i in range(20)])
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT fit('jlmodel', f1, f2, lbl) FROM jl2").fetchall()
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
 def test_fit_blob_served_via_cte(db):
     """No registration: fit() returns a model blob, served in one statement."""
     _seed(db)

@@ -956,30 +956,12 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   }
   if (c->err)
     return;
-  /* Determine this row's trailing options: the last argument when it is TEXT
-   * beginning with '{'. Presence and content must be constant across the group,
-   * or the feature/label split and the model config would depend on the order
-   * SQLite happens to visit rows in. Consequence of this convention: the trailing
-   * '{...}' is ALWAYS the options object, so a class label must not be a JSON
-   * object string (it would be consumed as options). A malformed options object
-   * fails loudly at predict0_options_parse; the only quiet case is a label that
-   * is itself a well-formed, valid-key options object, which is why the label
-   * contract is documented rather than guessed. */
-  int has_opts = 0;
-  const char *opts_txt = NULL;
-  if (argc >= 3 && sqlite3_value_type(argv[argc - 1]) == SQLITE_TEXT) {
-    const char *t = (const char *)sqlite3_value_text(argv[argc - 1]);
-    if (t && t[0] == '{') {
-      has_opts = 1;
-      opts_txt = t;
-    }
-  }
-
   /* An optional leading model name: a TEXT first argument. Features are numeric,
    * so a text argv[0] is unambiguously the register name — the guessable mirror of
    * predict(model, ...). Like the options object it must be constant across the
    * group, and it is reconciled against {"register":...} below (supplying the name
-   * both ways is an error, not a silent precedence). */
+   * both ways is an error, not a silent precedence). Detected before the trailing
+   * options so the options arity can discount it. */
   int has_name = (argc >= 1 && sqlite3_value_type(argv[0]) == SQLITE_TEXT);
   const char *name_txt = NULL;
   if (has_name) {
@@ -987,6 +969,28 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     if (!name_txt) { /* TEXT value but NULL text pointer means an allocation failed */
       c->err = SQLITE_NOMEM;
       return;
+    }
+  }
+
+  /* This row's trailing options: the last argument when it is TEXT beginning with
+   * '{'. It is options only when a feature and a label still precede it after the
+   * optional name (argc - has_name >= 3); with fewer arguments the trailing '{...}'
+   * is the label, exactly as the name-less form treats it, so both forms stay
+   * consistent. Presence and content must be constant across the group, or the
+   * feature/label split and the model config would depend on the order SQLite
+   * happens to visit rows in. Consequence: a trailing '{...}' with a feature and
+   * label present is ALWAYS the options object, so a class label must not be a
+   * JSON-object string (it would be consumed as options). A malformed options
+   * object fails loudly at predict0_options_parse; the only quiet case is a label
+   * that is itself a well-formed, valid-key options object, which is why the label
+   * contract is documented rather than guessed. */
+  int has_opts = 0;
+  const char *opts_txt = NULL;
+  if (argc - has_name >= 3 && sqlite3_value_type(argv[argc - 1]) == SQLITE_TEXT) {
+    const char *t = (const char *)sqlite3_value_text(argv[argc - 1]);
+    if (t && t[0] == '{') {
+      has_opts = 1;
+      opts_txt = t;
     }
   }
 
