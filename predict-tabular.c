@@ -862,8 +862,10 @@ static sqlite3_module predictModule = {
  * instead be given as {"register":"my-id"}, but supplying it both ways is an
  * error. With a name fit() returns the registered id text; with neither it
  * returns the serialized model blob. The optional trailing options is a TEXT JSON
- * object; a trailing '{...}' is therefore always read as options, so a class label
- * must not itself be a JSON-object string.
+ * object; once a feature and a label precede it (argc - has_name >= 3) a trailing
+ * '{...}' is read as options, so a class label at that arity must not itself be a
+ * JSON-object string. At the lowest arity (a single feature and the label, as in
+ * fit(x, '{}')) the trailing object is the label.
  * predict(model, f1, ..., fN [, options]) serves that student per row, features
  * positional, deserialized once and cached on the model argument.
  * ====================================================================== */
@@ -968,6 +970,15 @@ static void fit_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     name_txt = (const char *)sqlite3_value_text(argv[0]);
     if (!name_txt) { /* TEXT value but NULL text pointer means an allocation failed */
       c->err = SQLITE_NOMEM;
+      return;
+    }
+    /* The name flows through mprintf("%s") and strcmp below, so an embedded NUL
+     * would silently truncate it to a different id than the caller passed. Reject
+     * it rather than register/return the wrong name. */
+    if (memchr(name_txt, '\0', (size_t)sqlite3_value_bytes(argv[0]))) {
+      c->err = SQLITE_ERROR;
+      c->errmsg = sqlite3_mprintf("%s: model name must not contain a NUL byte",
+                                  PREDICT_ERR_OPTIONS);
       return;
     }
   }

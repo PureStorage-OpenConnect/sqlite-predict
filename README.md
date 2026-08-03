@@ -159,7 +159,7 @@ skills-capable agent, or read them as the condensed operator's manual.
 | `forecast(ts, value, horizon [, options])` | Where is this metric going? | an aggregate over your rows: forecast steps with prediction intervals, one JSON document per group |
 | `detect_anomalies(ts, value [, options])` | Which points are abnormal? | an aggregate over your rows: per-point anomaly probability and interval, one JSON document per group |
 | `backtest(ts, value, horizon [, options])` | How accurate is the model here? | an aggregate over your rows: per-fold MAE, RMSE, MASE, sMAPE and coverage from rolling-origin evaluation |
-| `fit([name,] f1, ..., fN, label [, options])` | Train a model on labeled rows | an aggregate over your rows: a native tabular student, named by a leading id (or `register`) or returned as a blob |
+| `fit([name,] f1, ..., fN, label [, options])` | Train a model on labeled rows | an aggregate over your rows: a native tabular student, registered under a leading id argument or a `register` option, or returned as a blob |
 | `predict(model, f1, ..., fN [, options])` | Classify or regress a row | a scalar: one prediction per row from a fitted student |
 | `distill_predict(train_query [, options])` | Compress a slow teacher into a fast student | a tiny native model (decision tree, gradient-boosted forest, or MLP), registered and served by `predict` |
 | `distill_forecast(train_query [, options])` | Compress a forecast foundation model into a fast student | a native DLinear/TiDE forecast net (a linear skip plus a small residual), registered and served by `forecast` |

@@ -94,6 +94,30 @@ def test_fit_leading_name_still_needs_features_and_label(db):
     assert "PREDICT_ERR_SCHEMA" in str(e.value)
 
 
+def test_fit_leading_name_varying_within_group_fails_loud(db):
+    """The leading name, like the options object, must be constant within an
+    aggregate group. A first TEXT argument that evaluates to different names
+    across rows fails loudly (PREDICT_ERR_OPTIONS) rather than silently binding
+    to whichever row SQLite happened to visit first."""
+    _seed(db)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute(
+            "SELECT fit(CASE WHEN tenure < 10 THEN 'lo' ELSE 'hi' END,"
+            " tenure, spend, churned) FROM h").fetchall()
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
+def test_fit_leading_name_rejects_embedded_nul(db):
+    """A model name with an embedded NUL would be truncated by the C-string path,
+    registering and returning a different id than the caller supplied. Reject it
+    loudly (PREDICT_ERR_OPTIONS) instead of silently binding to the prefix."""
+    _seed(db)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        db.execute("SELECT fit(char(97, 0, 98), tenure, spend, churned)"
+                   " FROM h").fetchall()
+    assert "PREDICT_ERR_OPTIONS" in str(e.value)
+
+
 def test_fit_leading_name_json_object_still_options(db):
     """The leading name discounts the options arity, so a trailing JSON-object
     argument is consumed as options with or without a name: fit('id', f1, f2, obj)

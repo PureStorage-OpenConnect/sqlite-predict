@@ -68,7 +68,8 @@ SELECT avg(mae) FROM backtest_rows(
 ### `fit([name,] f1, ..., fN, label [, options])`
 
 Trains a native tabular student over your rows. The features are positional and
-the **label is the last positional argument** (there is no `target` option). An
+the **label is the last argument before the optional `options`** (there is no
+`target` option). An
 optional **leading TEXT argument names and registers the model**, mirroring
 `predict(model, ...)` so the train and serve calls read in parallel:
 `fit('churn', f..., label)` then `predict('churn', f...)`. The same name can

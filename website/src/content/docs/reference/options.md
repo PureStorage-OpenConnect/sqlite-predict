@@ -49,8 +49,8 @@ carry the columns and `GROUP BY` carries the series split.
 ## fit
 
 `fit([name,] f1, ..., fN, label [, options])` trains a native tabular student
-over your rows; the label is the last positional argument, so there is no
-`target` option. An optional leading TEXT argument names and registers the
+over your rows; the label is the last argument before the optional `options`, so
+there is no `target` option. An optional leading TEXT argument names and registers the
 model, `fit('id', f..., label)`, mirroring `predict('id', f...)`. The leading
 name and the options object must be constant within an aggregate group.
 
