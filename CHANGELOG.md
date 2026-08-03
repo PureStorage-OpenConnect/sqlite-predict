@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`fit` accepts an optional leading model name**, mirroring `predict`:
+  `fit('churn', f1, ..., fN, label)` registers the trained student as `churn` and
+  returns its id, so the train and serve calls read in parallel with
+  `predict('churn', f1, ..., fN)`. The name can still be given as
+  `'{"register":"churn"}'` instead; supplying it both ways raises
+  `PREDICT_ERR_OPTIONS`. Existing `fit(f1, ..., fN, label [, options])` calls are
+  unchanged (a leading argument is only a name when it is TEXT, and features are
+  numeric).
+
 ### Fixed
 
 - **Forest prediction accumulates the learning-rate product in double**, matching

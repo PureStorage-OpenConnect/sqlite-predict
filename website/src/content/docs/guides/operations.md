@@ -16,7 +16,7 @@ e.g. `'{"confidence_level":0.9}'`.
 | `forecast(ts, value, horizon [, options])` | Where is this metric going? | one JSON document per group: future rows with prediction intervals and a status |
 | `detect_anomalies(ts, value [, options])` | Which points are abnormal? | one JSON document per group: anomaly-scored rows with expected value and probability |
 | `backtest(ts, value, horizon [, options])` | How accurate is the model here? | one JSON document per group: per-fold MAE / RMSE / MASE / sMAPE and coverage |
-| `fit(f1, ..., fN, label [, options])` | Train a model on labeled rows | a registered model id, or a model blob |
+| `fit([name,] f1, ..., fN, label [, options])` | Train a model on labeled rows | a registered model id, or a model blob |
 | `predict(model, f1, ..., fN [, options])` | Classify or regress a row | a prediction, or a `{prediction, confidence}` document with `proba` |
 | `distill_predict(train_query [, options])` | Compress a teacher into a fast student | a registered native tabular model |
 | `distill_forecast(train_query [, options])` | Compress a forecast model into a student | a registered native forecast model |
