@@ -5,6 +5,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Default the GITHUB_TOKEN to read-only; the publish job opts into
+# id-token: write for PyPI OIDC and nothing else needs write.
+permissions:
+  contents: read
+
 # Builds the Python wheels (`pip install sqlite-predict`). Each wheel bundles the
 # zero-dependency loadable compiled for its platform. Staging runs `make
 # python-src` on the host to drop the amalgamation + SQLite ext headers into the

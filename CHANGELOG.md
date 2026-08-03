@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Forest prediction accumulates the learning-rate product in double**, matching
+  the trainer. The serving path multiplied the learning rate by a tree value as
+  `float * float` before widening to the `double` accumulator, which could
+  overflow to infinity (and, under x87 excess precision, differ by platform)
+  before the widening. The product and the forest accumulation are now computed in
+  double (individual tree values are still `f32`); served predictions may shift in
+  their least-significant digits.
+
 ## [0.2.0] - 2026-07-31
 
 ### Changed
