@@ -77,8 +77,10 @@ instead be given as `'{"register":"churn"}'`, but supplying it both ways raises
 returns the id; with neither it returns a model blob you can pass to `predict`.
 The optional trailing `options` is a TEXT JSON object, so a trailing `{...}`
 argument is always read as options: a class **label must not be a JSON-object
-string** (it would be consumed as options). Options: `kind` (`gbt` default, or
-`tree`), `task` (`classify`/`regress`, inferred from the label), `register`.
+string** (it would be consumed as options). Within an aggregate group the leading
+name and the `options` object must be constant, or the call raises
+`PREDICT_ERR_OPTIONS`. Options: `kind` (`gbt` default, or `tree`), `task`
+(`classify` default, or `regress` for a numeric target), `register`.
 
 ```sql
 -- name the model with a leading id, and fit/predict read in parallel:

@@ -51,12 +51,13 @@ carry the columns and `GROUP BY` carries the series split.
 `fit([name,] f1, ..., fN, label [, options])` trains a native tabular student
 over your rows; the label is the last positional argument, so there is no
 `target` option. An optional leading TEXT argument names and registers the
-model, `fit('id', f..., label)`, mirroring `predict('id', f...)`.
+model, `fit('id', f..., label)`, mirroring `predict('id', f...)`. The leading
+name and the options object must be constant within an aggregate group.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `kind` | `gbt` \| `tree` | `gbt` | Student architecture. |
-| `task` | `classify` \| `regress` | inferred | Inferred from the label: integer or text is classify, real is regress. |
+| `task` | `classify` \| `regress` | `classify` | Default `classify` (the label is read as a class). Pass `regress` for a numeric target; a real-valued label is not inferred. |
 | `register` | string | none | Register the model under this id and return the id; without it, `fit` returns a model blob. The id can instead be given as a leading positional argument, `fit('id', ...)`; supplying it both ways raises `PREDICT_ERR_OPTIONS`. |
 
 ## predict
