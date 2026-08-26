@@ -4,7 +4,7 @@ version = "0.0.0"
 requires-python = ">=3.11"
 dependencies = [
   "pytest>=9.1.1",
-  "syrupy>=5.5.3",
+  "syrupy>=6.0.0",
   "sqlalchemy>=2.0.51",
 ]
 
